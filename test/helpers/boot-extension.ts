@@ -17,16 +17,35 @@ export interface BootedPi {
   pi: any;
   tools: Map<string, any>;
   lifecycle: Map<string, any>;
+  /** Custom entry renderers, by `customType`. */
+  entryRenderers: Map<string, any>;
+  /** Flags the extension registered, by name. */
+  registeredFlags: Map<string, any>;
+  /** Slash commands the extension registered, by name. */
+  commands: Map<string, any>;
 }
 
-/** A mock ExtensionAPI that records every tool and lifecycle handler registered. */
-export function makePi(): BootedPi {
+/**
+ * A mock ExtensionAPI that records every tool and lifecycle handler registered.
+ *
+ * `flags` seeds what `pi.getFlag` returns. It is deliberately separate from the
+ * values passed to `registerFlag`: the host applies CLI values only AFTER every
+ * extension has activated, so a test that seeds them here and reads them from
+ * `session_start` reproduces the real ordering.
+ */
+export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
   const tools = new Map<string, any>();
   const lifecycle = new Map<string, any>();
+  const entryRenderers = new Map<string, any>();
+  const registeredFlags = new Map<string, any>();
+  const commands = new Map<string, any>();
   const pi = {
     registerMessageRenderer: vi.fn(),
+    registerEntryRenderer: vi.fn((customType: string, renderer: any) => entryRenderers.set(customType, renderer)),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
-    registerCommand: vi.fn(),
+    registerCommand: vi.fn((name: string, command: any) => commands.set(name, command)),
+    registerFlag: vi.fn((name: string, options: any) => registeredFlags.set(name, options)),
+    getFlag: vi.fn((name: string) => flags[name]),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
     events: {
       emit: vi.fn(),
@@ -34,8 +53,9 @@ export function makePi(): BootedPi {
     },
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
+    exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
   } as any;
-  return { pi, tools, lifecycle };
+  return { pi, tools, lifecycle, entryRenderers, registeredFlags, commands };
 }
 
 /** A mock ExtensionContext — the second half of what a tool's `execute` receives. */

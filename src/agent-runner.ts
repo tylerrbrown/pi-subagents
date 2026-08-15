@@ -37,6 +37,7 @@ import type { LifetimeUsage } from "./usage.js";
  */
 export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
+  WORKFLOW: "Workflow",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
 } as const;

@@ -20,6 +20,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
+- **Scripted workflows** — a `Workflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/workflows`. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. A script written for Claude Code's `Workflow` tool runs here unchanged
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes detached by default and notifies you on completion, just like a fresh spawn; pass `run_in_background: false` to block and get the result inline
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
@@ -406,6 +407,46 @@ Launch a sub-agent.
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
 
+### `Workflow`
+
+Run a deterministic script that orchestrates many subagents. Returns a task id immediately; the run continues in the background and notifies on completion.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `script` | string | no | The workflow source. Must begin with `export const meta = { name, description }` |
+| `scriptPath` | string | no | Path to a script file. Takes precedence over `script` |
+| `args` | any | no | Passed through to the script as the `args` global, verbatim |
+
+Exactly one of `script` / `scriptPath` is required. Each invocation's script is persisted to the session directory and its path returned, so iterating means editing that file and re-running rather than resending the source.
+
+```js
+export const meta = {
+  name: 'auth-audit',
+  description: 'Find routes missing auth checks, then verify each finding',
+  phases: [{ title: 'Scan' }, { title: 'Audit' }],
+}
+
+phase('Scan')
+const listing = await agent('List every route file under src/routes/. One path per line.')
+const files = listing.split('\n').map(s => s.trim()).filter(Boolean)
+log('auditing ' + files.length + ' files')
+
+phase('Audit')
+return await pipeline(
+  files,
+  file => agent(`Audit ${file} for missing auth checks.`, { label: `audit:${file}` }),
+  (found, file) => agent(`Try to REFUTE this finding about ${file}: ${found}`, { label: `verify:${file}` }),
+)
+```
+
+**Globals** — `agent(prompt, opts?)` returns the child's text, or `null` if it was skipped or failed terminally. `opts` takes `label`, `phase`, `agentType`, `model`, `isolation: "worktree"`, `gate`, and `resume`. `parallel(thunks)` is a barrier; a thunk that throws becomes `null` without failing its siblings. `pipeline(items, ...stages)` has no barrier — each stage receives `(previousResult, originalItem, index)`, and a stage that throws drops that item to `null`.
+
+**Determinism** — `Date.now()`, `new Date()` and `Math.random()` throw, so a run can be replayed; stamp times afterwards or pass them via `args`. `eval` and `Function(...)` throw `EvalError`. There is no filesystem, network, or module access inside the script — all real work happens in the agents it spawns.
+
+**Verification** — `gate` runs a command after the agent finishes and fails it on a non-zero exit, with the command's output as the error. With `isolation: "worktree"` the gate runs inside that child's worktree, so it verifies what the child actually wrote. A gate-rejected child stays resumable by `label`.
+
+Concurrency is capped at `max(1, min(16, cpus - 2))`, with 1000 agents per run and 4096 items per `parallel`/`pipeline` call. A script that finishes with an un-awaited `agent()` fails rather than silently discarding it.
+
 ### `get_subagent_result`
 
 Check status and retrieve results from a background agent.
@@ -432,6 +473,17 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 |---------|-------------|
 | `/agents` | Interactive agent management menu |
+| `/workflows` | Inspect running workflows |
+
+`/workflows` opens a two-pane inspector over a run: a Phases list (a phase shows its number until it finishes, then `✔`/`✘`) and its agents, with per-agent **Prompt**, **Activity** and **Outcome** sections. `j`/`k` move within the focused pane, `tab` switches pane, `f` cycles the state filter, `e` expands the prompt, `x` stops the run, `esc` closes. With more than one workflow in the session it asks which, newest first. The footer lists only the keys that are actually wired, so it never advertises an action that does nothing.
+
+### CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `--subagents-workflow-file=<path>` | Run a workflow script at session start |
+
+Use the `=` form. The bare `--flag value` spelling consumes the next argument, so `pi --subagents-workflow-file review.js "do the thing"` would take the prompt as the flag's value. Composes with headless mode: `pi -p --subagents-workflow-file=review.js`. With no tool call to attach to, the run renders as a session entry and its result is handed to the model as context for its next turn.
 
 The `/agents` command opens an interactive menu:
 
@@ -825,6 +877,14 @@ src/
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)
   env.ts              # Environment detection (git, platform)
 
+  workflow/
+    meta.ts           # Extract and validate a script's pure-literal `meta` block
+    worker-source.ts  # The sandbox: vm context, determinism prelude, script globals
+    runtime.ts        # Worker lifecycle, RPC bridge, semaphore, caps, gate/resume
+    progress.ts       # Progress event log and every derived view of it (pure)
+    host.ts           # WorkflowHost adapter over AgentManager
+    task.ts           # local_workflow task record and batched progress updates
+    tool-description.ts # Model-facing description carrying the orchestration patterns
   ui/
     agent-widget.ts       # Persistent widget: spinners, activity, status icons, theming
     fleet-list.ts         # FleetView: navigable agent list below the editor
@@ -833,6 +893,8 @@ src/
     agent-mention.ts      # `@` roster (running, resumable, and startable agents) + popup rows
     schedule-menu.ts      # /agents → Scheduled jobs submenu
     select-item.ts        # Collision-safe ctx.ui.select wrapper (numbered rows)
+    workflow-card.ts      # Inline workflow card (tool result and session entry)
+    workflow-dialog.ts    # /workflows two-pane inspector
 ```
 
 ## License

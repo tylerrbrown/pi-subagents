@@ -1,0 +1,661 @@
+/**
+ * runtime.ts — the host half of a workflow run.
+ *
+ * Owns the worker lifecycle, the RPC bridge, the concurrency semaphore, the
+ * per-run caps, and the progress log. The script's only route to an agent is a
+ * `call` message landing here, which is what makes the caps and the abort story
+ * enforceable at all: a script cannot go around them because it has nothing to
+ * go around them *with*.
+ *
+ * Spawning is injected rather than imported. `AgentManager` is a large, stateful
+ * dependency and wiring it in directly would make every test here an integration
+ * test; a {@link WorkflowHost} stub is a dozen lines. The adapter that binds this
+ * to the real manager lives at the call site.
+ */
+
+import { cpus } from "node:os";
+import { Worker } from "node:worker_threads";
+import { extractMeta, type WorkflowMeta } from "./meta.js";
+import type { WorkflowAgentEntry, WorkflowEntry } from "./progress.js";
+import { WORKER_SOURCE } from "./worker-source.js";
+
+/** Matches the `script` field's `maxLength` in the tool schema. */
+export const MAX_SCRIPT_LENGTH = 524_288;
+
+/** Agents one run may schedule, in total. */
+export const WORKFLOW_AGENT_CAP = 1000;
+
+/** Items one `parallel()` or `pipeline()` call may take. */
+export const WORKFLOW_ITEM_CAP = 4096;
+
+/** How much of a prompt or result is kept for the UI. */
+const PREVIEW_LENGTH = 200;
+
+export class WorkflowRuntimeError extends Error {}
+
+/**
+ * Concurrent agents allowed, leaving two cores for the host and the TUI.
+ *
+ * `Math.max(1, …)` is not decoration: the raw `min(16, cpus - 2)` is 0 on a one-
+ * or two-core machine, and a semaphore with zero permits never hands out a slot,
+ * so the run would hang before its first agent rather than fail.
+ */
+export function workflowConcurrency(cpuCount: number = cpus().length): number {
+  return Math.max(1, Math.min(16, cpuCount - 2));
+}
+
+/** One agent the script asked for. `agentId` is the handle for {@link WorkflowHost.abortAgent}. */
+export interface WorkflowSpawnRequest {
+  agentId: string;
+  /** Position in the run, and the progress entry's stable identity. */
+  index: number;
+  prompt: string;
+  label: string;
+  agentType: string;
+  model?: string;
+  isolation?: "worktree";
+  phaseIndex?: number;
+  phaseTitle?: string;
+  /**
+   * The `gate` command this agent is being spawned under, when it has one.
+   *
+   * Passed down rather than run purely from here because an isolated child's
+   * worktree is destroyed as part of its own settle: a host that can reach
+   * inside that settle runs the gate there, against the tree the child wrote,
+   * and reports the outcome back as {@link WorkflowSpawnResult.gate}. A host
+   * that ignores this leaves the gate to {@link applyGate}, which then runs it
+   * itself — so exactly one execution either way.
+   */
+  gate?: string;
+}
+
+export interface WorkflowSpawnResult {
+  ok: boolean;
+  /** The agent's answer. Present when `ok`. */
+  text?: string;
+  /** Why it failed. Present when not `ok`. */
+  error?: string;
+  /** The user dismissed it rather than it failing; renders as skipped. */
+  skipped?: boolean;
+  tokens?: number;
+  toolCalls?: number;
+  /**
+   * Where the child actually ran.
+   *
+   * Only meaningful for `isolation: "worktree"`, and the whole reason it exists:
+   * a gate has to run against the tree the child edited, not the main one, or it
+   * verifies the wrong working copy. Left unset, a gate runs wherever the host
+   * runs commands by default.
+   *
+   * Usually unset for a worktree child even so: the copy is removed during the
+   * child's own settle, so it no longer exists by the time this is read. That
+   * is what {@link gate} is for.
+   */
+  cwd?: string;
+  /**
+   * The outcome of this agent's `gate`, when the host already ran it.
+   *
+   * Set only by a host that ran the command itself — inside the child's
+   * worktree, while that directory still existed. Its presence is what tells
+   * {@link applyGate} the command has already been executed; the pass/fail
+   * decision and the error shaping still happen there, in one place.
+   */
+  gate?: WorkflowGateResult;
+}
+
+/** Outcome of a `gate` command. `output` is what the user is shown when it fails. */
+export interface WorkflowGateResult {
+  ok: boolean;
+  /** Combined stdout/stderr, or whatever the host wants surfaced as the failure. */
+  output: string;
+}
+
+/** The one seam between a workflow and the rest of the extension. */
+export interface WorkflowHost {
+  spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
+  /** Called for every in-flight agent when the run aborts. */
+  abortAgent(agentId: string): void;
+  /**
+   * Continue a child that already ran in this run, keeping its context.
+   *
+   * `agentId` is one previously handed out in a {@link WorkflowSpawnRequest};
+   * the child keeps the agent type, model and tool contract it started with, so
+   * only the follow-up prompt crosses.
+   *
+   * Optional: a host without it rejects `resume` rather than quietly starting a
+   * fresh child that has none of the context the script is counting on.
+   */
+  resumeAgent?(agentId: string, prompt: string): Promise<WorkflowSpawnResult>;
+  /**
+   * Run a `gate` command and report whether it passed.
+   *
+   * `cwd` is the child's worktree when it had one. Optional for the same reason
+   * as {@link resumeAgent}, and more sharply: a gate that silently does not run
+   * would mark unverified work as verified, so the runtime fails the call
+   * instead of skipping it.
+   */
+  runGate?(command: string, options: { agentId: string; cwd?: string }): Promise<WorkflowGateResult>;
+}
+
+export interface RunWorkflowOptions {
+  /** Full script source, starting with `export const meta = { … }`. */
+  script: string;
+  args?: unknown;
+  host: WorkflowHost;
+  signal?: AbortSignal;
+  /** Fired per batch, not per entry — see the worker's progress batching. */
+  onProgress?(entries: readonly WorkflowEntry[]): void;
+  concurrency?: number;
+  agentCap?: number;
+  itemCap?: number;
+}
+
+export interface WorkflowRunResult {
+  status: "completed" | "failed" | "killed";
+  meta: WorkflowMeta;
+  /** The script's return value, JSON-checked at the boundary. */
+  value?: unknown;
+  error?: string;
+  /** The append-only log, in emission order. */
+  progress: WorkflowEntry[];
+  /** Agents scheduled, including those that failed. */
+  agentCount: number;
+}
+
+/* ------------------------------------------------------------------------- *
+ * JSON boundary — host side
+ * ------------------------------------------------------------------------- */
+
+function boundaryError(what: string, path: string): WorkflowRuntimeError {
+  return new WorkflowRuntimeError(
+    `Cannot pass ${what} across the workflow VM boundary (at ${path}).`,
+  );
+}
+
+function walk(value: unknown, path: string, seen: Set<object>): void {
+  if (value === null) return;
+  const kind = typeof value;
+  if (kind === "string" || kind === "boolean") return;
+  if (kind === "number") {
+    if (!Number.isFinite(value)) throw boundaryError("a non-finite number", path);
+    return;
+  }
+  if (kind === "undefined") {
+    if (path === "args") return;
+    throw boundaryError("undefined", path);
+  }
+  if (kind === "bigint") throw boundaryError("a BigInt", path);
+  if (kind === "symbol") throw boundaryError("a symbol", path);
+  if (kind === "function") throw boundaryError("a function", path);
+  if (kind !== "object") throw boundaryError(`a ${kind}`, path);
+
+  const object = value as object;
+  if (seen.has(object)) throw boundaryError("a circular structure", path);
+  seen.add(object);
+
+  if (Object.getOwnPropertySymbols(object).length > 0) {
+    throw boundaryError("an object with symbol keys", path);
+  }
+
+  if (Array.isArray(object)) {
+    for (let i = 0; i < object.length; i++) {
+      if (!Object.hasOwn(object, i)) throw boundaryError("a sparse array", `${path}[${i}]`);
+      walk(object[i], `${path}[${i}]`, seen);
+    }
+    seen.delete(object);
+    return;
+  }
+
+  const prototype = Object.getPrototypeOf(object);
+  if (prototype !== null && prototype !== Object.prototype) {
+    throw boundaryError("a non-plain object", path);
+  }
+  for (const [key, entry] of Object.entries(object)) {
+    walk(entry, `${path}.${key}`, seen);
+  }
+  seen.delete(object);
+}
+
+/**
+ * Reject anything that cannot survive the round trip to the worker and into a
+ * resume journal. Structured clone would happily carry a `Map` or a cycle that
+ * the journal then cannot represent, so the check is stricter than the transport.
+ */
+export function assertBoundarySafe(value: unknown, path: string): void {
+  walk(value, path, new Set());
+}
+
+/* ------------------------------------------------------------------------- *
+ * Semaphore
+ * ------------------------------------------------------------------------- */
+
+class Semaphore {
+  private active = 0;
+  private readonly waiters: (() => void)[] = [];
+
+  constructor(private readonly limit: number) {}
+
+  acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active++;
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  release(): void {
+    const next = this.waiters.shift();
+    // Hand the permit straight over rather than decrementing and re-acquiring;
+    // otherwise a burst of releases can let more than `limit` through.
+    if (next) next();
+    else this.active--;
+  }
+
+  /** Wake everyone so aborted callers can observe the abort and bail. */
+  drain(): void {
+    while (this.waiters.length > 0) {
+      const next = this.waiters.shift();
+      next?.();
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------- *
+ * Messages
+ * ------------------------------------------------------------------------- */
+
+interface AgentCallPayload {
+  prompt: string;
+  label?: string;
+  model?: string;
+  agentType?: string;
+  isolation?: "worktree";
+  phaseIndex?: number;
+  phaseTitle?: string;
+  /** Shell command that has to pass before the agent counts as done. */
+  gate?: string;
+  /** Label of an earlier child in this run to continue instead of starting one. */
+  resume?: string;
+}
+
+type WorkerMessage =
+  | { type: "call"; callId: number; method: string; payload: AgentCallPayload }
+  | { type: "progress"; entries: WorkflowEntry[] }
+  | { type: "complete"; resultJson?: string }
+  | { type: "error"; message: string; stack?: string };
+
+/** Everything below 0x20 except tab, newline and carriage return, plus DEL. */
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+
+const preview = (text: string) =>
+  text.length <= PREVIEW_LENGTH ? text : `${text.slice(0, PREVIEW_LENGTH - 1)}…`;
+
+/** First line of the prompt, trimmed — the fallback display name for an agent. */
+function derivedLabel(prompt: string): string {
+  const line = prompt.split("\n", 1)[0].trim();
+  return line.length <= 60 ? line || "agent" : `${line.slice(0, 59)}…`;
+}
+
+/**
+ * A child `resume` can revive, remembered under its label.
+ *
+ * The spawn options travel with it because `resume` deliberately takes none: the
+ * revived child keeps the agent type, model and isolation it was started with,
+ * and the progress entry has to show the same thing the first entry showed.
+ */
+interface CompletedChild {
+  agentId: string;
+  label: string;
+  agentType: string;
+  model?: string;
+  isolation?: "worktree";
+}
+
+/**
+ * Turn a failing gate into a failing agent.
+ *
+ * Deliberately no new state, no new entry type: a gated agent whose command
+ * fails is *a failed agent*, so the card, the dialog and `agent()`'s `null`
+ * return all handle it with the code they already have. The command output
+ * becomes the error, because that is the thing worth reading.
+ *
+ * The single place that decides whether a gate passed. The command may have
+ * been run by the host instead (inside a worktree that no longer exists by
+ * now), but only ever by one of the two: a host that ran it says so with
+ * `result.gate`, and this then shapes that outcome rather than running it
+ * again.
+ */
+async function applyGate(
+  result: WorkflowSpawnResult,
+  command: string,
+  agentId: string,
+  runGate: NonNullable<WorkflowHost["runGate"]>,
+): Promise<WorkflowSpawnResult> {
+  const outcome =
+    result.gate ??
+    (await runGate(command, {
+      agentId,
+      // Where the child worked, when it had a worktree of its own. Gating the
+      // main tree instead would verify code the child never touched.
+      ...(result.cwd !== undefined ? { cwd: result.cwd } : {}),
+    }));
+  const { gate: _ran, ...kept } = result;
+  if (outcome.ok) return kept;
+  const { text: _discarded, ...rest } = kept;
+  const output = outcome.output.trim();
+  return { ...rest, ok: false, error: output === "" ? `Gate command failed: ${command}` : output };
+}
+
+/**
+ * Nico's wording, kept verbatim — this is the one borrowed check whose message a
+ * user is likely to search for.
+ */
+function unawaitedLaunchMessage(labels: readonly string[]): string {
+  const list = labels.map(label => `'${label}'`).join(", ");
+  return `workflow script completed with unawaited agent launch(es): ${list}. Await or return each launch.`;
+}
+
+/**
+ * Run one workflow script to completion.
+ *
+ * Rejects before starting for a script that cannot run at all (bad `meta`, over
+ * the size limit, control characters, non-JSON `args`). Everything after the
+ * worker is live resolves instead, carrying the failure in `status` — by then
+ * there is a progress log worth handing back.
+ */
+export async function runWorkflow(options: RunWorkflowOptions): Promise<WorkflowRunResult> {
+  const { script, host } = options;
+
+  if (script.length > MAX_SCRIPT_LENGTH) {
+    throw new WorkflowRuntimeError(
+      `Workflow script is ${script.length} characters, over the limit of ${MAX_SCRIPT_LENGTH}.`,
+    );
+  }
+  if (CONTROL_CHARACTERS.test(script)) {
+    throw new WorkflowRuntimeError(
+      "Workflow script contains control characters. Only tab, carriage return and newline are allowed.",
+    );
+  }
+  assertBoundarySafe(options.args, "args");
+
+  const { meta, body } = extractMeta(script);
+  const agentCap = options.agentCap ?? WORKFLOW_AGENT_CAP;
+  const itemCap = options.itemCap ?? WORKFLOW_ITEM_CAP;
+  const semaphore = new Semaphore(options.concurrency ?? workflowConcurrency());
+
+  const progress: WorkflowEntry[] = [];
+  const inflight = new Set<string>();
+  /** Label → the child that ran under it, last one wins. The `resume` handle. */
+  const completedByLabel = new Map<string, CompletedChild>();
+  /**
+   * Launches the host has accepted and not yet answered, in call order.
+   *
+   * This is the whole unawaited-launch mechanism: a script that drops an
+   * `agent()` promise still gets its call answered eventually, but it returns
+   * first — so anything left here when `complete` arrives is a result nobody is
+   * waiting for. Tracking it host-side avoids proxying `Promise` inside the
+   * realm, which §2.4 rules out, and reading stack traces, which is brittle.
+   */
+  const openLaunches = new Map<number, string>();
+  let agentCount = 0;
+  let aborted = false;
+  let settled = false;
+
+  const worker = new Worker(WORKER_SOURCE, {
+    eval: true,
+    workerData: {
+      body,
+      metaJson: JSON.stringify(meta),
+      argsJson: options.args === undefined ? undefined : JSON.stringify(options.args),
+      itemCap,
+    },
+  });
+
+  return await new Promise<WorkflowRunResult>(resolve => {
+    const emit = (entries: WorkflowEntry[]) => {
+      if (entries.length === 0) return;
+      progress.push(...entries);
+      options.onProgress?.(entries);
+    };
+
+    const respond = (callId: number, ok: boolean, value?: unknown, error?: string, fatal?: boolean) => {
+      // Cleared before the settled check: a launch answered by a run that is
+      // already finishing is not an unawaited launch either.
+      openLaunches.delete(callId);
+      if (settled) return;
+      worker.postMessage({ type: "response", callId, ok, value, error, fatal });
+    };
+
+    const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount">) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      for (const agentId of inflight) host.abortAgent(agentId);
+      inflight.clear();
+      semaphore.drain();
+      // Resolve only once the thread is actually down, so a caller that awaits
+      // runWorkflow() is guaranteed not to be leaking one.
+      const settle = () => resolve({ ...result, meta, progress, agentCount });
+      void worker.terminate().then(settle, settle);
+    };
+
+    function onAbort() {
+      aborted = true;
+      // terminate() is why this runs in a worker at all: it stops a script that
+      // is spinning or wedged mid-await, which an in-process vm cannot do.
+      finish({ status: "killed", error: "Workflow aborted." });
+    }
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        onAbort();
+        return;
+      }
+      options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    async function handleAgent(callId: number, payload: AgentCallPayload): Promise<void> {
+      // Bound now: the optional methods are checked once, up front, so a
+      // capability the host lacks fails before an agent is spawned rather than
+      // after — a gate that never ran must not be mistaken for a gate that
+      // passed.
+      const runGate = host.runGate?.bind(host);
+      const resumeAgent = host.resumeAgent?.bind(host);
+      if (payload.gate !== undefined && runGate === undefined) {
+        respond(callId, false, undefined, "This workflow host cannot run gate commands.", true);
+        return;
+      }
+      if (payload.resume !== undefined && resumeAgent === undefined) {
+        respond(callId, false, undefined, "This workflow host cannot resume agents.", true);
+        return;
+      }
+
+      let resumed: CompletedChild | undefined;
+      if (payload.resume !== undefined) {
+        resumed = completedByLabel.get(payload.resume);
+        if (resumed === undefined) {
+          const known = [...completedByLabel.keys()];
+          // Fatal: a typo'd label is a script bug, and folding it into a null
+          // would show up as an agent that mysteriously returned nothing.
+          respond(
+            callId,
+            false,
+            undefined,
+            `agent() opts.resume: no agent has completed under the label "${payload.resume}" in this run. ${
+              known.length === 0
+                ? "No agent has completed yet."
+                : `Known labels: ${known.map(label => `"${label}"`).join(", ")}.`
+            }`,
+            true,
+          );
+          return;
+        }
+      }
+
+      if (agentCount >= agentCap) {
+        // Fatal, so parallel()/pipeline() rethrow instead of folding it into a
+        // null. A cap that silently drops work is worse than no cap.
+        respond(callId, false, undefined, `Workflow exceeded its cap of ${agentCap} agents.`, true);
+        return;
+      }
+      const index = agentCount++;
+      // A resumed call is the same child again: it keeps the agent id, so an
+      // abort still reaches it, and it keeps its spawn contract, so the row
+      // reads the same as the row it continues.
+      const agentId = resumed?.agentId ?? `wf-agent-${index}`;
+      const label = payload.label ?? resumed?.label ?? derivedLabel(payload.prompt);
+      const agentType = resumed?.agentType ?? payload.agentType ?? "general-purpose";
+      const model = resumed !== undefined ? resumed.model : payload.model;
+      const isolation = resumed !== undefined ? resumed.isolation : payload.isolation;
+      openLaunches.set(callId, label);
+
+      const base: WorkflowAgentEntry = {
+        type: "workflow_agent",
+        index,
+        label,
+        state: "start",
+        agentId,
+        agentType,
+        promptPreview: preview(payload.prompt),
+        ...(model !== undefined ? { model } : {}),
+        ...(isolation !== undefined ? { isolation } : {}),
+        ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
+        ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+      };
+
+      const queuedAt = Date.now();
+      emit([{ ...base, queuedAt }]);
+
+      // A resumed agent waits its turn like any other: it is the same amount of
+      // model running at once.
+      await semaphore.acquire();
+      if (aborted || settled) {
+        semaphore.release();
+        respond(callId, false, undefined, "Workflow aborted.", true);
+        return;
+      }
+
+      const startedAt = Date.now();
+      emit([{ ...base, queuedAt, startedAt }]);
+      inflight.add(agentId);
+
+      let result: WorkflowSpawnResult;
+      try {
+        result =
+          resumed !== undefined && resumeAgent !== undefined
+            ? await resumeAgent(resumed.agentId, payload.prompt)
+            : await host.spawnAgent({
+                agentId,
+                index,
+                prompt: payload.prompt,
+                label,
+                agentType,
+                ...(model !== undefined ? { model } : {}),
+                ...(isolation !== undefined ? { isolation } : {}),
+                ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
+                ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+                // Offered, not delegated: a host that can run it inside the
+                // child's worktree does, and hands back `result.gate`.
+                ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
+              });
+        if (result.ok) {
+          // Recorded before the gate runs: the child itself finished, so it is
+          // resumable even when its gate rejects the work — "here is what the
+          // gate said, fix it" is the loop this exists for.
+          completedByLabel.set(label, {
+            agentId,
+            label,
+            agentType,
+            ...(model !== undefined ? { model } : {}),
+            ...(isolation !== undefined ? { isolation } : {}),
+          });
+          if (payload.gate !== undefined && runGate !== undefined) {
+            result = await applyGate(result, payload.gate, agentId, runGate);
+          }
+        }
+      } catch (error) {
+        result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      } finally {
+        inflight.delete(agentId);
+        semaphore.release();
+      }
+
+      if (settled) return;
+      const finishedAt = Date.now();
+      const common = {
+        ...base,
+        queuedAt,
+        startedAt,
+        lastProgressAt: finishedAt,
+        durationMs: finishedAt - startedAt,
+        ...(result.tokens !== undefined ? { tokens: result.tokens } : {}),
+        ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls } : {}),
+      };
+
+      if (result.ok) {
+        const text = result.text ?? "";
+        emit([{ ...common, state: "done", resultPreview: preview(text) }]);
+        respond(callId, true, text);
+        return;
+      }
+      // A dead agent is a null in the script, not a thrown error: Claude Code
+      // scripts .filter(Boolean) rather than try/catch around every call.
+      emit([
+        {
+          ...common,
+          state: "error",
+          error: result.error ?? "Agent failed.",
+          ...(result.skipped ? { skipped: true } : {}),
+        },
+      ]);
+      respond(callId, true, null);
+    }
+
+    worker.on("message", (message: WorkerMessage) => {
+      if (settled) return;
+      switch (message.type) {
+        case "progress":
+          emit(message.entries);
+          break;
+        case "call":
+          if (message.method !== "agent") {
+            respond(message.callId, false, undefined, `Unknown workflow host method "${message.method}".`, true);
+            break;
+          }
+          void handleAgent(message.callId, message.payload);
+          break;
+        case "complete": {
+          // The script is done, so every launch it made should have been
+          // answered by now — a response is sent before the worker can post
+          // this, so anything still open was never awaited. finish() aborts
+          // those children on the way out.
+          const unawaited = [...openLaunches.values()];
+          if (unawaited.length > 0) {
+            finish({ status: "failed", error: unawaitedLaunchMessage(unawaited) });
+            break;
+          }
+          finish({
+            status: "completed",
+            ...(message.resultJson === undefined ? {} : { value: JSON.parse(message.resultJson) }),
+          });
+          break;
+        }
+        case "error":
+          finish({ status: "failed", error: message.message });
+          break;
+      }
+    });
+
+    worker.on("error", error => {
+      finish({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+    });
+
+    worker.on("exit", () => {
+      // Only reachable when the worker dies without reporting — a terminate()
+      // we did not initiate, or a hard crash.
+      finish({ status: "failed", error: "Workflow worker exited before completing." });
+    });
+  });
+}
