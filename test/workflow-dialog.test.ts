@@ -4,10 +4,12 @@ import { SPINNER } from "../src/ui/agent-widget.js";
 import { styleWorkflowCardLines, type WorkflowCardTask } from "../src/ui/workflow-card.js";
 import {
   ASCII_DIALOG_GLYPHS,
+  DEFAULT_PANE_BODY_ROWS,
   dialogRowGlyph,
   handleWorkflowDialogKey,
   initialWorkflowDialogState,
   layoutWorkflowDialog,
+  MIN_PANE_BODY_ROWS,
   PROMPT_COLLAPSED_LINES,
   plainWorkflowDialogLines,
   resolveWorkflowDialog,
@@ -67,17 +69,77 @@ const dialog = (over: DialogOverrides): string[] =>
 const styled = (over: DialogOverrides): string[] =>
   styleWorkflowCardLines(layoutWorkflowDialog(input(over)), theme);
 
-/** Strip the fake theme's markup and a heading's focus marker / padding. */
-const bare = (line: string) => line.replace(/<\/?[a-zA-Z]+>|\*/g, "").replace(/^[\s▸>]+/, "");
+/** Strip the fake theme's markup, keeping the text exactly as it is laid out. */
+const stripMarkup = (line: string) => line.replace(/<\/?[a-zA-Z]+>|\*/g, "");
 
-/** Rows of a section, i.e. everything between its heading and the next blank. */
-function section(lines: string[], heading: string): string[] {
-  const start = lines.findIndex(l => bare(l).startsWith(heading));
-  if (start < 0) throw new Error(`no ${heading} section in:\n${lines.join("\n")}`);
-  const rest = lines.slice(start + 1);
-  const end = rest.findIndex(l => l.trim() === "");
-  return end < 0 ? rest : rest.slice(0, end);
+/** Strip the markup and a heading's focus marker / padding. */
+const bare = (line: string) => stripMarkup(line).replace(/^[\s▸>]+/, "");
+
+/* --- reading the framed layout ---------------------------------------------
+ *
+ * Every body row is `│<left cell>│<right cell>│`, so a pane is read by taking
+ * one side of every row. Trailing blank rows are dropped: the frame pads to a
+ * fixed height, and a test asserting on "the rows" means the ones with content.
+ */
+
+/**
+ * The frame's body rows, as (left, right) cell pairs.
+ *
+ * Split on the border rather than sliced by index, and the border is matched
+ * with its optional theme markup, so the same helper reads a plain layout and a
+ * styled one — the styled tests need the markup left intact inside the cells.
+ */
+const BORDER = /(?:<[a-zA-Z]+>)?[│|](?:<\/[a-zA-Z]+>)?/;
+
+function cells(lines: string[]): { left: string; right: string }[] {
+  const rows: { left: string; right: string }[] = [];
+  for (const line of lines) {
+    const parts = line.split(new RegExp(BORDER.source, "g"));
+    if (parts.length === 4 && parts[0].trim() === "" && parts[3].trim() === "") {
+      rows.push({ left: parts[1], right: parts[2] });
+    }
+  }
+  return rows;
 }
+
+/** Drop the padding rows the frame adds below the content. */
+const trimTrailing = (rows: string[]): string[] => {
+  const out = [...rows];
+  while (out.length > 0 && out[out.length - 1].trim() === "") out.pop();
+  return out;
+};
+
+const leftRows = (lines: string[]): string[] => trimTrailing(cells(lines).map(row => row.left));
+const rightRows = (lines: string[]): string[] => trimTrailing(cells(lines).map(row => row.right));
+
+/** The two pane titles from the frame's top edge. */
+function paneTitles(lines: string[]): { left: string; right: string } {
+  for (const line of lines) {
+    const match = bare(line).match(/^[╭+](.*?)[┬+](.*)[╮+]$/);
+    if (match) {
+      const strip = (part: string) => part.replace(/[─-]+\s*$/, "").trim();
+      return { left: strip(match[1]), right: strip(match[2]) };
+    }
+  }
+  throw new Error(`no frame in:\n${lines.join("\n")}`);
+}
+
+/** Rows of a detail section, i.e. everything between its heading and the next blank. */
+function section(lines: string[], heading: string): string[] {
+  const rows = rightRows(lines).map(row => stripMarkup(row).trimEnd());
+  const start = rows.findIndex(row => row.trim().startsWith(heading));
+  if (start < 0) throw new Error(`no ${heading} section in:\n${lines.join("\n")}`);
+  const rest = rows.slice(start + 1);
+  const end = rest.findIndex(row => row.trim() === "");
+  // Body rows are indented three columns under their heading; the recovered
+  // copy carries its own two, so one is dropped to compare against it.
+  return (end < 0 ? rest : rest.slice(0, end)).map(row => row.replace(/^ {3}/, "  "));
+}
+
+/** The dialog in its agent subview, which is where the detail sections live. */
+const detail = (over: DialogOverrides): string[] =>
+  dialog({ ...over, state: { ...over.state, level: "agent" } });
+
 
 /* ------------------------------------------------------------------------- *
  * Glyphs
@@ -104,7 +166,7 @@ describe("dialog glyph mapping", () => {
   });
 
   it("keys off the derived display state, not the raw entry state", () => {
-    const rows = section(dialog({ progress: live }), "Agents");
+    const rows = rightRows(dialog({ progress: live }));
     expect(rows[0]).toContain("✔ done");
     expect(rows[1]).toContain("✘ failed");
     expect(rows[2]).toContain("✘ skipped");
@@ -134,12 +196,11 @@ describe("dialog glyph mapping", () => {
   });
 
   it("draws ◌ for an agent still live when the run stopped", () => {
-    const rows = section(
+    const rows = rightRows(
       dialog({
         progress: [agentEntry({ index: 0, label: "cutoff", state: "progress", startedAt: START })],
         task: { status: "killed", startTime: START },
       }),
-      "Agents",
     );
     expect(rows[0]).toContain("◌ cutoff");
   });
@@ -173,7 +234,7 @@ describe("phases pane", () => {
   ];
 
   it("shows a phase's number until it finishes, then its glyph", () => {
-    const rows = section(dialog({ progress, meta }), "Phases");
+    const rows = leftRows(dialog({ progress, meta }));
     // Review is fully done → tick. Verify is still running → its NUMBER, not a
     // glyph. Report never started → its number too.
     expect(rows[0]).toContain("✔ Review");
@@ -184,37 +245,44 @@ describe("phases pane", () => {
   });
 
   it("shows a cross once a phase has a failure", () => {
-    const rows = section(
+    const rows = leftRows(
       dialog({
         progress: [
           { type: "workflow_phase", index: 0, title: "Review" },
           agentEntry({ index: 0, label: "a", phaseIndex: 0, state: "error" }),
         ],
       }),
-      "Phases",
     );
     expect(rows[0]).toContain("✘ Review");
   });
 
   it("points at the selected phase and accents it, leaving the others alone", () => {
-    const rows = section(styled({ progress, meta, state: { selectedPhase: 1 } }), "Phases");
-    expect(rows[1]).toContain("<accent>  ❯ </accent>");
+    const rows = leftRows(styled({ progress, meta, state: { selectedPhase: 1 } }));
+    expect(rows[1]).toContain("<accent>❯</accent>");
     expect(rows[1]).toContain("<accent>Verify</accent>");
     expect(rows[0]).not.toContain("❯");
     expect(rows[0]).toContain("<success>");
     expect(rows[2]).toContain("<dim>");
   });
 
-  it("labels a declared-but-unseen phase Not started yet", () => {
-    const rows = section(dialog({ progress, meta }), "Phases");
-    expect(rows[2]).toContain(WORKFLOW_DIALOG_COPY.notStarted);
-    expect(rows[2]).toContain("Not started yet");
+  it("leaves a declared-but-unseen phase without a count", () => {
+    // The narrow pane has no room for "Not started yet"; an absent count says
+    // the same thing, and the phase's number already marks it as pending.
+    const rows = leftRows(dialog({ progress, meta }));
+    expect(rows[2]).toContain("Report");
+    expect(rows[2]).not.toMatch(/\d\/\d/);
     expect(rows[0]).toContain("1/1");
   });
 
   it("swaps the agent list when the phase selection moves", () => {
-    expect(section(dialog({ progress, meta }), "Agents")[0]).toContain(" a");
-    expect(section(dialog({ progress, meta, state: { selectedPhase: 1 } }), "Agents")[0]).toContain(" b");
+    expect(rightRows(dialog({ progress, meta }))[0]).toContain(" a");
+    expect(rightRows(dialog({ progress, meta, state: { selectedPhase: 1 } }))[0]).toContain(" b");
+  });
+
+  it("names the selected phase and its agent count on the right pane", () => {
+    expect(paneTitles(dialog({ progress, meta })).left).toBe("Phases");
+    expect(paneTitles(dialog({ progress, meta })).right).toBe("Review · 1 agent");
+    expect(paneTitles(dialog({ progress, meta, state: { selectedPhase: 1 } })).right).toBe("Verify · 1 agent");
   });
 });
 
@@ -231,15 +299,19 @@ describe("state filter", () => {
 
   it("counts unfiltered agents with a plural that agrees", () => {
     // Exact, not `toContain`: "1 agent" is a substring of "1 agents".
-    expect(dialog({ progress }).find(l => l.includes("Agents"))).toBe("  Agents  3 agents");
+    // "Phase 0" because the fixtures carry a phase index with no declared
+    // title; what is being pinned is the count and its plural.
+    expect(paneTitles(dialog({ progress })).right).toBe("Phase 0 · 3 agents");
     const one = dialog({ progress: [agentEntry({ index: 0, state: "done" })] });
-    expect(one.find(l => l.includes("Agents"))).toBe("  Agents  1 agent");
+    expect(paneTitles(one).right).toBe("Phase 0 · 1 agent");
   });
 
-  it("narrows the visible set and reports `showing N <filter>`", () => {
+  it("narrows the visible set and names the filter in the pane title", () => {
     const lines = dialog({ progress, state: { filter: "running" } });
-    expect(lines.find(l => l.includes("Agents"))).toContain("showing 2 running");
-    const rows = section(lines, "Agents");
+    // The count is of what survived, so the title has to say which filter or
+    // "2 agents" would read as the whole phase.
+    expect(paneTitles(lines).right).toBe("Phase 0 · 2 running");
+    const rows = rightRows(lines);
     expect(rows).toHaveLength(2);
     expect(rows.join("\n")).not.toContain("one");
     expect(rows.join("\n")).toContain("two");
@@ -247,8 +319,8 @@ describe("state filter", () => {
 
   it("reports a filter that matches nothing, and says so in the list", () => {
     const lines = dialog({ progress, state: { filter: "blocked" } });
-    expect(lines.find(l => l.includes("Agents"))).toContain("showing 0 blocked");
-    expect(section(lines, "Agents")).toEqual(["  No agents"]);
+    expect(paneTitles(lines).right).toBe("Phase 0 · 0 blocked");
+    expect(rightRows(lines).map(row => row.trim())).toEqual([WORKFLOW_DIALOG_COPY.noAgents]);
     expect(WORKFLOW_DIALOG_COPY.noAgents).toBe("No agents");
   });
 
@@ -298,7 +370,7 @@ describe("sub-status annotations", () => {
   });
 
   it("puts the annotations on the row ahead of the card's stat tail", () => {
-    const rows = section(
+    const rows = rightRows(
       dialog({
         progress: [
           agentEntry({
@@ -314,11 +386,11 @@ describe("sub-status annotations", () => {
         ],
         now: START + 8000,
       }),
-      "Agents",
     );
-    expect(rows[0].trimStart()).toBe(
-      "❯ ◌ retry-me · throttled · attempt 2 · waiting 8s · Explore · 4 tool calls",
-    );
+    // The agent type and the tool-call count are the detail pane's, not the
+    // row's — the row carries why it looks the way it does, then the model and
+    // the token count, and nothing that would push those off a narrow pane.
+    expect(rows[0].trim()).toBe("❯ ◌ retry-me · throttled · attempt 2 · waiting 8s");
   });
 });
 
@@ -330,55 +402,61 @@ describe("per-agent detail", () => {
   const long = Array.from({ length: 9 }, (_, i) => `prompt line ${i}`).join("\n");
 
   it("collapses a long prompt behind an `expand` affordance and counts its lines", () => {
-    const collapsed = dialog({
+    const collapsed = detail({
       progress: [agentEntry({ index: 0, state: "done", promptPreview: long })],
     });
-    expect(collapsed.find(l => l.includes("Prompt"))).toContain("Prompt  9 lines · expand");
-    expect(section(collapsed, "Prompt")).toHaveLength(PROMPT_COLLAPSED_LINES);
+    expect(rightRows(collapsed).map(bare).find(l => l.includes("Prompt"))).toContain("Prompt · 9 lines · ⏎ expand");
+    // The shown lines plus the row that names how many are not shown, so a
+    // collapsed prompt never looks like the whole prompt.
+    expect(section(collapsed, "Prompt")).toHaveLength(PROMPT_COLLAPSED_LINES + 1);
+    expect(section(collapsed, "Prompt").at(-1)).toContain("… 5 more lines");
 
-    const expanded = dialog({
+    const expanded = detail({
       progress: [agentEntry({ index: 0, state: "done", promptPreview: long })],
       state: { promptExpanded: true },
     });
-    expect(expanded.find(l => l.includes("Prompt"))).toContain("Prompt  9 lines");
-    expect(expanded.find(l => l.includes("Prompt"))).not.toContain("expand");
+    expect(rightRows(expanded).map(bare).find(l => l.includes("Prompt"))).toContain("Prompt · 9 lines · ⏎ collapse");
     expect(section(expanded, "Prompt")).toHaveLength(9);
   });
 
   it("does not offer expand for a prompt that already fits, and counts one line as one", () => {
-    const two = dialog({
+    const heading = (lines: string[]) =>
+      rightRows(lines).map(row => bare(row).trim()).find(row => row.startsWith("Prompt"));
+    const two = detail({
       progress: [agentEntry({ index: 0, state: "done", promptPreview: "one\ntwo" })],
     });
-    expect(two.find(l => l.includes("Prompt"))).toBe("  Prompt  2 lines");
-    const one = dialog({ progress: [agentEntry({ index: 0, state: "done", promptPreview: "solo" })] });
-    expect(one.find(l => l.includes("Prompt"))).toBe("  Prompt  1 line");
+    expect(heading(two)).toBe("Prompt · 2 lines");
+    const one = detail({ progress: [agentEntry({ index: 0, state: "done", promptPreview: "solo" })] });
+    expect(heading(one)).toBe("Prompt · 1 line");
   });
 
   it("uses Claude Code's copy for a prompt and activity that do not exist yet", () => {
-    const lines = dialog({ progress: [agentEntry({ index: 0, state: "start", queuedAt: START })] });
+    const lines = detail({ progress: [agentEntry({ index: 0, state: "start", queuedAt: START })] });
     expect(section(lines, "Prompt")).toEqual([`  ${WORKFLOW_DIALOG_COPY.availableOnceStarted}`]);
     expect(section(lines, "Activity")).toEqual(["  Available once the agent starts."]);
     expect(section(lines, "Outcome")).toEqual(["  Waiting for an agent slot."]);
   });
 
   it("distinguishes no-tool-calls-yet from no-tool-calls-ever", () => {
-    const running = dialog({ progress: [agentEntry({ index: 0, state: "progress", startedAt: START })] });
+    const running = detail({ progress: [agentEntry({ index: 0, state: "progress", startedAt: START })] });
     expect(section(running, "Activity")).toEqual(["  No tool calls yet."]);
-    const finished = dialog({ progress: [agentEntry({ index: 0, state: "done" })] });
+    const finished = detail({ progress: [agentEntry({ index: 0, state: "done" })] });
     expect(section(finished, "Activity")).toEqual(["  No tool calls."]);
   });
 
   it("heads Activity with the tool-call count and admits it has no transcript", () => {
-    const lines = dialog({ progress: [agentEntry({ index: 0, state: "done", toolCalls: 3 })] });
-    expect(lines.find(l => l.includes("Activity"))).toBe("  Activity  last 3 tool calls");
+    const heading = (lines: string[]) =>
+      rightRows(lines).map(row => bare(row).trim()).find(row => row.startsWith("Activity"));
+    const lines = detail({ progress: [agentEntry({ index: 0, state: "done", toolCalls: 3 })] });
+    expect(heading(lines)).toBe("Activity · 3 tool calls");
     expect(section(lines, "Activity")).toEqual(["  Transcript not available."]);
-    const one = dialog({ progress: [agentEntry({ index: 0, state: "done", toolCalls: 1 })] });
-    expect(one.find(l => l.includes("Activity"))).toBe("  Activity  last 1 tool call");
+    const one = detail({ progress: [agentEntry({ index: 0, state: "done", toolCalls: 1 })] });
+    expect(heading(one)).toBe("Activity · 1 tool call");
   });
 
   it("writes a different Outcome for every terminal state", () => {
     const outcome = (entry: Partial<WorkflowAgentEntry>, task?: WorkflowCardTask) =>
-      section(dialog({ progress: [agentEntry({ index: 0, ...entry })], task }), "Outcome");
+      section(detail({ progress: [agentEntry({ index: 0, ...entry })], task }), "Outcome");
 
     expect(outcome({ state: "error", skipped: true })).toEqual(["  Skipped by user."]);
     expect(outcome({ state: "error", error: "boom" })).toEqual(["  boom"]);
@@ -393,10 +471,11 @@ describe("per-agent detail", () => {
   });
 
   it("omits the detail sections entirely when nothing is selected", () => {
-    const lines = dialog({ progress: [] });
+    const lines = detail({ progress: [] });
     expect(lines.join("\n")).not.toContain("Prompt");
     expect(lines.join("\n")).not.toContain("Outcome");
-    expect(section(lines, "Agents")).toEqual([`  ${WORKFLOW_DIALOG_COPY.noAgents}`]);
+    expect(rightRows(lines).map(row => row.trim()).filter(Boolean)).toEqual([]);
+    expect(leftRows(lines).map(row => row.trim())).toEqual([WORKFLOW_DIALOG_COPY.noAgents]);
   });
 });
 
@@ -426,7 +505,7 @@ describe("keys", () => {
   });
 
   it("moves the agent selection with j/k and clamps at both ends", () => {
-    const agents = { pane: "agents" as const };
+    const agents = { level: "agent" as const };
     expect(press("j", agents)?.state.selectedAgent).toBe(1);
     expect(press("j", { ...agents, selectedAgent: 1 })?.state.selectedAgent).toBe(1);
     expect(press("k", { ...agents, selectedAgent: 1 })?.state.selectedAgent).toBe(0);
@@ -440,23 +519,35 @@ describe("keys", () => {
   });
 
   it("never runs the cursor off an empty list", () => {
-    const empty = input({ progress: [], state: { pane: "agents" } });
+    const empty = input({ progress: [], state: { level: "agent" } });
     const view = resolveWorkflowDialog(empty);
     expect(handleWorkflowDialogKey("j", empty.state, view)?.state.selectedAgent).toBe(0);
     expect(view.selectedEntry).toBeUndefined();
   });
 
-  it("toggles the pane focus, and the focused pane is the marked one", () => {
-    expect(press("\t")?.state.pane).toBe("agents");
-    expect(press("\t", { pane: "agents" })?.state.pane).toBe("phases");
+  it("opens the selected phase's agents, and escape comes back", () => {
+    expect(press("\r")?.state.level).toBe("agent");
+    expect(press("\x1b", { level: "agent" })?.state.level).toBe("phases");
+    // Back one level, not out of the dialog — a wrong turn must not cost it.
+    expect(press("\x1b", { level: "agent" })?.action).toBeUndefined();
+  });
 
-    const phases = dialog({ progress });
-    expect(phases.find(l => l.includes("Phases"))).toBe("▸ Phases");
-    expect(phases.find(l => l.includes("Agents"))?.startsWith("  Agents")).toBe(true);
+  it("refuses to open a phase with nothing in it", () => {
+    // A subview with no rows and no detail is a dead end to back out of.
+    const empty = input({ progress: [], state: {} });
+    expect(handleWorkflowDialogKey("\r", empty.state, resolveWorkflowDialog(empty))?.state.level).toBe("phases");
+  });
 
-    const agents = dialog({ progress, state: { pane: "agents" } });
-    expect(agents.find(l => l.includes("Phases"))).toBe("  Phases");
-    expect(agents.find(l => l.includes("Agents"))?.startsWith("▸ Agents")).toBe(true);
+  it("swaps which pane holds which list when it opens", () => {
+    const overview = dialog({ progress });
+    expect(paneTitles(overview).left).toBe("Phases");
+    expect(paneTitles(overview).right).toBe("Review · 2 agents");
+
+    const opened = dialog({ progress, state: { level: "agent" } });
+    // The agents move left and the selected one's detail takes the right. The
+    // left title is truncated to the narrow pane, marker and all.
+    expect(paneTitles(opened).left).toBe("Review · 2 agen…");
+    expect(paneTitles(opened).right).toBe("a");
   });
 
   it("cycles the filter and resets the agent cursor with it", () => {
@@ -469,9 +560,12 @@ describe("keys", () => {
   it("toggles the prompt expansion", () => {
     expect(press("e")?.state.promptExpanded).toBe(true);
     expect(press("e", { promptExpanded: true })?.state.promptExpanded).toBe(false);
+    // Enter means "open" at the overview and "expand" once opened, which is the
+    // only reading under which one key does the obvious thing at both levels.
+    expect(press("\r", { level: "agent" })?.state.promptExpanded).toBe(true);
   });
 
-  it("cancels on escape", () => {
+  it("cancels on escape from the overview", () => {
     expect(press("\x1b")?.action).toEqual({ kind: "cancel" });
   });
 
@@ -484,16 +578,127 @@ describe("keys", () => {
     });
   });
 
+  /** A run whose phase 0 holds one queued, one running and one finished agent. */
+  const mixed: WorkflowEntry[] = [
+    { type: "workflow_phase", index: 0, title: "Review" },
+    agentEntry({ index: 0, label: "queued", phaseIndex: 0, state: "start", queuedAt: START }),
+    agentEntry({ index: 1, label: "running", phaseIndex: 0, state: "progress", queuedAt: START, startedAt: START }),
+    agentEntry({ index: 2, label: "done", phaseIndex: 0, state: "done" }),
+  ];
+  const pressMixed = (data: string, selectedAgent: number) => {
+    const full = input({ progress: mixed, state: { level: "agent", selectedAgent } });
+    return handleWorkflowDialogKey(data, full.state, resolveWorkflowDialog(full));
+  };
+
   it("raises skip and retry against the selected agent's stable index", () => {
-    const at = { pane: "agents" as const, selectedAgent: 1 };
-    expect(press("s", at)?.action).toEqual({ kind: "skip", index: 1 });
-    expect(press("r", at)?.action).toEqual({ kind: "retry", index: 1 });
-    // Phase 1 holds the agent whose index is 2 — the row position is not it.
-    expect(press("s", { selectedPhase: 1 })?.action).toEqual({ kind: "skip", index: 2 });
+    // Row position is not index: phase 0's second row is index 1.
+    expect(pressMixed("s", 1)?.action).toEqual({ kind: "skip", index: 1 });
+    expect(pressMixed("r", 1)?.action).toEqual({ kind: "retry", index: 1 });
+  });
+
+  it("offers skip but not retry on an agent that has not started", () => {
+    // Nothing has been spawned to stop and start over, but the call can still
+    // be given up on.
+    expect(pressMixed("s", 0)?.action).toEqual({ kind: "skip", index: 0 });
+    expect(pressMixed("r", 0)).toBeUndefined();
+  });
+
+  it("refuses both on an agent that has already settled", () => {
+    // Its `agent()` call has its value; there is nothing left to skip or redo.
+    expect(pressMixed("s", 2)).toBeUndefined();
+    expect(pressMixed("r", 2)).toBeUndefined();
+  });
+
+  it("refuses both once the run itself has stopped", () => {
+    const settled = input({
+      progress: mixed,
+      task: { status: "killed", startTime: START, endTime: START + 10 },
+      state: { level: "agent", selectedAgent: 1 },
+    });
+    const view = resolveWorkflowDialog(settled);
+    expect(handleWorkflowDialogKey("s", settled.state, view)).toBeUndefined();
+    expect(handleWorkflowDialogKey("r", settled.state, view)).toBeUndefined();
   });
 
   it("leaves an unbound key alone", () => {
     expect(press("z")).toBeUndefined();
+  });
+
+  it("refuses the run-level actions once the run has settled", () => {
+    // The footer already hides `x stop` and `p pause` on a finished run, so the
+    // keys have to agree: stopping something that already stopped reports a
+    // success that did not happen.
+    for (const status of ["completed", "failed", "killed"] as const) {
+      const settled = input({ progress, task: { status, startTime: START, endTime: START + 10 } });
+      const view = resolveWorkflowDialog(settled);
+      expect(handleWorkflowDialogKey("x", settled.state, view)).toBeUndefined();
+      expect(handleWorkflowDialogKey("p", settled.state, view)).toBeUndefined();
+    }
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * Frame height
+ * ------------------------------------------------------------------------- */
+
+describe("frame height", () => {
+  /** Every row of the frame's body, padding included — the box's real height. */
+  const bodyHeight = (over: DialogOverrides): number => cells(dialog(over)).length;
+
+  const phased = (agents: number): WorkflowEntry[] => [
+    { type: "workflow_phase", index: 0, title: "Review" },
+    ...Array.from({ length: agents }, (_, i) =>
+      agentEntry({ index: i, label: `a${i}`, phaseIndex: 0, state: "done" }),
+    ),
+  ];
+
+  it("sizes the box to its content instead of a fixed height", () => {
+    // A three-agent run in a twenty-two row box is twenty rows of nothing,
+    // sitting in the conversation under everything else that happened.
+    expect(bodyHeight({ progress: phased(3) })).toBeLessThan(DEFAULT_PANE_BODY_ROWS);
+  });
+
+  it("keeps a floor so a one-agent run still reads as a pane", () => {
+    expect(bodyHeight({ progress: phased(1) })).toBe(MIN_PANE_BODY_ROWS);
+  });
+
+  it("grows with the content", () => {
+    const small = bodyHeight({ progress: phased(3) });
+    const large = bodyHeight({ progress: phased(12) });
+    expect(large).toBeGreaterThan(small);
+    expect(large).toBe(12);
+  });
+
+  it("stops growing at the cap, however large the run", () => {
+    // A 200-agent fan-out must not paste 200 rows into the scrollback; the
+    // window inside the pane is what scrolls instead.
+    expect(bodyHeight({ progress: phased(200) })).toBe(DEFAULT_PANE_BODY_ROWS);
+  });
+
+  /**
+   * The detail pane is the one thing in the dialog that is never windowed — an
+   * expanded prompt is however many lines the prompt has — so it is where the
+   * cap has to actually hold.
+   */
+  const longPrompt: WorkflowEntry[] = [
+    { type: "workflow_phase", index: 0, title: "Review" },
+    agentEntry({
+      index: 0,
+      label: "a",
+      phaseIndex: 0,
+      state: "done",
+      promptPreview: Array.from({ length: 60 }, (_, i) => `prompt line ${i}`).join("\n"),
+    }),
+  ];
+  const expanded = { level: "agent" as const, promptExpanded: true };
+
+  it("caps the detail pane when a long prompt is expanded", () => {
+    expect(bodyHeight({ progress: longPrompt, state: expanded })).toBe(DEFAULT_PANE_BODY_ROWS);
+  });
+
+  it("honours an explicit cap from the caller", () => {
+    expect(bodyHeight({ progress: longPrompt, state: expanded, bodyRows: 9 })).toBe(9);
+    expect(bodyHeight({ progress: phased(200), bodyRows: 9 })).toBe(9);
   });
 });
 
@@ -552,6 +757,25 @@ describe("width", () => {
  * Header
  * ------------------------------------------------------------------------- */
 
+describe("replayed rows", () => {
+  it("annotates a replayed agent's row in the agents pane", () => {
+    // The helper is unit-tested above; this pins that the row actually carries
+    // it, which is the thing a person resuming a run looks at.
+    const lines = dialog({
+      progress: [
+        agentEntry({ index: 0, label: "audit", state: "done", cached: true }),
+        agentEntry({ index: 1, label: "verify", state: "done" }),
+      ],
+      now: START,
+    });
+
+    const audit = lines.find(line => line.includes("audit"))!;
+    const verify = lines.find(line => line.includes("verify"))!;
+    expect(audit).toContain("from resume journal");
+    expect(verify).not.toContain("resume journal");
+  });
+});
+
 describe("header", () => {
   it("carries the shared N/M agents · elapsed line and the run's subtext", () => {
     const lines = dialog({
@@ -562,9 +786,11 @@ describe("header", () => {
       meta: { name: "review-changes", description: "Review changed files" },
       now: START + 72_000,
     });
-    expect(lines[0]).toContain("Workflow  review-changes");
-    expect(lines[0]).toContain("1/2 agents · 1m12s");
-    expect(lines[1]).toBe("  Review changed files");
+    // The run's own name leads, with the description and the counters under
+    // it — the tool's name is the card's job, not the dialog's.
+    expect(lines[0]).toBe(" review-changes");
+    expect(lines[1]).toContain("Review changed files");
+    expect(lines[1]).toContain("1/2 agents · 1m12s");
   });
 });
 
@@ -578,13 +804,21 @@ describe("WorkflowDialog component", () => {
     task: { status: "running" as const, workflowName: "wf", startTime: START },
   });
 
-  function harness(): { dialog: WorkflowDialog; calls: string[]; closed: boolean[] } {
+  /** The same run with its only agent still going, so the per-agent keys apply. */
+  const liveSource = () => ({
+    progress: [agentEntry({ index: 7, label: "only", state: "progress", queuedAt: START, startedAt: START })],
+    task: { status: "running" as const, workflowName: "wf", startTime: START },
+  });
+
+  function harness(
+    from: () => ReturnType<typeof source> = source,
+  ): { dialog: WorkflowDialog; calls: string[]; closed: boolean[] } {
     const calls: string[] = [];
     const closed: boolean[] = [];
     const tui = { requestRender: () => calls.push("render") } as unknown as never;
     const instance = new WorkflowDialog(
       tui,
-      source,
+      from,
       theme,
       () => closed.push(true),
       {
@@ -603,13 +837,13 @@ describe("WorkflowDialog component", () => {
     expect(rendered).toHaveLength(
       layoutWorkflowDialog({ ...source(), state: initialWorkflowDialogState(), width: 86 }).length,
     );
-    expect(rendered[0]).toContain("<toolTitle>*Workflow*</toolTitle>");
+    expect(rendered[0]).toContain("<toolTitle>*wf*</toolTitle>");
     expect(rendered.join("\n")).toContain("<success>✔</success>");
     instance.dispose();
   });
 
   it("dispatches the injected actions and closes on escape", () => {
-    const { dialog: instance, calls, closed } = harness();
+    const { dialog: instance, calls, closed } = harness(liveSource);
     instance.handleInput("x");
     instance.handleInput("p");
     instance.handleInput("s");
@@ -623,8 +857,9 @@ describe("WorkflowDialog component", () => {
 
   it("keeps its state across keypresses", () => {
     const { dialog: instance } = harness();
-    instance.handleInput("\t");
-    expect(instance.render(86).find(l => l.includes("Agents"))).toContain("▸ ");
+    // Opening a phase is state the next render has to still be in.
+    instance.handleInput("\r");
+    expect(instance.render(86).some(l => l.includes("Prompt"))).toBe(true);
     instance.dispose();
   });
 });
@@ -635,12 +870,24 @@ describe("key hints reflect the wired actions", () => {
   ];
   // Wide enough that the footer is never clipped — these assert which hints are
   // present, not how they truncate (that is covered by the width tests).
-  const hintLine = (over: DialogOverrides) =>
-    dialog({ width: 200, ...over }).find(line => line.includes("j/k move")) ?? "";
+  // The footer is the last line, and the per-agent keys only exist in the
+  // subview — so a test about skip/retry has to be looking at that level.
+  const hintLine = (over: DialogOverrides) => dialog({ width: 200, ...over }).at(-1) ?? "";
+  const agentHints = (over: DialogOverrides) =>
+    hintLine({ ...over, state: { ...over.state, level: "agent" } });
 
-  it("advertises every key when availability is not declared", () => {
+  it("advertises the overview's own keys", () => {
     const hints = hintLine({ progress: live });
-    for (const key of ["s skip", "r retry", "p pause", "x stop", "esc close"]) {
+    for (const key of ["↑↓ select", "⏎ open", "f filter", "p pause", "x stop", "esc close"]) {
+      expect(hints).toContain(key);
+    }
+    // Nothing that belongs to a single agent, because none is open.
+    expect(hints).not.toContain("s skip");
+  });
+
+  it("advertises every per-agent key when availability is not declared", () => {
+    const hints = agentHints({ progress: live });
+    for (const key of ["↑↓ agent", "s skip", "r retry", "p pause", "x stop", "esc back"]) {
       expect(hints).toContain(key);
     }
   });
@@ -648,15 +895,34 @@ describe("key hints reflect the wired actions", () => {
   it("hides the keys the caller did not wire", () => {
     // A caller that wires only onKill must not advertise skip/retry/pause —
     // a footer promising a key that silently does nothing is worse than no key.
-    const hints = hintLine({
+    const hints = agentHints({
       progress: live,
       available: { onKill: true, onPause: false, onResume: false, onSkipAgent: false, onRetryAgent: false },
     });
     expect(hints).toContain("x stop");
-    expect(hints).toContain("esc close");
+    expect(hints).toContain("esc back");
     expect(hints).not.toContain("s skip");
     expect(hints).not.toContain("r retry");
     expect(hints).not.toContain("p pause");
+  });
+
+  it("offers skip but not retry on an agent that has not started", () => {
+    const queued: WorkflowEntry[] = [
+      { type: "workflow_agent", index: 0, label: "a", phaseIndex: 0, state: "start", queuedAt: START },
+    ];
+    const hints = agentHints({ progress: queued });
+    expect(hints).toContain("s skip");
+    // There is no child to stop and start again yet.
+    expect(hints).not.toContain("r retry");
+  });
+
+  it("offers neither once the agent has settled", () => {
+    const settled: WorkflowEntry[] = [
+      { type: "workflow_agent", index: 0, label: "a", phaseIndex: 0, state: "done" },
+    ];
+    const hints = agentHints({ progress: settled });
+    expect(hints).not.toContain("s skip");
+    expect(hints).not.toContain("r retry");
   });
 
   it("hides stop when kill is not wired", () => {
@@ -681,8 +947,11 @@ describe("component availability", () => {
     ] as WorkflowEntry[],
     task: { status: "running", workflowName: "wf", startTime: START } as WorkflowCardTask,
   });
-  const footer = (instance: WorkflowDialog) =>
-    instance.render(200).find(line => line.includes("j/k move")) ?? "";
+  /** The footer of the subview, where the per-agent keys are advertised. */
+  const footer = (instance: WorkflowDialog) => {
+    instance.handleInput("\r");
+    return instance.render(200).at(-1) ?? "";
+  };
 
   it("advertises only the actions it was given", () => {
     // Wiring just onKill must not promise skip/retry/pause.
@@ -709,7 +978,7 @@ describe("component availability", () => {
     const instance = new WorkflowDialog(tui, liveSource, theme, () => {});
     const hints = footer(instance);
     for (const key of ["s skip", "r retry", "p pause", "x stop"]) expect(hints).not.toContain(key);
-    expect(hints).toContain("esc close");
+    expect(hints).toContain("esc back");
     instance.dispose();
   });
 });

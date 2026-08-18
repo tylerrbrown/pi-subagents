@@ -6,6 +6,7 @@ import {
   runWorkflow,
   WORKFLOW_AGENT_CAP,
   WORKFLOW_ITEM_CAP,
+  type WorkflowControl,
   type WorkflowHost,
   type WorkflowRunResult,
   type WorkflowSpawnRequest,
@@ -83,6 +84,33 @@ describe("script globals", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].agentType).toBe("general-purpose");
     expect(calls[0].label).toBe("hello");
+  });
+
+  it("carries opts.effort to the spawn request", async () => {
+    const { host, calls } = stubHost();
+    const result = await run('await agent("deep", { effort: "xhigh" });\nreturn null;', { host });
+
+    expect(result.status).toBe("completed");
+    expect(calls[0].effort).toBe("xhigh");
+  });
+
+  it("leaves effort unset when the script does not ask for one", async () => {
+    // Unset, not defaulted: the agent definition's `thinking` and then the
+    // parent's still decide, exactly as they do for `model`.
+    const { host, calls } = stubHost();
+    await run('await agent("plain");\nreturn null;', { host });
+
+    expect(calls[0].effort).toBeUndefined();
+  });
+
+  it("rejects an effort level pi does not have", async () => {
+    const { host, calls } = stubHost();
+    const result = await run('await agent("a", { effort: "ultra" });\nreturn null;', { host });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("agent() opts.effort must be one of");
+    // Rejected at the call, so nothing was spawned at the wrong depth.
+    expect(calls).toHaveLength(0);
   });
 
   it("passes args through verbatim and exposes meta to the script", async () => {
@@ -528,5 +556,274 @@ describe("abort", () => {
     const result = await run('await agent("never");', { host, signal: AbortSignal.abort() });
     expect(result.status).toBe("killed");
     expect(calls).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * Live control — pause, skip, retry
+ * ------------------------------------------------------------------------- */
+
+describe("run control", () => {
+  /** A host whose children hang until the test lets them go, or are aborted. */
+  function controllableHost() {
+    const started: string[] = [];
+    const aborted: string[] = [];
+    const release = new Map<string, (r: WorkflowSpawnResult) => void>();
+    const host: WorkflowHost = {
+      spawnAgent(request) {
+        started.push(request.agentId);
+        return new Promise<WorkflowSpawnResult>(resolve => {
+          release.set(request.agentId, resolve);
+        });
+      },
+      abortAgent(agentId) {
+        aborted.push(agentId);
+        // What the real host does: the child is stopped, and a stopped child
+        // comes back as a skipped result rather than a failure.
+        release.get(agentId)?.({ ok: false, skipped: true, error: "Stopped." });
+      },
+    };
+    return {
+      host,
+      started: () => started,
+      aborted: () => aborted,
+      finish: (agentId: string, text: string) => release.get(agentId)?.({ ok: true, text }),
+    };
+  }
+
+  /** Wait until `predicate` holds, so a test never races the worker thread. */
+  async function until(predicate: () => boolean, what: string): Promise<void> {
+    for (let i = 0; i < 400; i++) {
+      if (predicate()) return;
+      await sleep(5);
+    }
+    throw new Error(`timed out waiting for ${what}`);
+  }
+
+  it("stops starting agents while paused, and starts them again on resume", async () => {
+    const stub = controllableHost();
+    let control: WorkflowControl | undefined;
+    const done = run(
+      "const a = await agent('one'); const b = await agent('two'); return [a, b].join('|');",
+      {
+        host: stub.host,
+        concurrency: 4,
+        onControl: c => { control = c; },
+      },
+    );
+
+    await until(() => stub.started().length === 1, "the first agent to start");
+    control?.pause();
+    expect(control?.isPaused()).toBe(true);
+    stub.finish("wf-agent-0", "first");
+
+    // The second call is held at the gate — it must not reach the host.
+    await sleep(60);
+    expect(stub.started()).toEqual(["wf-agent-0"]);
+
+    control?.resume();
+    await until(() => stub.started().length === 2, "the second agent to start");
+    stub.finish("wf-agent-1", "second");
+
+    expect((await done).value).toBe("first|second");
+  });
+
+  it("skips a running agent, so its call returns null", async () => {
+    const stub = controllableHost();
+    let control: WorkflowControl | undefined;
+    const done = run("return await agent('one');", {
+      host: stub.host,
+      onControl: c => { control = c; },
+    });
+
+    await until(() => stub.started().length === 1, "the agent to start");
+    expect(control?.skip(0)).toBe(true);
+
+    const result = await done;
+    expect(stub.aborted()).toEqual(["wf-agent-0"]);
+    expect(result.value).toBeNull();
+    expect(agentEntries(result.progress).at(-1)).toMatchObject({ state: "error", skipped: true });
+  });
+
+  it("skips an agent held at a pause without waiting for the resume", async () => {
+    const stub = controllableHost();
+    let control: WorkflowControl | undefined;
+    const done = run(
+      "const a = await agent('one'); const b = await agent('two'); return JSON.stringify([a, b]);",
+      { host: stub.host, onControl: c => { control = c; } },
+    );
+
+    await until(() => stub.started().length === 1, "the first agent to start");
+    control?.pause();
+    stub.finish("wf-agent-0", "first");
+    await until(() => control?.skip(1) === true, "the second call to reach the gate");
+
+    const result = await done;
+    // Never handed to the host at all, and the script saw a null for it.
+    expect(stub.started()).toEqual(["wf-agent-0"]);
+    expect(result.value).toBe('["first",null]');
+  });
+
+  it("retries a running agent into the same call", async () => {
+    const stub = controllableHost();
+    let control: WorkflowControl | undefined;
+    const done = run("return await agent('one');", {
+      host: stub.host,
+      onControl: c => { control = c; },
+    });
+
+    await until(() => stub.started().length === 1, "the first attempt to start");
+    expect(control?.retry(0)).toBe(true);
+
+    // Same call, run again — the script is still awaiting it, which is the only
+    // reason a retry can deliver anything.
+    await until(() => stub.started().length === 2, "the second attempt to start");
+    stub.finish("wf-agent-0", "second time lucky");
+
+    const result = await done;
+    expect(result.value).toBe("second time lucky");
+    expect(agentEntries(result.progress).at(-1)).toMatchObject({
+      state: "done",
+      attempt: 2,
+      lastAttemptReason: "user-retry",
+    });
+  });
+
+  it("refuses to act on an agent that is not live", async () => {
+    const stub = controllableHost();
+    let control: WorkflowControl | undefined;
+    const done = run("return await agent('one');", {
+      host: stub.host,
+      onControl: c => { control = c; },
+    });
+
+    await until(() => stub.started().length === 1, "the agent to start");
+    // Nothing at index 9, and a retry needs a child to stop.
+    expect(control?.skip(9)).toBe(false);
+    expect(control?.retry(9)).toBe(false);
+
+    stub.finish("wf-agent-0", "done");
+    await done;
+    // Settled: its value is already the script's, so there is nothing to redo.
+    expect(control?.skip(0)).toBe(false);
+    expect(control?.retry(0)).toBe(false);
+  });
+
+  it("does not leave an agent parked when a paused run is aborted", async () => {
+    const stub = controllableHost();
+    const abort = new AbortController();
+    let control: WorkflowControl | undefined;
+    const done = run(
+      "const a = await agent('one'); return await agent('two');",
+      { host: stub.host, signal: abort.signal, onControl: c => { control = c; } },
+    );
+
+    await until(() => stub.started().length === 1, "the first agent to start");
+    control?.pause();
+    stub.finish("wf-agent-0", "first");
+    await sleep(40);
+
+    abort.abort();
+    // Resolves at all: a held agent must not outlive the run it belongs to.
+    expect((await done).status).toBe("killed");
+  });
+});
+
+describe("pause and the concurrency limit", () => {
+  /** A host whose children hang until the test lets them go. */
+  function holdingHost() {
+    const started: string[] = [];
+    const release = new Map<string, (r: WorkflowSpawnResult) => void>();
+    const host: WorkflowHost = {
+      spawnAgent(request) {
+        started.push(request.agentId);
+        return new Promise<WorkflowSpawnResult>(resolve => release.set(request.agentId, resolve));
+      },
+      abortAgent(agentId) {
+        release.get(agentId)?.({ ok: false, skipped: true, error: "Stopped." });
+      },
+    };
+    return { host, started: () => started, finish: (id: string, text: string) => release.get(id)?.({ ok: true, text }) };
+  }
+
+  it("holds back an agent that was already queued behind the limit", async () => {
+    // The gate is before the semaphore, so an agent waiting for a permit when
+    // the pause lands never passed it. Without a second look after the permit
+    // arrives, a pause leaks exactly as many agents as happened to be queued.
+    const stub = holdingHost();
+    let control: WorkflowControl | undefined;
+    const done = run(
+      "const r = await parallel([() => agent('a'), () => agent('b')]); return JSON.stringify(r);",
+      { host: stub.host, concurrency: 1, onControl: c => { control = c; } },
+    );
+
+    // One permit, so 'a' runs and 'b' is queued behind it.
+    for (let i = 0; i < 40 && stub.started().length < 1; i++) await sleep(5);
+    expect(stub.started()).toEqual(["wf-agent-0"]);
+
+    control?.pause();
+    stub.finish("wf-agent-0", "first");
+    await sleep(80);
+    // The freed permit must not start 'b' — the run is paused.
+    expect(stub.started()).toEqual(["wf-agent-0"]);
+
+    control?.resume();
+    for (let i = 0; i < 40 && stub.started().length < 2; i++) await sleep(5);
+    stub.finish("wf-agent-1", "second");
+    expect((await done).value).toBe('["first","second"]');
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * Scripts written for Claude Code
+ * ------------------------------------------------------------------------- */
+
+describe("Claude Code option compatibility", () => {
+  it("names opts.schema instead of quietly returning raw text", async () => {
+    // Claude Code's canonical example is `agent(p, {schema: FINDINGS})`, which
+    // there returns a validated object. Ignoring it hands the script a string,
+    // and the script then reads a field off it — so the run dies several lines
+    // later with "cannot read properties of undefined", nowhere near the cause.
+    const stub = stubHost();
+    const result = await run("return await agent('go', { schema: { type: 'object' } });", {
+      host: stub.host,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/opts\.schema/);
+    // Named *and* answered: a ported script's author needs the workaround, not
+    // just the word "unsupported".
+    expect(result.error).toMatch(/JSON\.parse/);
+    // And it never spent a model call finding out.
+    expect(stub.calls).toHaveLength(0);
+  });
+
+  it("names a misspelt option rather than ignoring it", async () => {
+    const stub = stubHost();
+    const result = await run("return await agent('go', { agenttype: 'Explore' });", { host: stub.host });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/agenttype/);
+    expect(result.error).toMatch(/agentType/);
+  });
+
+  it("accepts every option a Claude Code script actually uses", async () => {
+    const stub = stubHost();
+    const result = await run(
+      "return await agent('go', { label: 'L', phase: 'P', agentType: 'general-purpose', model: 'haiku', effort: 'high', isolation: 'worktree' });",
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(stub.calls[0]).toMatchObject({ label: "L", agentType: "general-purpose", effort: "high" });
+  });
+
+  it("passes each pipeline stage (previous, item, index), as Claude Code does", async () => {
+    const result = await run(
+      "return JSON.stringify(await pipeline(['a','b'], (p, item, i) => item + i, (p, item, i) => p + '/' + item + i));",
+      { host: stubHost().host },
+    );
+
+    expect(result.value).toBe('["a0/a0","b1/b1"]');
   });
 });

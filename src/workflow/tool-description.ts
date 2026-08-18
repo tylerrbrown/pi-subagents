@@ -1,5 +1,5 @@
 /**
- * tool-description.ts — the model-facing description of the `Workflow` tool.
+ * tool-description.ts — the model-facing description of the `SubagentWorkflow` tool.
  *
  * This is a deliverable, not boilerplate. The orchestration *patterns* — fan out
  * with pipeline, verify adversarially, loop until dry — are deliberately NOT
@@ -28,7 +28,7 @@ The tool returns a task ID immediately and the run continues in the background. 
 
 Use \`Agent\` for one delegated task, or a handful you can name up front in a single message.
 
-Use \`Workflow\` when:
+Use \`SubagentWorkflow\` when:
 - the number of agents depends on something discovered at runtime ("audit every route file");
 - work flows through stages and later stages depend on earlier output;
 - you want the same treatment applied uniformly across many items;
@@ -64,17 +64,29 @@ return findings.filter(Boolean)
 
 \`meta\` must be a **pure literal** — no variables, function calls, spreads, or template interpolation. It is read before the script runs, so the phases can be displayed before any agent starts. \`name\` and \`description\` are required; \`phases\` and \`whenToUse\` are optional.
 
+## Resuming a run
+
+Editing a script and re-running it normally re-pays for every agent. \`resumeFromRunId: "<run id>"\` avoids that: the run's unchanged leading \`agent()\` calls come straight back from its record, and the first call that changed — plus everything after it — runs live. Same script and args means nothing re-runs at all.
+
+It is a *prefix*, not a lookup: a later call that still matches is not reused once an earlier one has changed, because its recorded answer was produced downstream of work that no longer exists. An agent that failed is never replayed as a failure, so resuming a broken run retries exactly the thing that broke. Same session only, and the run has to have finished — stop it from \`/agents → Workflows\` first.
+
+## Saved workflows
+
+A script you will run more than once belongs in a file: put it in \`.pi/workflows/<name>.js\` (or \`.agents/workflows/\`, or \`<agent dir>/workflows/\` for one that follows the user everywhere) and call it with \`name: "<name>"\` instead of re-sending the source. \`scriptPath\` and \`script\` both take precedence over \`name\`, and a saved run reports its own file back, so iterating on it is still edit-the-file-and-re-run.
+
 ## Globals
 
-- **\`agent(prompt, opts?)\` → \`Promise<string | null>\`** — spawn one subagent and wait for its final text. Returns \`null\` if it is skipped from the /workflows view or fails terminally, so filter with \`.filter(Boolean)\` when a null would break later stages.
+- **\`agent(prompt, opts?)\` → \`Promise<string | null>\`** — spawn one subagent and wait for its final text. Returns \`null\` if it is skipped from the /agents → Workflows view or fails terminally, so filter with \`.filter(Boolean)\` when a null would break later stages.
   - \`label\` — display name in the progress tree. Also the handle for \`resume\`.
   - \`phase\` — put this agent in a named group, overriding the ambient \`phase()\`. **Use this inside \`pipeline\`/\`parallel\` stages**, where the ambient phase races.
   - \`agentType\` — which agent definition to use. Available types:
 {{typeList}}
   - \`model\` — override the model ("provider/modelId", or fuzzy like "haiku").
+  - \`effort\` — reasoning effort for this child: \`minimal\`, \`low\`, \`medium\`, \`high\`, \`xhigh\`, \`max\`. Omit it to inherit — the agent definition's own level, then the parent's. Spend it where the thinking is: \`low\` for mechanical stages, a high tier only for the hardest verify or judge step.
   - \`isolation: "worktree"\` — run in a throwaway git worktree. Use ONLY when agents write files in parallel and would otherwise collide; it costs setup time and disk per agent.
   - \`gate: "<command>"\` — run a shell command after the agent finishes and require it to pass. A failing gate marks the agent failed and its output becomes the error. This is how you make a result *verified* rather than merely claimed — prefer \`gate: "npm test"\` over asking another agent whether the code looks right.
   - \`resume: "<label>"\` — continue the child that ran under that label instead of starting fresh, so an iterative loop keeps its context. Mutually exclusive with \`agentType\`; cannot be combined with \`gate\`.
+  - Any other key is rejected by name at the call. In particular there is no \`schema\` here — ask for JSON in the prompt and \`JSON.parse\` what comes back — and no \`budget\` global or nested \`workflow()\`.
 - **\`pipeline(items, ...stages)\` → \`Promise<any[]>\`** — run every item through every stage, with **no barrier between stages**. Each stage receives \`(previousResult, originalItem, index)\`. A stage that throws drops that item to \`null\` and skips its remaining stages.
 - **\`parallel(thunks)\` → \`Promise<any[]>\`** — run functions concurrently and wait for all of them. A thunk that throws becomes \`null\` without failing its siblings.
 - **\`phase(title)\`** — start a new progress group. Subsequent \`agent()\` calls are grouped under it.
@@ -108,7 +120,7 @@ Pick what fits; compose freely.
 
 ## Determinism
 
-\`Date.now()\`, \`new Date()\`, and \`Math.random()\` are unavailable and throw. Workflow scripts must be reproducible. Stamp timestamps after the workflow returns, or pass them in through \`args\`. For N varied samples, vary the prompt or label by index rather than reaching for randomness.
+\`Date.now()\`, \`new Date()\`, and \`Math.random()\` are unavailable and throw. SubagentWorkflow scripts must be reproducible. Stamp timestamps after the workflow returns, or pass them in through \`args\`. For N varied samples, vary the prompt or label by index rather than reaching for randomness.
 
 \`eval\` and \`Function(...)\` are disabled. There is no filesystem, network, or module access inside the script — all real work happens in the agents you spawn.
 

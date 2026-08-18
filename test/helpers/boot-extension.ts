@@ -51,6 +51,11 @@ export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
       emit: vi.fn(),
       on: vi.fn(() => vi.fn()),
     },
+    // Only bound after the session exists in real pi — the extension calls these
+    // from `session_start` for exactly that reason. Default to "nothing else is
+    // registered"; a test that cares overrides them.
+    getAllTools: vi.fn(() => [] as any[]),
+    getCommands: vi.fn(() => [] as any[]),
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
     exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),

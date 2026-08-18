@@ -83,8 +83,25 @@ function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | 
  * goes, not how WIDE. A parent's only limit on concurrent children is that each
  * spawn costs it a turn, which is unbounded when max turns is unlimited.
  */
-function occupiesPoolSlot(record: Pick<AgentRecord, "isBackground" | "parentAgentId">): boolean {
-  return !!record.isBackground && record.parentAgentId === undefined;
+function occupiesPoolSlot(
+  record: Pick<AgentRecord, "isBackground" | "parentAgentId" | "workflowId">,
+): boolean {
+  return !!record.isBackground && isTopLevelAgent(record);
+}
+
+/**
+ * Whether a record is one of the session's own agents, rather than something
+ * another agent or a workflow owns.
+ *
+ * The single definition behind every user-facing surface — the fleet list, the
+ * widget, the `/agents` menus, `@handle` resolution, and the completion events
+ * and session entries. An owned child reports through its owner, so surfacing
+ * it separately would double-count the same work in the places a person reads.
+ */
+export function isTopLevelAgent(
+  record: Pick<AgentRecord, "parentAgentId" | "workflowId">,
+): boolean {
+  return record.parentAgentId === undefined && record.workflowId === undefined;
 }
 
 interface SpawnArgs {
@@ -143,6 +160,16 @@ interface SpawnOptions {
    * scheduler so a fired job can't be deferred past its trigger window.
    */
   bypassQueue?: boolean;
+  /**
+   * The workflow run this child belongs to, when a workflow spawned it.
+   *
+   * Ownership, not decoration. A workflow's children are the workflow's — they
+   * report through its card, its notification and its dialog, so they are
+   * filtered out of every top-level surface exactly as nested children are, and
+   * they take no `maxConcurrent` slot: the run has its own concurrency cap, and
+   * counting them twice would let one workflow starve the whole session.
+   */
+  workflowId?: string;
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
   /**
@@ -350,10 +377,10 @@ export class AgentManager {
     const record: AgentRecord = {
       id,
       type,
-      // Nested children are filtered out of every top-level surface, so no
-      // handle: nothing can address them and they must not consume a name a
-      // top-level sibling could otherwise take.
-      handle: options.parentAgentId !== undefined
+      // Owned children — nested, or a workflow's — are filtered out of every
+      // top-level surface, so no handle: nothing can address them and they must
+      // not consume a name a top-level sibling could otherwise take.
+      handle: !isTopLevelAgent(options)
         ? undefined
         // A reclaimed handle is used as-is: it belongs to the conversation this
         // spawn is reopening, and re-deriving it would lose the numbering.
@@ -362,7 +389,7 @@ export class AgentManager {
       // Reclaimed here, or filled in below from `name` — in which case it must
       // see the handle this record just took, since both come out of the same
       // namespace.
-      alias: options.parentAgentId === undefined ? options.reclaim?.alias : undefined,
+      alias: isTopLevelAgent(options) ? options.reclaim?.alias : undefined,
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
@@ -378,6 +405,7 @@ export class AgentManager {
       invocation: options.invocation,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
+      workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
     };

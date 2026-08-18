@@ -261,6 +261,43 @@ function optionalText(value, what) {
   return requireText(value, what);
 }
 
+/**
+ * Reasoning effort a child may be spawned under — pi's \`ThinkingLevel\`.
+ *
+ * A superset of Claude Code's five, so a script written there runs here; the
+ * extra \`minimal\` is pi's own. Validated in the worker rather than the host
+ * because a typo should stop the script at the call that made it, not surface
+ * later as an agent that quietly ran at the wrong depth.
+ */
+const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Every option \`agent()\` understands.
+ *
+ * Checked rather than ignored, because the alternative is the worst failure a
+ * ported script can have. Claude Code's \`agent()\` also takes \`schema\`, and its
+ * own canonical example uses it; quietly dropping it hands the script the
+ * agent's raw text where it expected a validated object, and the run then dies
+ * several lines later reading a field off a string. A typo behaves the same
+ * way. Naming the option costs one error message and no model calls.
+ */
+const AGENT_OPTIONS = [
+  "label",
+  "phase",
+  "model",
+  "agentType",
+  "isolation",
+  "gate",
+  "resume",
+  "effort",
+];
+
+/** Claude Code options this runtime does not have, and why. */
+const UNSUPPORTED_AGENT_OPTIONS = {
+  schema: "there is no structured-output mode here, so the call would return the agent's raw text. "
+    + "Ask for JSON in the prompt and JSON.parse what comes back.",
+};
+
 /* ------------------------------------------------------------------ *
  * Script globals
  * ------------------------------------------------------------------ */
@@ -321,6 +358,16 @@ async function agent(prompt, opts) {
     throw new Error("agent(prompt, opts) expects opts to be an object.");
   }
 
+  for (const key of Object.keys(options)) {
+    if (AGENT_OPTIONS.indexOf(key) !== -1) continue;
+    const why = UNSUPPORTED_AGENT_OPTIONS[key];
+    throw new Error(
+      why !== undefined
+        ? "agent() opts." + key + " is not supported here: " + why
+        : "agent() opts." + key + " is not a recognised option. Supported: " + AGENT_OPTIONS.join(", ") + "."
+    );
+  }
+
   const label = optionalText(options.label, "agent() opts.label");
   const phaseName = optionalText(options.phase, "agent() opts.phase");
   const model = optionalText(options.model, "agent() opts.model");
@@ -331,6 +378,10 @@ async function agent(prompt, opts) {
   }
   const gate = optionalText(options.gate, "agent() opts.gate");
   const resume = optionalText(options.resume, "agent() opts.resume");
+  const effort = optionalText(options.effort, "agent() opts.effort");
+  if (effort !== undefined && EFFORT_LEVELS.indexOf(effort) === -1) {
+    throw new Error("agent() opts.effort must be one of: " + EFFORT_LEVELS.join(", ") + ".");
+  }
 
   // resume revives a child that already exists, so anything describing how to
   // *start* one is not a thing this call gets to decide — the revived child
@@ -350,6 +401,11 @@ async function agent(prompt, opts) {
     if (isolation !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.isolation are mutually exclusive: a resumed agent keeps the working tree it was started in."
+      );
+    }
+    if (effort !== undefined) {
+      throw new Error(
+        "agent() opts.resume and opts.effort are mutually exclusive: a resumed agent keeps the reasoning effort it was started with."
       );
     }
     if (gate !== undefined) {
@@ -373,6 +429,7 @@ async function agent(prompt, opts) {
     phaseTitle: phaseTitle,
     gate: gate,
     resume: resume,
+    effort: effort,
   });
   return result === undefined ? null : result;
 }

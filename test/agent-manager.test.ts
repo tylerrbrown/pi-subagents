@@ -319,6 +319,47 @@ describe("AgentManager — nested runtime propagation", () => {
     expect(manager.getRecord(siblingId)?.status).toBe("queued");
   });
 
+  it("starts a workflow's children regardless of the concurrency pool", async () => {
+    // A workflow bounds its own fan-out. Routing its agents through the session
+    // pool as well would let one run fill it and starve everything else — and
+    // the run itself is not in the pool to be drained behind them.
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager = new AgentManager(undefined, 1);
+
+    const holder = manager.spawn(mockPi, mockCtx, "general-purpose", "holder", {
+      description: "holder",
+      isBackground: true,
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "scout", "child", {
+      description: "child",
+      isBackground: true,
+      workflowId: "wf_run1",
+    });
+    // A second top-level background agent still queues — the pool is untouched.
+    const siblingId = manager.spawn(mockPi, mockCtx, "general-purpose", "sibling", {
+      description: "sibling",
+      isBackground: true,
+    });
+
+    expect(manager.getRecord(holder)?.status).toBe("running");
+    expect(manager.getRecord(childId)?.status).toBe("running");
+    expect(manager.getRecord(siblingId)?.status).toBe("queued");
+  });
+
+  it("gives a workflow's child no handle, so nothing can address it", () => {
+    // Same reasoning as a nested child: it is filtered out of every top-level
+    // surface, so a handle would name something unreachable and consume a name
+    // a visible agent could have taken.
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
+      description: "child",
+      workflowId: "wf_run1",
+    });
+    expect(manager.getRecord(id)?.handle).toBeUndefined();
+
+    const visible = manager.spawn(mockPi, mockCtx, "general-purpose", "mine", { description: "mine" });
+    expect(manager.getRecord(visible)?.handle).toBe("general-purpose");
+  });
+
   it("aborts owned children when the parent settles", async () => {
     let finishParent: ((value: any) => void) | undefined;
     // Children settle on abort, as a real run does when its signal fires.

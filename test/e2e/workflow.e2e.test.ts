@@ -15,13 +15,51 @@
  * No network and no keys: the faux backend answers every model call.
  */
 
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { encodeCwd } from "../../src/output-file.js";
+import { readJournal } from "../../src/workflow/journal.js";
 import { runPrintMode } from "../helpers/print-mode-runner.js";
 
-/** A `Workflow` tool call, the way the parent model would emit one. */
+/**
+ * A project directory with workflows switched on.
+ *
+ * Workflows are opt-in, and the switch is read at extension load — so it has to
+ * be on disk before the run boots, exactly as it would be for a real project
+ * that turned the feature on once. Without this the tool is never registered
+ * and the parent model has nothing to call.
+ */
+function workflowProject(): string {
+  const dir = mkdtempSync(join(tmpdir(), "subagents-wf-e2e-"));
+  mkdirSync(join(dir, ".pi"), { recursive: true });
+  writeFileSync(join(dir, ".pi", "subagents.json"), JSON.stringify({ workflowsEnabled: true }));
+  return dir;
+}
+
+/** A `SubagentWorkflow` tool call, the way the parent model would emit one. */
 const workflowCall = (script: string, id = "wf-call-1") =>
-  fauxToolCall("Workflow", { script }, { id });
+  fauxToolCall("SubagentWorkflow", { script }, { id });
+
+/**
+ * Every workflow journal written for `cwd`, across whatever session id the run
+ * ended up with. The path is derived the same way `sessionTaskDir` derives it.
+ */
+function journalsFor(cwd: string): string[] {
+  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
+  if (!existsSync(root)) return [];
+  const found: string[] = [];
+  for (const session of readdirSync(root)) {
+    const tasks = join(root, session, "tasks");
+    if (!existsSync(tasks)) continue;
+    for (const file of readdirSync(tasks)) {
+      if (file.endsWith(".workflow.jsonl")) found.push(join(tasks, file));
+    }
+  }
+  return found;
+}
 
 /** Everything the faux backend was ever asked, flattened for substring checks. */
 const asText = (context: { messages?: unknown[] }) => JSON.stringify(context.messages ?? []);
@@ -52,11 +90,13 @@ describe("Workflow end to end", () => {
     /** Prompts the faux backend saw on non-parent (i.e. subagent) calls. */
     const childPrompts: string[] = [];
 
+    const cwd = workflowProject();
     const run = await runPrintMode({
       prompt: "run the workflow",
+      cwd,
       maxModelCalls: 32,
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "Workflow");
+        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
           return fauxText("SUBAGENT-DONE");
@@ -81,6 +121,15 @@ describe("Workflow end to end", () => {
 
       expect(sawBoth, `child prompts seen: ${childPrompts.length}`).toBe(true);
       await run.manager?.waitForAll();
+
+      // The journal is what makes `resumeFromRunId` cheap, and it is only real
+      // if a real run writes it — both agents, keyed and answered, on disk.
+      const journals = journalsFor(cwd);
+      expect(journals, "a real run must leave a journal beside its script").toHaveLength(1);
+      const recorded = readJournal(journals[0]);
+      expect(recorded).toHaveLength(2);
+      expect(recorded.every(entry => entry.ok && entry.key.length > 0)).toBe(true);
+      expect(recorded.map(entry => entry.index)).toEqual([0, 1]);
     } finally {
       await run.dispose?.();
     }
@@ -91,9 +140,10 @@ describe("Workflow end to end", () => {
 
     const run = await runPrintMode({
       prompt: "run the broken workflow",
+      cwd: workflowProject(),
       maxModelCalls: 12,
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "Workflow");
+        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
           return fauxText("SUBAGENT-DONE");

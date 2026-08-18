@@ -18,7 +18,7 @@
  * **The glyphs are not the dialog's glyphs.** The inline row keys off the *raw*
  * entry `state` (start | progress | done | error), not the derived display
  * state, so a skipped or blocked agent renders as a plain ✘ here while the
- * /workflows dialog distinguishes them. `displayState` is deliberately not
+ * workflows dialog distinguishes them. `displayState` is deliberately not
  * consulted below.
  *
  * **The layout is pure.** `layoutWorkflowCard` returns coloured segments and
@@ -72,6 +72,8 @@ export interface WorkflowGlyphs {
   running: string;
   /** First and subsequent phase groups. */
   groupTop: string;
+  /** A group that is neither the first nor the last. */
+  groupMid: string;
   /** The last phase group. */
   groupBottom: string;
   /** Continuation rail under a non-final group. */
@@ -89,6 +91,7 @@ export const UNICODE_GLYPHS: WorkflowGlyphs = {
   cross: "✘",
   running: "⟳",
   groupTop: "╭─",
+  groupMid: "├─",
   groupBottom: "╰─",
   vertical: "│",
   branch: "├─",
@@ -108,6 +111,7 @@ export const ASCII_GLYPHS: WorkflowGlyphs = {
   cross: "×",
   running: "*",
   groupTop: ",-",
+  groupMid: "|-",
   groupBottom: "`-",
   vertical: "|",
   branch: "|-",
@@ -126,7 +130,7 @@ export const ASCII_GLYPHS: WorkflowGlyphs = {
  * an undefined colour means "leave it at the terminal default", which is what
  * the recovered inline mapping asks for on a running row.
  *
- * `accent` is unused by the card and exists for the /workflows dialog, which
+ * `accent` is unused by the card and exists for the workflows dialog, which
  * shares these segment types.
  */
 export type WorkflowCardColor = "success" | "error" | "warning" | "dim" | "muted" | "toolTitle" | "accent";
@@ -164,6 +168,14 @@ export interface WorkflowCardInput {
   width?: number;
   /** Swap in the ASCII glyph tier for terminals without unicode. */
   ascii?: boolean;
+  /**
+   * Lead with `▸ SubagentWorkflow`.
+   *
+   * True where the card stands alone — the session entry a flag-launched run
+   * writes, which has no tool call above it to say what it is. False as a tool
+   * result, where the call line directly above already does.
+   */
+  showToolTitle?: boolean;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -171,7 +183,7 @@ export interface WorkflowCardInput {
  * ------------------------------------------------------------------------- */
 
 /** `18.4k` / `1.2M` — bare magnitude, since the row already reads as a stat. */
-function formatCompactTokens(count: number): string {
+export function formatCompactTokens(count: number): string {
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
   if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
   return `${count}`;
@@ -182,11 +194,19 @@ function formatCompactTokens(count: number): string {
  * would just be noise, so it only shows when the run actually has two models in
  * play.
  */
-function formatModel(entry: WorkflowAgentEntry): string | undefined {
+export function formatModel(entry: WorkflowAgentEntry): string | undefined {
   const { model, fallbackModel } = entry;
   if (model && fallbackModel && model !== fallbackModel) return `${model}→${fallbackModel}`;
   return model ?? fallbackModel;
 }
+
+/**
+ * What a row replayed from a resume journal says instead of a duration.
+ *
+ * Shared with the dialog so both views name the same thing the same way — the
+ * card shows it inline while the run happens, the dialog on the agent's row.
+ */
+export const REPLAYED_ANNOTATION = "from resume journal";
 
 /**
  * The `·`-separated tail of an agent row, in the recovered order: agentType,
@@ -260,13 +280,18 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
 
   const lines: WorkflowCardLine[] = [];
 
-  // ---- Header: `▸ Workflow  <name>` with the stats flush right ----
-  const left: WorkflowCardLine = [
-    { text: `${glyphs.pointer} `, color: "toolTitle" },
-    { text: "Workflow", color: "toolTitle", bold: true },
-    { text: "  " },
-    { text: head.name, color: "muted" },
-  ];
+  // ---- Header: `<name>` with the stats flush right ----
+  // The tool name appears only when nothing above the card already carries it.
+  // As a tool result there is a `▸ SubagentWorkflow …` call line directly above,
+  // and repeating it put two near-identical pointer lines back to back.
+  const left: WorkflowCardLine = input.showToolTitle
+    ? [
+        { text: `${glyphs.pointer} `, color: "toolTitle" },
+        { text: "SubagentWorkflow", color: "toolTitle", bold: true },
+        { text: "  " },
+        { text: head.name, color: "muted" },
+      ]
+    : [{ text: "  " }, { text: head.name, color: "toolTitle", bold: true }];
   const statsWidth = visibleWidth(head.stats);
   const clampedLeft = clampLine(left, Math.max(0, width - statsWidth - 1));
   const gap = Math.max(1, width - lineWidth(clampedLeft) - statsWidth);
@@ -288,7 +313,17 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
       clampLine(
         [
           { text: "  " },
-          { text: `${lastGroup ? glyphs.groupBottom : glyphs.groupTop} `, color: "dim" },
+          // One box, not a stack of them: only the first group opens it and
+          // only the last closes it. Everything between branches off the side,
+          // or three phases read as three half-drawn boxes.
+          {
+            text: `${
+              lastGroup ? glyphs.groupBottom
+              : groupIndex === 0 ? glyphs.groupTop
+              : glyphs.groupMid
+            } `,
+            color: "dim",
+          },
           { text: group.title },
         ],
         width,
@@ -306,7 +341,13 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
         { text: " " },
       ];
 
-      const statParts = agentStatSegments(entry);
+      // Prepended rather than folded into `agentStatSegments`, which is the
+      // ported stat tail in its recovered order. A replayed agent otherwise
+      // renders as a tick with no tokens and no duration — indistinguishable
+      // from one that somehow did the work for free.
+      const statParts = entry.cached
+        ? [REPLAYED_ANNOTATION, ...agentStatSegments(entry)]
+        : agentStatSegments(entry);
       const pad = Math.max(0, labelColumn - visibleWidth(entry.label));
       segments.push({ text: statParts.length > 0 ? entry.label + " ".repeat(pad) : entry.label });
       for (const part of statParts) {
@@ -337,7 +378,7 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   });
   if (warning) {
     lines.push(
-      clampLine([{ text: `  ${glyphs.warning} Large workflow · /workflows to stop`, color: "warning" }], width),
+      clampLine([{ text: `  ${glyphs.warning} Large workflow · /agents → Workflows to stop`, color: "warning" }], width),
     );
   }
 

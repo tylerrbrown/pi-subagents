@@ -420,6 +420,11 @@ describe("resume", () => {
         'await agent("b", { resume: "impl", isolation: "worktree" });',
         "agent() opts.resume and opts.isolation are mutually exclusive",
       ],
+      [
+        "effort",
+        'await agent("b", { resume: "impl", effort: "high" });',
+        "agent() opts.resume and opts.effort are mutually exclusive",
+      ],
     ];
 
     for (const [name, body, expected] of rejected) {

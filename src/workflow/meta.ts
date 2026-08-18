@@ -60,6 +60,19 @@ const PURE_LITERAL_HINT =
 /** Matches `export const meta =` allowing arbitrary inner whitespace. */
 const META_DECLARATION = /(^|[\r\n])[ \t]*export[ \t\r\n]+const[ \t\r\n]+meta[ \t\r\n]*=/;
 
+/**
+ * Whether `source` even claims to be a workflow script.
+ *
+ * The cheap half of {@link extractMeta}, exported so a directory of `.js` files
+ * can be told apart from a directory of workflows without evaluating anything.
+ * A saved-workflow folder is a normal folder — it may hold a build artifact, a
+ * config, someone's scratch script — and those should neither be offered as
+ * workflows nor produce a parser error when named.
+ */
+export function hasMetaDeclaration(source: string): boolean {
+  return META_DECLARATION.test(source);
+}
+
 interface ScanResult {
   /** Index of the literal's closing brace, or -1 when braces never balance. */
   end: number;

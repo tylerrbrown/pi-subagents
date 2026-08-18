@@ -4,7 +4,7 @@
  *
  * The engine itself is covered by workflow-runtime/-progress/-meta/-render; what
  * is untested until here is everything *around* it: the adapter that turns a
- * `WorkflowSpawnRequest` into a real `AgentManager` spawn, the `Workflow` tool's
+ * `WorkflowSpawnRequest` into a real `AgentManager` spawn, the `SubagentWorkflow` tool's
  * input contract, and the CLI flag's ordering — read from `session_start`, never
  * at activation, because the host applies flag values only after every extension
  * has already loaded.
@@ -187,6 +187,58 @@ describe("createWorkflowHost — spawn mapping", () => {
     await host.spawnAgent(request({ model: "haiku" }));
 
     expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(model);
+  });
+
+  it("stamps its children with the run id and keeps them out of the pool", async () => {
+    // Ownership, not decoration: the stamp is what removes a workflow's agents
+    // from the fleet list, the widget and the `/agents` menus, and what keeps
+    // one fan-out from filling the session's concurrency pool.
+    const stub = stubManager();
+    const host = createWorkflowHost({
+      pi: {} as any,
+      ctx: ctx(),
+      manager: stub.manager,
+      workflowId: "wf_run1",
+    });
+
+    await host.spawnAgent(request({}));
+
+    // The stamp alone: `AgentManager` reads it to keep the child out of the
+    // pool (covered in agent-manager.test.ts), so no second opt-out is passed.
+    const options = stub.spawnAndWait.mock.calls[0][4];
+    expect(options.workflowId).toBe("wf_run1");
+    expect(options.bypassQueue).toBeUndefined();
+  });
+
+  it("leaves the stamp off when no run id was injected", async () => {
+    // The runtime tests drive the host without one; an undefined stamp must not
+    // become the string "undefined" and quietly group unrelated agents.
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({}));
+
+    expect(stub.spawnAndWait.mock.calls[0][4].workflowId).toBeUndefined();
+  });
+
+  it("maps opts.effort onto the spawn's thinking level", async () => {
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({ effort: "high" }));
+
+    expect(stub.spawnAndWait.mock.calls[0][4].thinkingLevel).toBe("high");
+  });
+
+  it("leaves thinkingLevel unset when no effort was asked for", async () => {
+    // The agent definition's `thinking` resolves it downstream; sending
+    // `undefined` explicitly would be the same, but sending a default would not.
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({}));
+
+    expect(stub.spawnAndWait.mock.calls[0][4].thinkingLevel).toBeUndefined();
   });
 
   it("surfaces a strict worktree-isolation failure as a failed agent, not a rejection", async () => {
@@ -378,8 +430,8 @@ describe("Workflow tool registration", () => {
   it("excludes itself from subagents, so a workflow cannot recurse into itself", () => {
     // The exclusion list is derived from this object; a Workflow tool missing
     // here is a Workflow tool every spawned child inherits.
-    expect(Object.values(SUBAGENT_TOOL_NAMES)).toContain("Workflow");
-    expect(SUBAGENT_TOOL_NAMES.WORKFLOW).toBe("Workflow");
+    expect(Object.values(SUBAGENT_TOOL_NAMES)).toContain("SubagentWorkflow");
+    expect(SUBAGENT_TOOL_NAMES.WORKFLOW).toBe("SubagentWorkflow");
   });
 });
 
@@ -393,14 +445,14 @@ const fileScript = 'export const meta = { name: "from-file", description: "file 
 /** Plain theme, so a rendered component can be asserted as text. */
 const plainTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-describe("Workflow tool — script vs scriptPath", () => {
+describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   let hermetic: Hermetic;
   let booted: ReturnType<typeof makePi>;
   let tools: Map<string, any>;
 
   beforeEach(() => {
     // Hermetic dir first — settings and agent files are read at boot.
-    hermetic = hermeticDir({ settings: { schedulingEnabled: false } });
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
     booted = makePi();
     subagentsExtension(booted.pi);
     tools = booted.tools;
@@ -416,7 +468,7 @@ describe("Workflow tool — script vs scriptPath", () => {
   const workflowCtx = () => ctx({ cwd: hermetic.dir });
 
   it("runs the inline script when only `script` is given, and persists it", async () => {
-    const result = await tools.get("Workflow").execute("tc-1", { script: inlineScript }, undefined, undefined, workflowCtx());
+    const result = await tools.get("SubagentWorkflow").execute("tc-1", { script: inlineScript }, undefined, undefined, workflowCtx());
 
     const text = textOf(result);
     expect(text).toMatch(/Workflow "from-inline" started/);
@@ -429,7 +481,7 @@ describe("Workflow tool — script vs scriptPath", () => {
     const path = join(hermetic.dir, "wf.js");
     writeFileSync(path, fileScript);
 
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-2",
       { script: inlineScript, scriptPath: path },
       undefined, undefined, workflowCtx(),
@@ -443,7 +495,7 @@ describe("Workflow tool — script vs scriptPath", () => {
     mkdirSync(join(hermetic.dir, "flows"), { recursive: true });
     writeFileSync(join(hermetic.dir, "flows", "wf.js"), fileScript);
 
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-3",
       { scriptPath: join("flows", "wf.js") },
       undefined, undefined, workflowCtx(),
@@ -453,7 +505,7 @@ describe("Workflow tool — script vs scriptPath", () => {
   });
 
   it("reports a missing scriptPath instead of silently falling back to `script`", async () => {
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-4",
       { script: inlineScript, scriptPath: join(hermetic.dir, "nope.js") },
       undefined, undefined, workflowCtx(),
@@ -463,14 +515,220 @@ describe("Workflow tool — script vs scriptPath", () => {
     expect(textOf(result)).not.toMatch(/started/);
   });
 
-  it("asks for one of the two when neither is given", async () => {
-    const result = await tools.get("Workflow").execute("tc-5", {}, undefined, undefined, workflowCtx());
+  it("asks for one of the three when none is given", async () => {
+    const result = await tools.get("SubagentWorkflow").execute("tc-5", {}, undefined, undefined, workflowCtx());
 
-    expect(textOf(result)).toMatch(/Provide either `script`.*or `scriptPath`/s);
+    expect(textOf(result)).toMatch(/Provide `script`.*`scriptPath`.*or `name`/s);
+  });
+
+  it("runs a saved workflow by name from .pi/workflows", async () => {
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-name-1",
+      { name: "nightly" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    const text = textOf(result);
+    expect(text).toMatch(/Workflow "from-file" started/);
+    // Reported as its own file, so editing and re-running works on a saved one.
+    expect(text).toContain(join(".pi", "workflows", "nightly.js"));
+  });
+
+  it("lets script and scriptPath both outrank name", async () => {
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
+
+    const viaScript = await tools.get("SubagentWorkflow").execute(
+      "tc-name-2",
+      { script: inlineScript, name: "nightly" },
+      undefined, undefined, workflowCtx(),
+    );
+    expect(textOf(viaScript)).toMatch(/Workflow "from-inline" started/);
+  });
+
+  it("names the saved workflows it does have when the name is unknown", async () => {
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-name-3",
+      { name: "nightlyy" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    const text = textOf(result);
+    expect(text).toMatch(/No saved workflow named "nightlyy"/);
+    expect(text).toMatch(/Available: nightly\./);
+    expect(text).not.toMatch(/started/);
+  });
+
+  it("falls back to the user's agent dir, and lets the project shadow it", async () => {
+    const globalDir = join(process.env.PI_CODING_AGENT_DIR!, "workflows");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "shared.js"), fileScript);
+
+    const fromGlobal = await tools.get("SubagentWorkflow").execute(
+      "tc-name-6",
+      { name: "shared" },
+      undefined, undefined, workflowCtx(),
+    );
+    expect(textOf(fromGlobal)).toMatch(/Workflow "from-file" started/);
+
+    // Same name in the project wins — .pi stays the project authority.
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "shared.js"), inlineScript);
+
+    const fromProject = await tools.get("SubagentWorkflow").execute(
+      "tc-name-7",
+      { name: "shared" },
+      undefined, undefined, workflowCtx(),
+    );
+    expect(textOf(fromProject)).toMatch(/Workflow "from-inline" started/);
+  });
+
+  it("refuses a file in the folder that is not a workflow", async () => {
+    // These are ordinary directories — a build artifact or a scratch script can
+    // sit next to the workflows, and naming one must not run it.
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "utils.js"), "module.exports = { helper: 1 };\n");
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-shape-1",
+      { name: "utils" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    const text = textOf(result);
+    expect(text).toMatch(/is not a workflow script/);
+    expect(text).toMatch(/Nothing was run/);
+    expect(text).not.toMatch(/started/);
+  });
+
+  it("leaves non-workflow files out of the listing entirely", async () => {
+    // Offering `utils.js` as a runnable workflow is what invites trying it.
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "utils.js"), "const x = 1;\n");
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-shape-2",
+      { name: "nope" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    const text = textOf(result);
+    expect(text).toMatch(/Available: nightly\./);
+    expect(text).not.toMatch(/utils/);
+  });
+
+  it("does not shadow a real workflow with a same-named non-workflow deeper down", async () => {
+    // The project file wins the lookup, so the report is about the file that
+    // was actually found — reaching past it to a lower root would run a
+    // different script than the one the name resolves to.
+    const globalDir = join(process.env.PI_CODING_AGENT_DIR!, "workflows");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "shared.js"), fileScript);
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "shared.js"), "// not a workflow\n");
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-shape-3",
+      { name: "shared" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    expect(textOf(result)).toMatch(/is not a workflow script/);
+    expect(textOf(result)).not.toMatch(/started/);
+  });
+
+  it("refuses to read a name out of its directories", async () => {
+    writeFileSync(join(hermetic.dir, "escaped.js"), fileScript);
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-name-4",
+      { name: "../escaped" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    expect(textOf(result)).toMatch(/is not a usable workflow name/);
+    expect(textOf(result)).not.toMatch(/started/);
+  });
+
+  it("refuses a run id this session never issued", async () => {
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-resume-1",
+      { script: inlineScript, resumeFromRunId: "wf_deadbeef1234" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    // An unknown id is an error, not a cold start: a caller that asked to
+    // resume is expecting not to pay, and silently paying hides that.
+    expect(textOf(result)).toMatch(/No workflow run "wf_deadbeef1234" in this session/);
+    expect(textOf(result)).not.toMatch(/started/);
+  });
+
+  it("refuses to resume a run that is still going", async () => {
+    const started = await tools.get("SubagentWorkflow").execute(
+      "tc-resume-2",
+      { script: inlineScript },
+      undefined, undefined, workflowCtx(),
+    );
+    const runId = (started.details as { taskId: string }).taskId;
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-resume-3",
+      { script: inlineScript, resumeFromRunId: runId },
+      undefined, undefined, workflowCtx(),
+    );
+
+    expect(textOf(result)).toMatch(/is still running/);
+  });
+
+  it("accepts a settled run and says plainly that there was nothing to replay", async () => {
+    const started = await tools.get("SubagentWorkflow").execute(
+      "tc-resume-4",
+      { script: inlineScript },
+      undefined, undefined, workflowCtx(),
+    );
+    const runId = (started.details as { taskId: string }).taskId;
+
+    // The run is detached: it has to actually settle before it can be resumed,
+    // and the worker thread takes a moment to start, compile and finish.
+    let result: any;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await flush();
+      result = await tools.get("SubagentWorkflow").execute(
+        `tc-resume-5-${attempt}`,
+        { script: inlineScript, resumeFromRunId: runId },
+        undefined, undefined, workflowCtx(),
+      );
+      if (!/is still running/.test(textOf(result))) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+
+    // That script spawns no agents, so its journal is empty. Saying so beats
+    // reporting a resume that silently replayed nothing.
+    expect(textOf(result)).toMatch(new RegExp(`Nothing to replay from ${runId}`));
+    expect(textOf(result)).toMatch(/started in the background/);
+  });
+
+  it("ignores title and description rather than rejecting them", async () => {
+    // Claude Code accepts both and ignores them; a schema rejection here would
+    // cost a turn to re-emit a script that was already correct.
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-name-5",
+      { script: inlineScript, title: "Nightly Audit", description: "does the thing" },
+      undefined, undefined, workflowCtx(),
+    );
+
+    expect(textOf(result)).toMatch(/Workflow "from-inline" started/);
   });
 
   it("reports a bad `meta` up front rather than as a background run that failed", async () => {
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-6",
       { script: "const x = 1;\n" },
       undefined, undefined, workflowCtx(),
@@ -481,14 +739,14 @@ describe("Workflow tool — script vs scriptPath", () => {
   });
 
   it("names the workflow on the call line", () => {
-    const line = tools.get("Workflow").renderCall({ script: inlineScript }, plainTheme, { isPartial: false }).text ?? "";
-    expect(String(line)).toContain("Workflow");
+    const line = tools.get("SubagentWorkflow").renderCall({ script: inlineScript }, plainTheme, { isPartial: false }).text ?? "";
+    expect(String(line)).toContain("SubagentWorkflow");
     expect(String(line)).toContain("from-inline");
   });
 
   it("actually runs the script in the background and notifies through the agent channel", async () => {
     const script = `${inlineScript}log("scanned 3 files");\nreturn "done here";\n`;
-    const result = await tools.get("Workflow").execute("tc-run", { script }, undefined, undefined, workflowCtx());
+    const result = await tools.get("SubagentWorkflow").execute("tc-run", { script }, undefined, undefined, workflowCtx());
     const taskId = /Task ID: (\S+)/.exec(textOf(result))?.[1];
     expect(taskId).toBeTruthy();
 
@@ -510,7 +768,7 @@ describe("Workflow tool — script vs scriptPath", () => {
     // …and the inline card follows the background run rather than freezing at
     // whatever `execute` returned.
     const card = String(
-      tools.get("Workflow")
+      tools.get("SubagentWorkflow")
         .renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false })
         .text ?? "",
     );
@@ -536,7 +794,7 @@ describe("Workflow tool — script vs scriptPath", () => {
   it("kills a still-running workflow (and its worker thread) on session shutdown", async () => {
     // A never-returning script: only the run's own abort signal can stop it, so
     // abortAll() over the agent records would leave the worker spinning.
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-shutdown",
       { script: `${inlineScript}await new Promise(() => {});\n` },
       undefined, undefined, workflowCtx(),
@@ -549,7 +807,7 @@ describe("Workflow tool — script vs scriptPath", () => {
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-throw",
       { script: `${inlineScript}throw new Error("script blew up");\n` },
       undefined, undefined, workflowCtx(),
@@ -566,7 +824,7 @@ describe("Workflow tool — script vs scriptPath", () => {
   it("reports a run that could not start at all", async () => {
     // A control character is rejected before the worker is created, so this
     // never reaches the run's own error path.
-    const result = await tools.get("Workflow").execute(
+    const result = await tools.get("SubagentWorkflow").execute(
       "tc-bad",
       { script: `${inlineScript}const x = "\u0007";\n` },
       undefined, undefined, workflowCtx(),
@@ -586,7 +844,7 @@ describe("--subagents-workflow-file", () => {
   let hermetic: Hermetic;
 
   beforeEach(() => {
-    hermetic = hermeticDir({ settings: { schedulingEnabled: false } });
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
   });
 
   afterEach(async () => {
@@ -605,6 +863,26 @@ describe("--subagents-workflow-file", () => {
       },
       ...overrides,
     });
+
+  it("registers the fleet row as soon as a run starts, not when it settles", async () => {
+    // The regression this guards: a run's agents are owned by it, so their
+    // lifecycle callbacks no longer refresh the fleet — and nothing else did,
+    // which left a running workflow invisible in FleetView.
+    const booted = makePi();
+    subagentsExtension(booted.pi);
+    const context = uiCtx();
+    await booted.lifecycle.get("session_start")?.({}, context);
+    context.ui.setWidget.mockClear();
+
+    await booted.tools.get("SubagentWorkflow").execute(
+      "tc-fleet",
+      { script: inlineScript },
+      undefined, undefined, ctx({ cwd: hermetic.dir }),
+    );
+
+    const keys = context.ui.setWidget.mock.calls.map((call: any[]) => call[0]);
+    expect(keys, "the run has to claim its row before its first agent starts").toContain("fleet");
+  });
 
   it("captures the UI at session_start, before any tool has executed", () => {
     // A flag-launched workflow runs from session_start, so a UI captured only
@@ -729,5 +1007,166 @@ describe("--subagents-workflow-file", () => {
     expect(text).toContain("from-file");
     expect(text).toContain("step");
     expect(text).toContain("1/1 agent");
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * The master switch
+ * ------------------------------------------------------------------------- */
+
+describe("workflowsEnabled — the master switch", () => {
+  let hermetic: Hermetic;
+
+  afterEach(async () => {
+    await flush();
+    hermetic.restore();
+    vi.restoreAllMocks();
+  });
+
+  /** A context with the UI surface `session_start` touches on the way through. */
+  const switchCtx = () =>
+    ctx({
+      hasUI: true,
+      cwd: hermetic.dir,
+      ui: {
+        setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(),
+        addAutocompleteProvider: vi.fn(), onTerminalInput: vi.fn(() => vi.fn()),
+      },
+    });
+
+  /** Boot the extension against a project whose settings say `settings`. */
+  const boot = (settings: Record<string, unknown>, flags: Record<string, string | boolean> = {}) => {
+    hermetic = hermeticDir({ settings });
+    const booted = makePi(flags);
+    subagentsExtension(booted.pi);
+    return booted;
+  };
+
+  it("is off unless a setting turns it on", () => {
+    const booted = boot({});
+
+    // Not registered at all: the model is never told the feature exists. The
+    // switch buys zero tool-spec tokens, which a refusing tool would not.
+    expect(booted.tools.has("SubagentWorkflow")).toBe(false);
+    // Nothing else is affected.
+    expect(booted.tools.has("Agent")).toBe(true);
+  });
+
+  it("stays off when the setting says so explicitly", () => {
+    expect(boot({ workflowsEnabled: false }).tools.has("SubagentWorkflow")).toBe(false);
+  });
+
+  it("registers the tool once the setting turns it on", () => {
+    expect(boot({ workflowsEnabled: true }).tools.has("SubagentWorkflow")).toBe(true);
+  });
+
+  it("refuses the startup flag while off, instead of running the script anyway", async () => {
+    // The flag is the same machinery by another door, so the switch has to
+    // close it too — and say why, rather than appearing to do nothing.
+    const booted = boot({ workflowsEnabled: false });
+    const path = join(hermetic.dir, "flow.js");
+    writeFileSync(path, fileScript);
+    booted.pi.getFlag.mockReturnValue(path);
+    const context = switchCtx();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    const notices = context.ui.notify.mock.calls.map((c: any[]) => String(c[0]));
+    expect(notices.some((m: string) => /workflows are off/i.test(m))).toBe(true);
+    expect(booted.pi.appendEntry).not.toHaveBeenCalledWith(WORKFLOW_ENTRY_TYPE, expect.anything());
+  });
+
+});
+
+/* ------------------------------------------------------------------------- *
+ * Name collisions with other extensions
+ * ------------------------------------------------------------------------- */
+
+describe("collisions with another extension", () => {
+  let hermetic: Hermetic;
+
+  afterEach(async () => {
+    await flush();
+    hermetic.restore();
+    vi.restoreAllMocks();
+  });
+
+  const boot = (settings: Record<string, unknown> = { workflowsEnabled: true }) => {
+    hermetic = hermeticDir({ settings });
+    const booted = makePi();
+    subagentsExtension(booted.pi);
+    return booted;
+  };
+
+  const uiContext = () =>
+    ctx({
+      hasUI: true,
+      cwd: hermetic.dir,
+      ui: {
+        setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(),
+        addAutocompleteProvider: vi.fn(), onTerminalInput: vi.fn(() => vi.fn()),
+      },
+    });
+
+  const warnings = (context: any) =>
+    context.ui.notify.mock.calls.filter((c: any[]) => c[1] === "warning").map((c: any[]) => String(c[0]));
+
+  it("warns when another extension already owns the tool name", async () => {
+    // Pi keeps the FIRST registration per tool name, across extensions. Ours
+    // never reaches the registry, and nothing in pi says so.
+    const booted = boot();
+    booted.pi.getAllTools.mockReturnValue([
+      {
+        name: "SubagentWorkflow",
+        description: "some other extension's workflow tool",
+        sourceInfo: { source: "other-ext", path: "/x/other.ts" },
+      },
+    ]);
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(warnings(context).some(m => /already registers a "SubagentWorkflow" tool/.test(m))).toBe(true);
+    expect(warnings(context).some(m => /other-ext/.test(m))).toBe(true);
+  });
+
+  it("stays quiet when the registered tool is our own", async () => {
+    const booted = boot();
+    const ours = booted.tools.get("SubagentWorkflow");
+    booted.pi.getAllTools.mockReturnValue([
+      { name: "SubagentWorkflow", description: ours.description, sourceInfo: { source: "pi-subagents" } },
+    ]);
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(warnings(context).filter(m => /SubagentWorkflow/.test(m))).toEqual([]);
+  });
+
+  it("does not check the tool name while workflows are off", async () => {
+    // Nothing of ours is registered, so another extension owning the name is
+    // simply not our business to complain about.
+    const booted = boot({ workflowsEnabled: false });
+    booted.pi.getAllTools.mockReturnValue([
+      { name: "SubagentWorkflow", description: "someone else's", sourceInfo: { source: "other-ext" } },
+    ]);
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(warnings(context).filter(m => /SubagentWorkflow/.test(m))).toEqual([]);
+  });
+
+  it("survives a host where the listing methods are unavailable", async () => {
+    // print mode and RPC mode do not bind them; a diagnostic must not be the
+    // thing that takes the session down.
+    const booted = boot();
+    booted.pi.getAllTools.mockImplementation(() => {
+      throw new Error("Extension runtime not initialized.");
+    });
+    const context = uiContext();
+
+    await expect(booted.lifecycle.get("session_start")?.({}, context)).resolves.not.toThrow();
+    expect(warnings(context)).toEqual([]);
   });
 });

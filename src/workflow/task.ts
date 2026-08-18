@@ -1,9 +1,9 @@
 /**
  * task.ts — the background record one workflow run lives in.
  *
- * A `Workflow` tool call returns a task id immediately and the run continues
+ * A `SubagentWorkflow` tool call returns a task id immediately and the run continues
  * without it, so the run's state cannot live in the tool call's closure: the
- * inline card, the completion notification and (later) the `/workflows` dialog
+ * inline card, the completion notification and (later) the `/agents → Workflows` dialog
  * all read it after `execute` has returned. This is that record, shaped after
  * Claude Code's `local_workflow` task so the fields line up with what the
  * renderers already expect.
@@ -15,9 +15,10 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
 import { collapse, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
-import type { WorkflowRunResult } from "./runtime.js";
+import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
 export function workflowRunId(): string {
@@ -38,11 +39,39 @@ export interface WorkflowTask {
   /** The `tool_use_id` of the call that started this, when one did. */
   toolCallId?: string;
 
+  /**
+   * Pause, skip and retry, once the run is up.
+   *
+   * Absent before the runtime hands it over and after the run settles — the
+   * dialog treats "no control" as "those keys do nothing", which is the same
+   * thing it does for a run that has finished.
+   */
+  control?: WorkflowControl;
+  /** When the current pause started, so `totalPausedMs` can be closed out. */
+  pausedAt?: number;
+
+  /** Where this run records its own settled calls, for a later resume. */
+  journalPath?: string;
+  /** A previous run's journal, when this call asked to resume one. */
+  replay?: readonly WorkflowJournalEntry[];
+  /** The run id this one resumed, for the result line that says so. */
+  resumedFrom?: string;
+  /** How many agents came back from {@link replay} instead of being spawned. */
+  replayedCount: number;
+
   /** The append-only event log, in emission order. */
   workflowProgress: WorkflowEntry[];
   /** Bumped once per applied batch, so a renderer can tell nothing changed. */
   progressVersion: number;
   agentCount: number;
+  /**
+   * Agents that have settled successfully, recomputed with the other counters.
+   *
+   * Cached rather than derived on read because the fleet list asks five times a
+   * second: deriving it there would walk the whole append-only log on every
+   * tick, which for a thousand-agent run is real work in the render loop.
+   */
+  doneCount: number;
   totalTokens: number;
   totalToolCalls: number;
   logs: string[];
@@ -66,6 +95,9 @@ export function createWorkflowTask(init: {
   meta?: WorkflowMeta;
   toolCallId?: string;
   startTime?: number;
+  journalPath?: string;
+  replay?: readonly WorkflowJournalEntry[];
+  resumedFrom?: string;
 }): WorkflowTask {
   return {
     type: "local_workflow",
@@ -77,9 +109,14 @@ export function createWorkflowTask(init: {
     meta: init.meta,
     workflowName: init.meta?.name,
     toolCallId: init.toolCallId,
+    journalPath: init.journalPath,
+    replay: init.replay,
+    resumedFrom: init.resumedFrom,
+    replayedCount: 0,
     workflowProgress: [],
     progressVersion: 0,
     agentCount: 0,
+    doneCount: 0,
     totalTokens: 0,
     totalToolCalls: 0,
     logs: [],
@@ -113,20 +150,58 @@ export function updateWorkflowProgressBatch(
 
   let totalTokens = 0;
   let totalToolCalls = 0;
+  let done = 0;
   for (const agent of agents) {
     totalTokens += agent.tokens ?? 0;
     totalToolCalls += agent.toolCalls ?? 0;
+    // Counted off the collapsed agents, so a re-emitted row counts once.
+    if (agent.state === "done") done++;
   }
   task.totalTokens = totalTokens;
   task.totalToolCalls = totalToolCalls;
+  task.doneCount = done;
+}
+
+/**
+ * Hold the run, and stop its clock.
+ *
+ * The elapsed figure every surface shows subtracts `totalPausedMs`, so a run
+ * left paused overnight does not come back reading as a twelve-hour run.
+ */
+export function pauseWorkflowTask(task: WorkflowTask, now = Date.now()): boolean {
+  if (task.status !== "running" || task.control === undefined) return false;
+  task.control.pause();
+  task.status = "paused";
+  task.pausedAt = now;
+  return true;
+}
+
+/** Let it go again, banking however long it was held. */
+export function resumeWorkflowTask(task: WorkflowTask, now = Date.now()): boolean {
+  if (task.status !== "paused" || task.control === undefined) return false;
+  task.control.resume();
+  task.status = "running";
+  task.totalPausedMs = (task.totalPausedMs ?? 0) + Math.max(0, now - (task.pausedAt ?? now));
+  task.pausedAt = undefined;
+  return true;
 }
 
 /** Settle a task from the run's own result. */
 export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResult): void {
+  // Banked before the status moves off "paused": a run that finished while held
+  // still spent that time held, and the elapsed figure has to say so.
+  if (task.pausedAt !== undefined) {
+    task.totalPausedMs = (task.totalPausedMs ?? 0) + Math.max(0, Date.now() - task.pausedAt);
+    task.pausedAt = undefined;
+  }
+  // Nothing left to control, and holding the handle would let the dialog offer
+  // pause on a run that has already stopped.
+  task.control = undefined;
   task.status = result.status;
   task.meta ??= result.meta;
   task.workflowName ??= result.meta.name;
   task.agentCount = Math.max(task.agentCount, result.agentCount);
+  task.replayedCount = result.replayedCount;
   task.value = result.value;
   task.error = result.error;
   task.endTime = Date.now();
@@ -137,6 +212,8 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
  * worker started (bad `meta`, oversized source, non-JSON `args`).
  */
 export function failWorkflowTask(task: WorkflowTask, error: string): void {
+  task.control = undefined;
+  task.pausedAt = undefined;
   task.status = "failed";
   task.error = error;
   task.endTime = Date.now();

@@ -37,7 +37,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
-import type { AgentRecord } from "../types.js";
+import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
 
@@ -56,6 +56,15 @@ export interface WorkflowHostOptions {
   signal?: AbortSignal;
   /** Groups child transcripts under the parent session. */
   rootSessionId?: string;
+  /**
+   * The run id every child is stamped with.
+   *
+   * What makes them the workflow's rather than the session's: stamped children
+   * are filtered out of the fleet list, the widget, the `/agents` menus and
+   * `@handle` resolution, and they take no `maxConcurrent` slot. The run
+   * reports for them, and it has its own concurrency cap.
+   */
+  workflowId?: string;
   gateTimeoutMs?: number;
 }
 
@@ -100,7 +109,7 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
     return { ...common, ok: true, text: record.result ?? "" };
   }
   // "stopped" is someone reaching in and stopping this child — /agents, the
-  // fleet list, a workflow abort. That is the same thing the /workflows dialog's
+  // fleet list, a workflow abort. That is the same thing the workflows dialog's
   // skip action means, so it renders as skipped rather than failed.
   if (record.status === "stopped") {
     return { ...common, ok: false, skipped: true, error: record.error ?? "Stopped." };
@@ -199,7 +208,19 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
           request.prompt,
           {
             description: request.label,
+            // The stamp is what keeps this child out of the session's
+            // `maxConcurrent` pool — see `occupiesPoolSlot`. The run already
+            // bounds how many of its agents run at once, and counting them
+            // twice would let one fan-out starve everything else the user is
+            // doing. No `bypassQueue` needed: an agent outside the pool is
+            // never queued behind it.
+            ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
             ...(model !== undefined ? { model } : {}),
+            // Validated worker-side against the same list pi accepts, so the
+            // cast asserts what the boundary has already checked. Left unset,
+            // the agent definition's `thinking` (then the parent's) still wins —
+            // same precedence as `model` above.
+            ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),

@@ -15,6 +15,7 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import { journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "./progress.js";
 import { WORKER_SOURCE } from "./worker-source.js";
@@ -53,6 +54,14 @@ export interface WorkflowSpawnRequest {
   label: string;
   agentType: string;
   model?: string;
+  /**
+   * Reasoning effort for this child, as one of pi's thinking levels.
+   *
+   * Typed as a plain string because this interface is the host boundary and
+   * deliberately knows nothing about pi — `host.ts` is where it becomes a
+   * `ThinkingLevel`. The worker has already rejected anything off the list.
+   */
+  effort?: string;
   isolation?: "worktree";
   phaseIndex?: number;
   phaseTitle?: string;
@@ -137,6 +146,45 @@ export interface WorkflowHost {
   runGate?(command: string, options: { agentId: string; cwd?: string }): Promise<WorkflowGateResult>;
 }
 
+/**
+ * What a run can be told to do while it is going, from the workflows dialog.
+ *
+ * Every method is best-effort and idempotent: the dialog renders off a progress
+ * log that lags the runtime slightly, so it will sometimes ask for something
+ * that has just stopped being possible. `false` means "there was nothing to do
+ * that to" — a caller can say so, but it is never an error.
+ */
+export interface WorkflowControl {
+  /**
+   * Stop *starting* agents. Ones already running are left to finish, because
+   * killing model work mid-turn throws away everything it has spent and there
+   * is no way to hand it back its context.
+   */
+  pause(): void;
+  resume(): void;
+  isPaused(): boolean;
+  /**
+   * Give up on the agent at `index`: its `agent()` call returns `null`, exactly
+   * as a terminal failure does, and the row renders skipped.
+   *
+   * Immediate for a running agent and for one held at a pause. An agent parked
+   * behind the concurrency limit takes its skip when it reaches the front —
+   * the alternative is a cancellable semaphore for a case that resolves itself
+   * as soon as any sibling finishes.
+   */
+  skip(index: number): boolean;
+  /**
+   * Start the agent at `index` over: the child is stopped and the same call is
+   * re-run, so the script's `agent()` promise is still the one waiting and it
+   * gets the new answer.
+   *
+   * Only while it is running — that is the whole window. Once the call has
+   * settled its value is already the script's, and re-running would produce a
+   * result with nowhere to go.
+   */
+  retry(index: number): boolean;
+}
+
 export interface RunWorkflowOptions {
   /** Full script source, starting with `export const meta = { … }`. */
   script: string;
@@ -148,6 +196,27 @@ export interface RunWorkflowOptions {
   concurrency?: number;
   agentCap?: number;
   itemCap?: number;
+  /**
+   * Hands the caller the run's control surface, once per run.
+   *
+   * A callback rather than a return value because `runWorkflow` resolves when
+   * the run is *over*, which is the one moment there is nothing left to
+   * control. Fired before the first agent starts.
+   */
+  onControl?(control: WorkflowControl): void;
+  /**
+   * Replay and record, for `resumeFromRunId`.
+   *
+   * The runtime does no file IO — `entries` come in already read and `append`
+   * goes back out — so its tests stay free of a filesystem, the same reason
+   * spawning is behind {@link WorkflowHost}.
+   */
+  journal?: {
+    /** A previous run's settled calls, in position order. Empty replays nothing. */
+    entries?: readonly WorkflowJournalEntry[];
+    /** Called as each call of *this* run settles, so it can be resumed in turn. */
+    append?(entry: WorkflowJournalEntry): void;
+  };
 }
 
 export interface WorkflowRunResult {
@@ -160,6 +229,8 @@ export interface WorkflowRunResult {
   progress: WorkflowEntry[];
   /** Agents scheduled, including those that failed. */
   agentCount: number;
+  /** How many of those came back from the journal instead of being spawned. */
+  replayedCount: number;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -278,6 +349,8 @@ interface AgentCallPayload {
   gate?: string;
   /** Label of an earlier child in this run to continue instead of starting one. */
   resume?: string;
+  /** Reasoning effort, already validated against pi's thinking levels worker-side. */
+  effort?: string;
 }
 
 type WorkerMessage =
@@ -403,6 +476,100 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   let aborted = false;
   let settled = false;
 
+  /* --- resume state ---------------------------------------------------- */
+
+  const journalEntries = options.journal?.entries ?? [];
+  const recordJournal = options.journal?.append;
+  /**
+   * Whether the replayable prefix is still intact.
+   *
+   * Once a position misses — different key, a journaled failure, or nothing
+   * recorded there — every later call runs live, however well it matches.
+   * See the header of journal.ts for why this is a prefix and not a lookup.
+   */
+  // A journal from a run that used `agent({ resume })` is declined whole: see
+  // journal.ts on why a replayed agent leaves nothing for a later resume to
+  // continue. Declining up front beats stranding the first `resume` call
+  // partway through a run that has already spent its cheap half.
+  const journalResumes = journalEntries.some(entry => entry.resumed);
+  let prefixIntact = journalEntries.length > 0 && !journalResumes;
+  let replayedCount = 0;
+
+  /* --- live control ---------------------------------------------------- */
+
+  /**
+   * Agents that still have an unanswered `agent()` call, by index.
+   *
+   * The window in which skip and retry mean anything: before the entry appears
+   * there is nothing to act on, and after it is gone the script already has its
+   * value. `started` is what separates the two — a retry needs a child to stop.
+   */
+  interface LiveAgent {
+    agentId: string;
+    started: boolean;
+    intent?: "skip" | "retry";
+    /** Wakes it out of a pause hold, so a skip does not wait for a resume. */
+    wake?: () => void;
+  }
+  const liveAgents = new Map<number, LiveAgent>();
+
+  let paused = false;
+  /** Read through a call for the same reason `intent()` is — see below. */
+  const isPaused = () => paused;
+  const pauseWaiters = new Set<() => void>();
+  /** Release everyone held at a pause — on resume, and on the way out. */
+  function releasePause(): void {
+    for (const wake of [...pauseWaiters]) wake();
+    pauseWaiters.clear();
+  }
+  /** Park here while the run is paused, so no new agent is started. */
+  function pauseGate(live: LiveAgent): Promise<void> {
+    if (!paused || aborted || settled) return Promise.resolve();
+    return new Promise<void>(resolve => {
+      const wake = () => {
+        pauseWaiters.delete(wake);
+        live.wake = undefined;
+        resolve();
+      };
+      live.wake = wake;
+      pauseWaiters.add(wake);
+    });
+  }
+
+  options.onControl?.({
+    pause: () => { paused = true; },
+    resume: () => { paused = false; releasePause(); },
+    isPaused: () => paused,
+    skip: index => {
+      const live = liveAgents.get(index);
+      if (live === undefined || live.intent !== undefined) return false;
+      live.intent = "skip";
+      // A running child is stopped, which comes back as a skipped result; a
+      // held one is woken so it can bail at the gate it is parked on.
+      if (live.started) host.abortAgent(live.agentId);
+      else live.wake?.();
+      return true;
+    },
+    retry: index => {
+      const live = liveAgents.get(index);
+      if (live === undefined || !live.started || live.intent !== undefined) return false;
+      live.intent = "retry";
+      host.abortAgent(live.agentId);
+      return true;
+    },
+  });
+
+  /** The journal entry to reuse at `index`, or undefined to run it live. */
+  function replayAt(index: number, key: string): WorkflowJournalEntry | undefined {
+    if (!prefixIntact) return undefined;
+    const entry = journalEntries[index];
+    if (entry === undefined || entry.index !== index || entry.key !== key || !entry.ok) {
+      prefixIntact = false;
+      return undefined;
+    }
+    return entry;
+  }
+
   const worker = new Worker(WORKER_SOURCE, {
     eval: true,
     workerData: {
@@ -428,16 +595,21 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       worker.postMessage({ type: "response", callId, ok, value, error, fatal });
     };
 
-    const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount">) => {
+    const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount" | "replayedCount">) => {
       if (settled) return;
       settled = true;
       options.signal?.removeEventListener("abort", onAbort);
+      // Symmetric with `semaphore.drain()` below: everything parked is woken so
+      // it observes the settle and unwinds. Nothing depends on it — the run's
+      // promise resolves either way — it just does not leave live-agent
+      // bookkeeping behind for a run that is over.
+      releasePause();
       for (const agentId of inflight) host.abortAgent(agentId);
       inflight.clear();
       semaphore.drain();
       // Resolve only once the thread is actually down, so a caller that awaits
       // runWorkflow() is guaranteed not to be leaking one.
-      const settle = () => resolve({ ...result, meta, progress, agentCount });
+      const settle = () => resolve({ ...result, meta, progress, agentCount, replayedCount });
       void worker.terminate().then(settle, settle);
     };
 
@@ -479,15 +651,23 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           const known = [...completedByLabel.keys()];
           // Fatal: a typo'd label is a script bug, and folding it into a null
           // would show up as an agent that mysteriously returned nothing.
+          //
+          // Unless agents were replayed, in which case it is not a script bug
+          // at all — the label's child came back from the journal and has no
+          // conversation here to continue. Saying "no agent has completed"
+          // would send the reader hunting for a typo that is not there.
           respond(
             callId,
             false,
             undefined,
-            `agent() opts.resume: no agent has completed under the label "${payload.resume}" in this run. ${
-              known.length === 0
-                ? "No agent has completed yet."
-                : `Known labels: ${known.map(label => `"${label}"`).join(", ")}.`
-            }`,
+            replayedCount > 0 ?
+              `agent() opts.resume: "${payload.resume}" was replayed from the resume journal, not run, so there is ` +
+                "no conversation in this run to continue. Re-run without resumeFromRunId."
+            : `agent() opts.resume: no agent has completed under the label "${payload.resume}" in this run. ${
+                known.length === 0
+                  ? "No agent has completed yet."
+                  : `Known labels: ${known.map(label => `"${label}"`).join(", ")}.`
+              }`,
             true,
           );
           return;
@@ -528,89 +708,200 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       const queuedAt = Date.now();
       emit([{ ...base, queuedAt }]);
 
-      // A resumed agent waits its turn like any other: it is the same amount of
-      // model running at once.
-      await semaphore.acquire();
-      if (aborted || settled) {
-        semaphore.release();
-        respond(callId, false, undefined, "Workflow aborted.", true);
+      // Replay before the semaphore, not after: a cached answer is not model
+      // running, so it must not hold a concurrency slot that a live agent
+      // could use. The row still appears in the tree — the run reads as the
+      // same shape it had the first time, just faster.
+      const replayed = replayAt(index, journalKey(payload));
+      if (replayed !== undefined) {
+        replayedCount++;
+        const replayedText = replayed.text ?? "";
+        const at = Date.now();
+        emit([
+          {
+            ...base,
+            queuedAt,
+            startedAt: at,
+            lastProgressAt: at,
+            durationMs: 0,
+            state: "done",
+            // The row reads as done, because it is — `cached` is what tells the
+            // dialog to annotate it "from resume journal" rather than letting a
+            // 0ms agent look like one that did the work impossibly fast.
+            cached: true,
+            resultPreview: preview(replayedText),
+          },
+        ]);
+        openLaunches.delete(callId);
+        // Re-recorded so this run's journal is complete on its own terms: a
+        // resume of a resume must not have to walk back through a chain of
+        // earlier files to find the prefix.
+        recordJournal?.({ index, key: replayed.key, ok: true, text: replayedText });
+        respond(callId, true, replayedText);
         return;
       }
 
-      const startedAt = Date.now();
-      emit([{ ...base, queuedAt, startedAt }]);
-      inflight.add(agentId);
+      const key = journalKey(payload);
+      const resumeMark = payload.resume !== undefined ? ({ resumed: true } as const) : {};
 
-      let result: WorkflowSpawnResult;
+      /** A skip the user asked for, before the child ever started. */
+      const settleSkipped = (extra: Partial<WorkflowAgentEntry>) => {
+        recordJournal?.({ index, key, ok: false, ...resumeMark });
+        emit([{ ...base, queuedAt, ...extra, state: "error", skipped: true, error: "Skipped by user." }]);
+        // `null`, exactly as a terminal failure gives — a skipped agent is one
+        // the script's `.filter(Boolean)` was already written to survive.
+        respond(callId, true, null);
+      };
+
+      // Registered for exactly as long as the call is unanswered, which is the
+      // window in which skip and retry mean anything.
+      const live: LiveAgent = { agentId, started: false };
+      liveAgents.set(index, live);
+      // Read through a call, not off the field: `intent` is set from outside
+      // this function while it is suspended at an await, so control-flow
+      // narrowing across the awaits would be reasoning about a value that has
+      // since changed.
+      const intent = (): LiveAgent["intent"] => live.intent;
+      let attempt = 1;
       try {
-        result =
-          resumed !== undefined && resumeAgent !== undefined
-            ? await resumeAgent(resumed.agentId, payload.prompt)
-            : await host.spawnAgent({
+        for (;;) {
+          // Held before the slot, not after: a paused run must not sit on
+          // concurrency it is not using while its running agents drain.
+          await pauseGate(live);
+          if (intent() === "skip") return settleSkipped({});
+
+          // A resumed agent waits its turn like any other: it is the same amount of
+          // model running at once.
+          await semaphore.acquire();
+          if (aborted || settled) {
+            semaphore.release();
+            respond(callId, false, undefined, "Workflow aborted.", true);
+            return;
+          }
+          // Paused while parked behind the limit: this agent was waiting for a
+          // permit when the pause landed, so it never passed the gate above.
+          // Hand the permit back and go wait at the gate like everything else,
+          // or a pause would leak exactly as many agents as were queued.
+          if (isPaused() && !aborted && !settled) {
+            semaphore.release();
+            continue;
+          }
+          // Skipped while parked behind the limit: the permit arrived, and the
+          // only thing left to do with it is give it back.
+          if (intent() === "skip") {
+            semaphore.release();
+            return settleSkipped({});
+          }
+
+          // Carried on every emit from here on, so a retried row keeps saying
+          // why it is on its second attempt instead of losing it to the next
+          // progress update.
+          const attemptMark =
+            attempt > 1 ? { attempt, lastAttemptReason: "user-retry" as const } : {};
+
+          const startedAt = Date.now();
+          emit([{ ...base, queuedAt, startedAt, ...attemptMark }]);
+          live.started = true;
+          inflight.add(agentId);
+
+          let result: WorkflowSpawnResult;
+          try {
+            result =
+              resumed !== undefined && resumeAgent !== undefined
+                ? await resumeAgent(resumed.agentId, payload.prompt)
+                : await host.spawnAgent({
+                    agentId,
+                    index,
+                    prompt: payload.prompt,
+                    label,
+                    agentType,
+                    ...(model !== undefined ? { model } : {}),
+                    ...(payload.effort !== undefined ? { effort: payload.effort } : {}),
+                    ...(isolation !== undefined ? { isolation } : {}),
+                    ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
+                    ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+                    // Offered, not delegated: a host that can run it inside the
+                    // child's worktree does, and hands back `result.gate`.
+                    ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
+                  });
+            if (result.ok) {
+              // Recorded before the gate runs: the child itself finished, so it is
+              // resumable even when its gate rejects the work — "here is what the
+              // gate said, fix it" is the loop this exists for.
+              completedByLabel.set(label, {
                 agentId,
-                index,
-                prompt: payload.prompt,
                 label,
                 agentType,
                 ...(model !== undefined ? { model } : {}),
                 ...(isolation !== undefined ? { isolation } : {}),
-                ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
-                ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
-                // Offered, not delegated: a host that can run it inside the
-                // child's worktree does, and hands back `result.gate`.
-                ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
               });
-        if (result.ok) {
-          // Recorded before the gate runs: the child itself finished, so it is
-          // resumable even when its gate rejects the work — "here is what the
-          // gate said, fix it" is the loop this exists for.
-          completedByLabel.set(label, {
-            agentId,
-            label,
-            agentType,
-            ...(model !== undefined ? { model } : {}),
-            ...(isolation !== undefined ? { isolation } : {}),
-          });
-          if (payload.gate !== undefined && runGate !== undefined) {
-            result = await applyGate(result, payload.gate, agentId, runGate);
+              if (payload.gate !== undefined && runGate !== undefined) {
+                result = await applyGate(result, payload.gate, agentId, runGate);
+              }
+            }
+          } catch (error) {
+            result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+          } finally {
+            inflight.delete(agentId);
+            live.started = false;
+            semaphore.release();
           }
+
+          if (settled) return;
+
+          // The stop that produced this result was ours, so run the same call
+          // again rather than reporting it. The script is still awaiting this
+          // `agent()`, which is the only reason a retry can mean anything.
+          if (intent() === "retry" && !aborted) {
+            live.intent = undefined;
+            attempt++;
+            emit([{ ...base, queuedAt, attempt, lastAttemptReason: "user-retry" }]);
+            continue;
+          }
+
+          const finishedAt = Date.now();
+          const common = {
+            ...base,
+            queuedAt,
+            startedAt,
+            ...attemptMark,
+            lastProgressAt: finishedAt,
+            durationMs: finishedAt - startedAt,
+            ...(result.tokens !== undefined ? { tokens: result.tokens } : {}),
+            ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls } : {}),
+          };
+
+          if (result.ok) {
+            const text = result.text ?? "";
+            emit([{ ...common, state: "done", resultPreview: preview(text) }]);
+            recordJournal?.({ index, key, ok: true, text, ...resumeMark });
+            respond(callId, true, text);
+            return;
+          }
+          // Recorded as a failure rather than left out: a gap would be read as an
+          // unchanged prefix on the next resume, silently skipping the retry this
+          // whole mechanism exists to make cheap.
+          recordJournal?.({ index, key, ok: false, ...resumeMark });
+          // A dead agent is a null in the script, not a thrown error: Claude Code
+          // scripts .filter(Boolean) rather than try/catch around every call.
+          emit([
+            {
+              ...common,
+              state: "error",
+              // A user skip reaches here as a stopped child, which the host
+              // already reports as skipped — the flag is taken from the result
+              // rather than from the intent so an abort mid-skip still reads
+              // as whatever actually happened to the child.
+              error: result.error ?? "Agent failed.",
+              ...(result.skipped ? { skipped: true } : {}),
+            },
+          ]);
+          respond(callId, true, null);
+          return;
         }
-      } catch (error) {
-        result = { ok: false, error: error instanceof Error ? error.message : String(error) };
       } finally {
-        inflight.delete(agentId);
-        semaphore.release();
+        liveAgents.delete(index);
       }
-
-      if (settled) return;
-      const finishedAt = Date.now();
-      const common = {
-        ...base,
-        queuedAt,
-        startedAt,
-        lastProgressAt: finishedAt,
-        durationMs: finishedAt - startedAt,
-        ...(result.tokens !== undefined ? { tokens: result.tokens } : {}),
-        ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls } : {}),
-      };
-
-      if (result.ok) {
-        const text = result.text ?? "";
-        emit([{ ...common, state: "done", resultPreview: preview(text) }]);
-        respond(callId, true, text);
-        return;
-      }
-      // A dead agent is a null in the script, not a thrown error: Claude Code
-      // scripts .filter(Boolean) rather than try/catch around every call.
-      emit([
-        {
-          ...common,
-          state: "error",
-          error: result.error ?? "Agent failed.",
-          ...(result.skipped ? { skipped: true } : {}),
-        },
-      ]);
-      respond(callId, true, null);
     }
 
     worker.on("message", (message: WorkerMessage) => {

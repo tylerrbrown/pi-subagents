@@ -70,6 +70,27 @@ describe("inline glyph mapping", () => {
     expect(treeRows(lines)[1]).toContain("⟳ waiting");
   });
 
+  it("says a replayed agent came from the resume journal", () => {
+    const lines = card({
+      progress: [
+        agentEntry({ index: 0, label: "audit", state: "done", cached: true, agentType: "general-purpose" }),
+      ],
+    });
+
+    const row = treeRows(lines)[1];
+    // Ahead of the stat tail, so the row reads "why" before "how much".
+    expect(row).toContain("from resume journal");
+    expect(row.indexOf("from resume journal")).toBeLessThan(row.indexOf("general-purpose"));
+  });
+
+  it("leaves an agent that actually ran unannotated", () => {
+    const lines = card({
+      progress: [agentEntry({ index: 0, label: "audit", state: "done", agentType: "general-purpose" })],
+    });
+
+    expect(treeRows(lines)[1]).not.toContain("resume journal");
+  });
+
   it("renders a skipped and a blocked agent as a plain cross (the dialog splits them, this does not)", () => {
     const lines = card({
       progress: [
@@ -115,10 +136,34 @@ describe("tree branches", () => {
     expect(rows[4]).toMatch(/^ {2}└─ /);
   });
 
-  it("opens each group with ╭─ and the last with ╰─", () => {
+  it("opens the first group with ╭─ and closes the last with ╰─", () => {
     const rows = treeRows(card({ progress }));
     expect(rows[0]).toBe("╭─ Review");
     expect(rows[3]).toBe("╰─ Verify");
+  });
+
+  it("branches the middle groups instead of re-opening the box", () => {
+    // Three phases and no agents is what a run looks like the moment it starts,
+    // and every non-final group used to draw ╭─ — so it read as a stack of
+    // half-drawn boxes rather than one tree.
+    const rows = treeRows(
+      card({
+        progress: [],
+        meta: {
+          name: "src-vuln-scan",
+          description: "d",
+          phases: [{ title: "Discover" }, { title: "Scan" }, { title: "Verify" }],
+        },
+      }),
+    );
+    expect(rows).toEqual(["╭─ Discover", "├─ Scan", "╰─ Verify"]);
+  });
+
+  it("still draws a lone group as a closed box", () => {
+    const rows = treeRows(
+      card({ progress: [], meta: { name: "n", description: "d", phases: [{ title: "Only" }] } }),
+    );
+    expect(rows).toEqual(["╰─ Only"]);
   });
 
   it("hangs rows off a │ rail under a non-final group and off blanks under the final one", () => {
@@ -253,9 +298,16 @@ describe("header", () => {
     expect(header).not.toMatch(/1\/1|\d+ phases?/);
   });
 
-  it("names the tool and the workflow", () => {
-    const [header] = card({ progress: sevenAgents });
-    expect(header).toMatch(/^▸ Workflow {2}review-changes/);
+  it("names the workflow, and the tool only when it stands alone", () => {
+    // As a tool result there is a `▸ SubagentWorkflow …` call line directly
+    // above, so repeating it here put two near-identical pointer lines back to
+    // back. A session entry has no such line and asks for the prefix.
+    const [asResult] = card({ progress: sevenAgents });
+    expect(asResult).toMatch(/^ {2}review-changes/);
+    expect(asResult).not.toContain("SubagentWorkflow");
+
+    const [standalone] = card({ progress: sevenAgents, showToolTitle: true });
+    expect(standalone).toMatch(/^▸ SubagentWorkflow {2}review-changes/);
   });
 
   it("appends the terminal suffix for each stopped status", () => {
@@ -359,7 +411,7 @@ describe("size warning", () => {
       progress: [agentEntry({ index: 0, label: "a" })],
       agentCount: 40,
     });
-    expect(lines.at(-1)).toBe("  ⚠ Large workflow · /workflows to stop");
+    expect(lines.at(-1)).toBe("  ⚠ Large workflow · /agents → Workflows to stop");
   });
 
   it("stays away for a small run", () => {
@@ -383,7 +435,7 @@ describe("component rendering", () => {
     // so a realistic width would wrap lines the terminal never would.
     const rendered = renderWorkflowCard(input, theme).render(400);
     expect(rendered).toHaveLength(layoutWorkflowCard(input).length);
-    expect(rendered[0]).toContain("<toolTitle>*Workflow*</toolTitle>");
+    expect(rendered[0]).toContain("<toolTitle>*review-changes*</toolTitle>");
     expect(rendered[0]).toContain("<dim>1/1 agent · 42s · done</dim>");
     expect(rendered.join("\n")).toContain("<success>✔</success>");
   });

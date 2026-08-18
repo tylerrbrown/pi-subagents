@@ -213,6 +213,14 @@ export interface AgentRecord {
   depth?: number;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
+  /**
+   * The workflow run that owns this child, when a workflow spawned it.
+   *
+   * Owned the same way a nested child is owned by its parent: filtered out of
+   * every top-level surface, and outside the `maxConcurrent` pool. See
+   * `isTopLevelAgent`.
+   */
+  workflowId?: string;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
   /**
