@@ -39,10 +39,14 @@ export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
   const entryRenderers = new Map<string, any>();
   const registeredFlags = new Map<string, any>();
   const commands = new Map<string, any>();
+  const activeTools: string[] = [];
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn((customType: string, renderer: any) => entryRenderers.set(customType, renderer)),
-    registerTool: vi.fn((t: any) => tools.set(t.name, t)),
+    registerTool: vi.fn((t: any) => {
+      tools.set(t.name, t);
+      if (!activeTools.includes(t.name)) activeTools.push(t.name);
+    }),
     registerCommand: vi.fn((name: string, command: any) => commands.set(name, command)),
     registerFlag: vi.fn((name: string, options: any) => registeredFlags.set(name, options)),
     getFlag: vi.fn((name: string) => flags[name]),
@@ -56,6 +60,14 @@ export function makePi(flags: Record<string, boolean | string> = {}): BootedPi {
     // registered"; a test that cares overrides them.
     getAllTools: vi.fn(() => [] as any[]),
     getCommands: vi.fn(() => [] as any[]),
+    // The active set starts as whatever was registered, which is what pi does
+    // for a freshly loaded extension tool. `setActiveTools` writes it back so a
+    // test can assert on a withdrawal.
+    getActiveTools: vi.fn(() => [...activeTools]),
+    setActiveTools: vi.fn((names: string[]) => {
+      activeTools.length = 0;
+      activeTools.push(...names);
+    }),
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
     exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),

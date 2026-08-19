@@ -296,6 +296,22 @@ export const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
 /** `customType` of the session entry a flag-launched workflow renders through. */
 export const WORKFLOW_ENTRY_TYPE = "subagents:workflow";
 
+/**
+ * Tool names that mean "another extension already orchestrates subagents".
+ *
+ * Our own name, because pi resolves a duplicate registration silently, and
+ * Claude Code's bare `Workflow`, because a port of that tool is what a second
+ * workflow extension most likely calls itself.
+ *
+ * Matched exactly. A substring test would catch `list_workflows` or
+ * `github_workflow_run` and turn an unrelated integration into a silent
+ * shutdown of this feature.
+ */
+export const FOREIGN_WORKFLOW_TOOL_NAMES: ReadonlySet<string> = new Set([
+  SUBAGENT_TOOL_NAMES.WORKFLOW,
+  "Workflow",
+]);
+
 
 /**
  * What a finished workflow persists into the session so its card survives a
@@ -855,7 +871,7 @@ export default function (pi: ExtensionAPI) {
     // Last, and only here: CLI flag values are applied by the host AFTER every
     // extension factory has run, so this is the earliest point the real value
     // exists. Detached inside — a workflow must not hold up session startup.
-    warnOnWorkflowCollisions(ctx);
+    resolveWorkflowCollisions(ctx);
     runWorkflowFlag(ctx);
   });
 
@@ -1185,15 +1201,25 @@ export default function (pi: ExtensionAPI) {
   function isSchedulingEnabled(): boolean { return schedulingEnabled; }
   function setSchedulingEnabled(b: boolean) { schedulingEnabled = b; }
 
-  // Master switch for scripted workflows. Defaults to OFF — one tool call can
-  // spawn hundreds of subagents, so it is opted into rather than inherited.
-  // Off means the `SubagentWorkflow` tool is never registered: the model is not
-  // told the feature exists (zero context cost) and has nothing to call. The
+  // Master switch for scripted workflows. Defaults to ON. Off means the
+  // `SubagentWorkflow` tool is never registered: the model is not told the
+  // feature exists (zero context cost) and has nothing to call. The
   // `/agents → Workflows` view and `--subagents-workflow-file` are refused too, so
   // there is no second door into the same machinery.
-  let workflowsEnabled = false;
+  //
+  // `workflowsPinned` records that the answer came from the user — a boolean in
+  // subagents.json, or the settings toggle — rather than from this default. It
+  // is what `resolveWorkflowCollisions` checks before yielding to another
+  // extension's workflow tool: a default may be overridden by what else is
+  // loaded, an explicit choice may not.
+  let workflowsEnabled = true;
+  let workflowsPinned = false;
   function isWorkflowsEnabled(): boolean { return workflowsEnabled; }
-  function setWorkflowsEnabled(b: boolean) { workflowsEnabled = b; }
+  function isWorkflowsPinned(): boolean { return workflowsPinned; }
+  function setWorkflowsEnabled(b: boolean) {
+    workflowsEnabled = b;
+    workflowsPinned = true;
+  }
 
   // ---- Disable default agents configuration ----
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
@@ -2656,30 +2682,59 @@ Terse command-style prompts produce shallow, generic work.
    * session_start for exactly this reason.
    */
   /**
-   * Warn when another extension already owns the workflow tool name.
+   * Stand down when another extension already offers a workflow tool.
    *
-   * Pi resolves this silently: tool registration is first-registration-wins
-   * across extensions (`getAllRegisteredTools`), and the winner also overwrites
-   * a built-in of the same name. Nothing throws, and there is no tool-conflict
-   * diagnostic the way there is for shortcuts. So a foreign `SubagentWorkflow`
-   * loaded before us simply *is* the tool the model sees; ours never reaches
-   * the registry. There is nothing to withdraw — the only thing missing is
-   * anyone saying so.
+   * Workflows are on by default, so this extension can now be the *second*
+   * orchestrator in a session rather than the only one. Two workflow tools in
+   * one spec is worse than either alone: the model has to guess which to call,
+   * and pays for both descriptions to find out. The other extension was
+   * installed deliberately; a default of ours should not compete with it.
    *
-   * Only one direction is detectable. If ours registers first, the other
-   * extension's is the one dropped, and pi exposes no way to see a tool that
-   * lost — the registry keeps winners only.
+   * ## What counts as a conflict
    *
-   * Checked from `session_start` and nowhere earlier: `getAllTools` throws
-   * during extension loading ("Action methods cannot be called during
-   * extension loading"), and load order means a registration-time check could
-   * not see an extension that has not loaded yet.
+   * An exact name match against {@link FOREIGN_WORKFLOW_TOOL_NAMES}, from a
+   * tool that is not ours. Exact and not a substring on purpose: `Workflow` is
+   * a common word in tool names that have nothing to do with orchestration
+   * (`github_workflow_run`, `list_workflows`), and silently disabling the
+   * feature against one of those would be a bug nobody could see.
+   *
+   * Two shapes, both handled here:
+   *
+   * 1. **A foreign tool took our name.** Registration is first-wins across
+   *    extensions (`getAllRegisteredTools` skips a name it already has), and
+   *    the winner also overwrites a built-in of the same name. Nothing throws,
+   *    and there is no tool-conflict diagnostic the way there is for shortcuts.
+   *    Ours never reached the registry, so there is nothing to withdraw — but
+   *    the rest of the feature (the menu, the CLI flag) is still live and would
+   *    drive a tool the model cannot call. It comes down with it.
+   * 2. **A foreign tool sits beside ours** under a different name, typically
+   *    Claude Code's bare `Workflow`. Both are registered and both are offered.
+   *    This one we can actually withdraw: see below.
+   *
+   * Only one direction of case 1 is detectable. If ours registered first, the
+   * other extension's tool is the one dropped, and pi exposes no way to see a
+   * tool that lost — the registry keeps winners only.
+   *
+   * ## Why this can only happen at session_start
+   *
+   * `getAllTools` throws during extension loading ("Action methods cannot be
+   * called during extension loading"), and load order means a check at
+   * registration time could not see an extension that has not loaded yet. So
+   * the decision cannot gate `registerTool`; it has to undo it. `setActiveTools`
+   * is what makes that real rather than cosmetic — pi rebuilds the system
+   * prompt from the new set, and `session_start` runs before any turn, so the
+   * model never sees a spec we withdrew. A later `_refreshToolRegistry` keeps
+   * the active set it had and only adds names new to the registry, so ours does
+   * not creep back.
+   *
+   * An explicit `workflowsEnabled` is never overridden — see
+   * {@link isWorkflowsPinned}. A default yields to evidence; a choice does not.
    *
    * Best-effort and swallowed. A diagnostic that took the session down would be
    * worse than the collision it reports.
    */
   let collisionsChecked = false;
-  function warnOnWorkflowCollisions(ctx: ExtensionContext): void {
+  function resolveWorkflowCollisions(ctx: ExtensionContext): void {
     if (collisionsChecked) return;
     collisionsChecked = true;
 
@@ -2689,22 +2744,51 @@ Terse command-style prompts produce shallow, generic work.
     };
 
     try {
-      if (isWorkflowsEnabled()) {
-        const registered = pi.getAllTools().find(tool => tool.name === SUBAGENT_TOOL_NAMES.WORKFLOW);
-        // Identified by the description we built rather than by path: this
-        // extension does not know its own install path, and the description is
-        // the one field that is certainly ours.
-        if (registered !== undefined && registered.description !== workflowTool.description) {
+      if (!isWorkflowsEnabled()) return;
+
+      // Identified by the description we built rather than by path: this
+      // extension does not know its own install path, and the description is
+      // the one field that is certainly ours.
+      const foreign = pi
+        .getAllTools()
+        .find(tool => FOREIGN_WORKFLOW_TOOL_NAMES.has(tool.name) && tool.description !== workflowTool.description);
+      if (foreign === undefined) return;
+
+      const source = foreign.sourceInfo?.source ?? "unknown source";
+      const tookOurName = foreign.name === SUBAGENT_TOOL_NAMES.WORKFLOW;
+
+      // Pinned: say what we found and leave it alone. The user asked for both,
+      // and case 1 is still worth reporting because pi resolves it silently.
+      if (isWorkflowsPinned()) {
+        if (tookOurName) {
           warn(
-            `Another extension (${registered.sourceInfo?.source ?? "unknown source"}) already registers a ` +
-              `"${SUBAGENT_TOOL_NAMES.WORKFLOW}" tool. Pi keeps the first registration, so this extension's ` +
-              "workflow tool is not offered to the model. Disable one of the two.",
+            `Another extension (${source}) already registers a "${SUBAGENT_TOOL_NAMES.WORKFLOW}" tool. ` +
+              "Pi keeps the first registration, so this extension's workflow tool is not offered to the " +
+              "model. Disable one of the two.",
           );
         }
+        return;
+      }
+
+      workflowsEnabled = false; // not setWorkflowsEnabled: this is not the user pinning it
+      widget.update();
+      fleet.update();
+
+      warn(
+        `Another extension (${source}) already provides a "${foreign.name}" tool, so this extension's ` +
+          "workflows are disabled for this session to avoid offering the model two orchestrators. " +
+          'Set `"workflowsEnabled": true` in .pi/subagents.json to keep both.',
+      );
+
+      if (tookOurName) return; // ours never reached the registry; nothing to withdraw
+
+      const active = pi.getActiveTools();
+      if (active.includes(SUBAGENT_TOOL_NAMES.WORKFLOW)) {
+        pi.setActiveTools(active.filter(name => name !== SUBAGENT_TOOL_NAMES.WORKFLOW));
       }
     } catch {
-      // getAllTools is unavailable in some hosts (print mode, RPC). Not being
-      // able to check is not a reason to fail the session.
+      // getAllTools/setActiveTools are unavailable in some hosts (print mode,
+      // RPC). Not being able to check is not a reason to fail the session.
     }
   }
 
@@ -3501,7 +3585,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
       widgetMode: getWidgetMode(),
       outputTranscript: getOutputTranscriptDefault(),
       worktreeIsolation: isWorktreeIsolationEnabled(),
-      workflowsEnabled: isWorkflowsEnabled(),
+      // The user's answer, not the effective one. A stand-down for another
+      // extension's workflow tool is scoped to the session it was detected in;
+      // writing it here would let an unrelated settings change three menus away
+      // freeze it into the file as an explicit `false`, which then survives
+      // uninstalling the extension it was deferring to. undefined is dropped by
+      // JSON.stringify, so unset stays unset — same reasoning as
+      // `fallbackSubagent` below.
+      workflowsEnabled: isWorkflowsPinned() ? isWorkflowsEnabled() : undefined,
       maxSubagentDepth: getMaxSubagentDepth(),
       // Deliberately NOT `?? "general-purpose"`: every settings change writes the
       // whole snapshot, and materializing the implicit default would turn it into
@@ -3593,7 +3684,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "workflowsEnabled",
           label: "Workflows",
-          description: "Scripted workflows (off keeps the SubagentWorkflow tool out of the tool spec; applies on next pi session)",
+          description:
+            "Scripted workflows, on unless another extension provides a workflow tool "
+            + "(off keeps the SubagentWorkflow tool out of the tool spec; applies on next pi session)",
           currentValue: isWorkflowsEnabled() ? "on" : "off",
           values: ["on", "off"],
         },

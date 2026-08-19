@@ -176,13 +176,19 @@ export interface SubagentsSettings {
    */
   worktreeIsolation?: boolean;
   /**
-   * Master switch for scripted workflows. Defaults to `false` — opt in.
+   * Master switch for scripted workflows. Defaults to `true`.
    *
    * Off is not a soft hide: the `SubagentWorkflow` tool is never registered, so
    * the model is not told it exists and cannot call it, the `/agents`
-   * Workflows entry is hidden, and `--subagents-workflow-file` is refused. A
-   * workflow can spawn hundreds of subagents from one tool call, which is
-   * worth asking for rather than inheriting.
+   * Workflows entry is hidden, and `--subagents-workflow-file` is refused.
+   *
+   * Absent is not the same as `true`. Unset means *auto*: on, but yielding to
+   * another extension that already offers a workflow tool, because two
+   * orchestrators in one tool spec is a worse default than none — the model
+   * has to guess which to call, and pays for both descriptions to find out.
+   * Setting it explicitly pins the answer in both directions: `true` keeps
+   * ours whatever else is loaded, `false` is off regardless. See
+   * `resolveWorkflowCollisions` in index.ts.
    *
    * Read once at extension init, before registration, so flipping it in
    * `/agents → Settings` takes effect on the next pi session — the same
