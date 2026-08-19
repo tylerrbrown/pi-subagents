@@ -76,7 +76,7 @@ A script you will run more than once belongs in a file: put it in \`.pi/workflow
 
 ## Globals
 
-- **\`agent(prompt, opts?)\` → \`Promise<string | null>\`** — spawn one subagent and wait for its final text. Returns \`null\` if it is skipped from the /agents → Workflows view or fails terminally, so filter with \`.filter(Boolean)\` when a null would break later stages.
+- **\`agent(prompt, opts?)\` → \`Promise<string | object | null>\`** — spawn one subagent and wait for its final text. Returns \`null\` if it is skipped from the /agents → Workflows view or fails terminally, so filter with \`.filter(Boolean)\` when a null would break later stages.
   - \`label\` — display name in the progress tree. Also the handle for \`resume\`.
   - \`phase\` — put this agent in a named group, overriding the ambient \`phase()\`. **Use this inside \`pipeline\`/\`parallel\` stages**, where the ambient phase races.
   - \`agentType\` — which agent definition to use. Available types:
@@ -86,9 +86,12 @@ A script you will run more than once belongs in a file: put it in \`.pi/workflow
   - \`isolation: "worktree"\` — run in a throwaway git worktree. Use ONLY when agents write files in parallel and would otherwise collide; it costs setup time and disk per agent.
   - \`gate: "<command>"\` — run a shell command after the agent finishes and require it to pass. A failing gate marks the agent failed and its output becomes the error. This is how you make a result *verified* rather than merely claimed — prefer \`gate: "npm test"\` over asking another agent whether the code looks right.
   - \`resume: "<label>"\` — continue the child that ran under that label instead of starting fresh, so an iterative loop keeps its context. Mutually exclusive with \`agentType\`; cannot be combined with \`gate\`.
-  - Any other key is rejected by name at the call. In particular there is no \`schema\` here — ask for JSON in the prompt and \`JSON.parse\` what comes back — and no \`budget\` global or nested \`workflow()\`.
+  - \`schema\` — a JSON Schema object (root \`type: "object"\`). The child gets a \`StructuredOutput\` tool built from it and \`agent()\` resolves to the **validated object** instead of text. A payload that does not match is rejected back to the child, which corrects it; a child that never answers through the tool gets one more prompt and then fails, so the call returns \`null\`. Cannot be combined with \`resume\`.
+  - Any other key is rejected by name at the call.
 - **\`pipeline(items, ...stages)\` → \`Promise<any[]>\`** — run every item through every stage, with **no barrier between stages**. Each stage receives \`(previousResult, originalItem, index)\`. A stage that throws drops that item to \`null\` and skips its remaining stages.
 - **\`parallel(thunks)\` → \`Promise<any[]>\`** — run functions concurrently and wait for all of them. A thunk that throws becomes \`null\` without failing its siblings.
+- **\`workflow(nameOrRef, args?)\` → \`Promise<any>\`** — run a saved workflow inline as a sub-step and return whatever it returns. Pass a name, or \`{ scriptPath }\`. \`args\` becomes the child's \`args\` global. The child shares this run's concurrency cap, agent counter, abort signal and budget, and its agents appear under their own \`▸ name\` group. **One level only** — \`workflow()\` inside a child throws. An unknown name, an unreadable path or a child that is not a workflow throws too, so \`try\`/\`catch\` to handle it. Reach for it to reuse a saved workflow, not to structure one script: inline composition is cheaper.
+- **\`budget\`** — \`{ total, spent(), remaining() }\`. \`total\` is always \`null\` here: it comes from a token-target directive pi does not have, so guards like \`while (budget.total && budget.remaining() > 50_000)\` correctly do not fire. \`spent()\` is real — output tokens this run's agents have used — and \`remaining()\` is \`Infinity\` with no target.
 - **\`phase(title)\`** — start a new progress group. Subsequent \`agent()\` calls are grouped under it.
 - **\`log(message)\`** — a progress line shown to the user under the tree.
 - **\`args\`** — whatever was passed as the tool's \`args\`, verbatim.

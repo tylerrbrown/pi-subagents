@@ -2,26 +2,23 @@
  * workflow-dialog.ts — the `/agents → Workflows` two-pane inspector.
  *
  * ```
- * Workflow  review-changes                            3/7 agents · 1m12s
- *   Review changed files across dimensions, verify each finding
+ *  review-changes
+ *  Review changed files across dimensions              3/7 agents · 1m12s
  *
- * ▸ Phases
- *   ❯ ✔ Review                                                     3/3
- *     2 Verify                                                      1/2
- *     3 Report                                             Not started yet
- *
- *   Agents  showing 1 queued
- *   ❯ ◌ verify:auth.ts · attempt 2 · throttled · waiting 8s
- *
- *   Prompt  12 lines · expand
- *     Verify the auth findings against the actual middleware…
- *
- *   Activity  last 3 tool calls
- *     Transcript not available.
- *
- *   Outcome
- *       Waiting for an agent slot.
+ *  ╭ Phases ──────────┬ Verify · 1 agent ──────────────────────────────╮
+ *  │ ❯ ✔ Review   3/3 │ ❯ ◌ verify:auth.ts · attempt 2 · waiting 8s    │
+ *  │   2 Verify   1/2 │                                                │
+ *  │   3 Report       │                                                │
+ *  ╰──────────────────┴────────────────────────────────────────────────╯
+ *  ↑↓ select · ⏎ open · f filter · x stop · esc close
  * ```
+ *
+ * Opening an agent swaps the panes: that phase's agents move left and the
+ * right becomes the agent's Prompt / Activity / Outcome detail.
+ *
+ * A phase with no agents yet shows its number and nothing else. The single-pane
+ * layout this replaced spelled that out as "Not started yet"; the left pane is
+ * too narrow to hold the words, and a numbered row with no count says it.
  *
  * **The glyphs are not the card's glyphs.** `workflow-card.ts` keys off the raw
  * entry `state`; this file keys off the *derived* `displayState(entry, active)`
@@ -230,7 +227,6 @@ export const WORKFLOW_DIALOG_COPY = {
   skippedByUser: "Skipped by user.",
   noToolCallsYet: "No tool calls yet.",
   noToolCalls: "No tool calls.",
-  notStarted: "Not started yet",
   noAgents: "No agents",
 } as const;
 

@@ -882,6 +882,35 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(manager.getRecord(queuedId)!.status).toBe("completed");
   });
 
+  it("keeps a structured payload parseable when the worktree note is appended", async () => {
+    // `record.result` is prose for a reader and picks up a branch note on the
+    // way out. A schema'd payload living in the same field would stop parsing
+    // for every `agent({ schema, isolation: "worktree" })` call.
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    const wt = { path: "/wt/a", branch: "pi-agent-a", baseSha: "abc", workPath: "/wt/a" };
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: true, branch: "pi-agent-a" } as never);
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "I edited two files",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+      structuredJson: '{"answer":"42"}',
+    } as never);
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "go", {
+      description: "go", isBackground: true, isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+    await vi.waitFor(() => expect(manager.getRecord(id)!.status).toBe("completed"));
+
+    const record = manager.getRecord(id)!;
+    expect(JSON.parse(record.structuredJson!)).toEqual({ answer: "42" });
+    // The note still reaches the prose, which is where a human reads it.
+    expect(record.result).toContain("Changes saved to branch");
+  });
+
   it("a stop that lands during the copy discards the worktree instead of running", async () => {
     // Window that did not exist when creation was synchronous: abort() can mark
     // the record stopped while the repo is still being copied.

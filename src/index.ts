@@ -67,7 +67,7 @@ import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflo
 import { extractMeta, type WorkflowMeta } from "./workflow/meta.js";
 import { elapsedMs, type WorkflowEntry, type WorkflowRunStatus, stats as workflowStats } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
-import { listSavedWorkflows, readSavedWorkflow } from "./workflow/saved.js";
+import { listSavedWorkflows, resolveWorkflowSource } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, pauseWorkflowTask, resumeWorkflowTask, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
@@ -2349,25 +2349,20 @@ Terse command-style prompts produce shallow, generic work.
   ): { ok: true; script: string; scriptPath?: string } | { ok: false; message: string } {
     const path = params.scriptPath?.trim();
     if (path !== undefined && path !== "") {
-      const resolved = isAbsolute(path) ? path : join(cwd, path);
-      try {
-        return { ok: true, script: readFileSync(resolved, "utf-8"), scriptPath: resolved };
-      } catch (err) {
-        return {
-          ok: false,
-          message: `Could not read workflow script "${resolved}": ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
+      const resolved = resolveWorkflowSource({ scriptPath: path }, cwd);
+      return resolved.ok ? { ok: true, script: resolved.script, scriptPath: resolved.path } : resolved;
     }
     const script = params.script;
     if (script !== undefined && script.trim() !== "") return { ok: true, script };
 
     // A saved workflow is the same source by another route, so it reports its
     // file as `scriptPath`: the "edit the file and re-run" loop then works on a
-    // named workflow without the author having to find where it lives.
+    // named workflow without the author having to find where it lives. Shared
+    // with a script's nested `workflow()`, so one definition decides what a
+    // reference means.
     const name = params.name?.trim();
     if (name !== undefined && name !== "") {
-      const saved = readSavedWorkflow(name, cwd);
+      const saved = resolveWorkflowSource({ name }, cwd);
       return saved.ok ? { ok: true, script: saved.script, scriptPath: saved.path } : saved;
     }
 

@@ -85,6 +85,8 @@ export interface JournalKeyInput {
   isolation?: string;
   gate?: string;
   resume?: string;
+  /** Serialized `agent({ schema })`, when the call asked for one. */
+  schema?: string;
 }
 
 /** Stable hash of a call's payload. Field order is fixed here, not by the caller. */
@@ -98,6 +100,12 @@ export function journalKey(input: JournalKeyInput): string {
     input.isolation ?? null,
     input.gate ?? null,
     input.resume ?? null,
+    // Appended only when present, which looks like a hack and is not: adding a
+    // ninth slot unconditionally would change the canonical form of every entry
+    // and invalidate every journal already on disk. Conditional, a schema-less
+    // call keys exactly as it always did, and adding or changing a schema still
+    // produces a different key.
+    ...(input.schema !== undefined ? [input.schema] : []),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }

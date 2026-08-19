@@ -591,9 +591,27 @@ describe("keys", () => {
   };
 
   it("raises skip and retry against the selected agent's stable index", () => {
-    // Row position is not index: phase 0's second row is index 1.
     expect(pressMixed("s", 1)?.action).toEqual({ kind: "skip", index: 1 });
     expect(pressMixed("r", 1)?.action).toEqual({ kind: "retry", index: 1 });
+  });
+
+  it("uses the entry's index, not its row position", () => {
+    // The distinction only shows across phases: phase 1's first row is index 3,
+    // so a dialog reporting the row would skip the wrong agent entirely.
+    const across: WorkflowEntry[] = [
+      { type: "workflow_phase", index: 0, title: "Review" },
+      { type: "workflow_phase", index: 1, title: "Verify" },
+      agentEntry({ index: 0, label: "r0", phaseIndex: 0, state: "done" }),
+      agentEntry({ index: 1, label: "r1", phaseIndex: 0, state: "done" }),
+      agentEntry({ index: 2, label: "r2", phaseIndex: 0, state: "done" }),
+      agentEntry({ index: 3, label: "v0", phaseIndex: 1, state: "progress", queuedAt: START, startedAt: START }),
+    ];
+    const full = input({ progress: across, state: { level: "agent", selectedPhase: 1, selectedAgent: 0 } });
+    const view = resolveWorkflowDialog(full);
+
+    expect(view.selectedEntry?.label).toBe("v0");
+    expect(handleWorkflowDialogKey("s", full.state, view)?.action).toEqual({ kind: "skip", index: 3 });
+    expect(handleWorkflowDialogKey("r", full.state, view)?.action).toEqual({ kind: "retry", index: 3 });
   });
 
   it("offers skip but not retry on an agent that has not started", () => {

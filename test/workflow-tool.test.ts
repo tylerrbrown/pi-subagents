@@ -25,6 +25,7 @@ import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-t
 import subagentsExtension, { WORKFLOW_ENTRY_TYPE, WORKFLOW_FILE_FLAG } from "../src/index.js";
 import type { AgentRecord } from "../src/types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
+import { compileJsonSchema } from "../src/workflow/json-schema.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
@@ -108,6 +109,10 @@ describe("createWorkflowHost — spawn mapping", () => {
     const result = await host.spawnAgent(request({ label: "review:bugs" }));
 
     expect(result).toMatchObject({ ok: true, text: "the answer", tokens: 125, toolCalls: 3 });
+    // `tokens` is the lifetime total (100 + 20 + 5); `outputTokens` feeds the
+    // script's `budget.spent()` and must be output alone, as Claude Code's
+    // budget is. Billing a fan-out's re-sent input would swamp it.
+    expect(result.outputTokens).toBe(20);
     const [, , type, prompt, options] = stub.spawnAndWait.mock.calls[0];
     expect(type).toBe("general-purpose");
     expect(prompt).toBe("do the thing");
@@ -208,6 +213,32 @@ describe("createWorkflowHost — spawn mapping", () => {
     const options = stub.spawnAndWait.mock.calls[0][4];
     expect(options.workflowId).toBe("wf_run1");
     expect(options.bypassQueue).toBeUndefined();
+  });
+
+  it("forwards a compiled schema and prefers the structured payload", async () => {
+    // `result` is prose and picks up the worktree branch note on the way out;
+    // the caller asked for a schema and must get the payload, not the prose.
+    const compilation = compileJsonSchema({ type: "object", properties: { a: { type: "string" } } });
+    if (!compilation.ok) throw new Error(compilation.message);
+    const stub = stubManager(() =>
+      record({ result: "here you go", structuredJson: '{"a":"x"}' }),
+    );
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ schema: compilation.compiled }));
+
+    expect(stub.spawnAndWait.mock.calls[0][4].structuredOutput).toBe(compilation.compiled);
+    expect(result).toMatchObject({ ok: true, text: '{"a":"x"}' });
+  });
+
+  it("falls back to the prose when no schema was asked for", async () => {
+    const stub = stubManager(() => record({ result: "here you go" }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({}));
+
+    expect(stub.spawnAndWait.mock.calls[0][4].structuredOutput).toBeUndefined();
+    expect(result).toMatchObject({ ok: true, text: "here you go" });
   });
 
   it("leaves the stamp off when no run id was injected", async () => {

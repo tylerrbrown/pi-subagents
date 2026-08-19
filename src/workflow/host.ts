@@ -40,6 +40,7 @@ import { resolveModel } from "../model-resolver.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
+import { resolveWorkflowSource } from "./saved.js";
 
 /**
  * Wall-clock bound on a `gate` command. Generous — a gate is routinely a test
@@ -98,15 +99,30 @@ function succeeded(record: AgentRecord | undefined): boolean {
 /** Translate a settled record into what the script sees. */
 function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   const tokens = getLifetimeTotal(record.lifetimeUsage);
+  // Reported separately from `tokens`, which is the lifetime total. The script's
+  // `budget` counts *output* tokens, as Claude Code's does — billing the input
+  // and cache reads a fan-out re-sends would over-report it by an order of
+  // magnitude and make the documented guards useless.
+  const outputTokens = record.lifetimeUsage?.output ?? 0;
   const cwd = childCwd(record);
   const common = {
     ...(tokens > 0 ? { tokens } : {}),
+    ...(outputTokens > 0 ? { outputTokens } : {}),
     ...(record.toolUses > 0 ? { toolCalls: record.toolUses } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
   };
 
   if (succeeded(record)) {
-    return { ...common, ok: true, text: record.result ?? "" };
+    return {
+      ...common,
+      ok: true,
+      // The schema'd payload when there is one: `result` is prose, and for a
+      // worktree child it has had the branch note appended, so it would not
+      // parse. A child asked for a schema that produced none never reaches
+      // here — `runAgent` reports that through `failure`.
+      text: record.structuredJson ?? record.result ?? "",
+      ...(record.structuredRetried ? { structuredRetried: true } : {}),
+    };
   }
   // "stopped" is someone reaching in and stopping this child — /agents, the
   // fleet list, a workflow abort. That is the same thing the workflows dialog's
@@ -221,6 +237,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // the agent definition's `thinking` (then the parent's) still wins —
             // same precedence as `model` above.
             ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
+            ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
@@ -260,6 +277,14 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         };
       }
       return toSpawnResult(record);
+    },
+
+    /**
+     * Resolve a nested `workflow()` reference. The runtime decides whether what
+     * comes back is a workflow; this only finds it.
+     */
+    loadWorkflow(ref) {
+      return resolveWorkflowSource(ref, ctx.cwd);
     },
 
     // Reached only for a gate the spawn did not already run — a child with no

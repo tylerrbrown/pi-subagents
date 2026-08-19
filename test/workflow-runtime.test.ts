@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { WorkflowAgentEntry, WorkflowEntry } from "../src/workflow/progress.js";
+import type { WorkflowJournalEntry } from "../src/workflow/journal.js";
+import { buildPhaseGroups, type WorkflowAgentEntry, type WorkflowEntry } from "../src/workflow/progress.js";
 import {
   assertBoundarySafe,
   type RunWorkflowOptions,
@@ -55,6 +56,18 @@ function run(body: string, options: Omit<RunWorkflowOptions, "script">): Promise
 
 const agentEntries = (progress: readonly WorkflowEntry[]): WorkflowAgentEntry[] =>
   progress.filter((entry): entry is WorkflowAgentEntry => entry.type === "workflow_agent");
+
+describe("the worker source itself", () => {
+  it("parses as JavaScript", async () => {
+    // It is a template literal in a .ts file, so tsc never sees the JavaScript
+    // inside it: an unescaped backtick, `\n` where `\\n` was meant, or `\"` in a
+    // double-quoted string all type-check cleanly and then fail at runtime as
+    // "missing ) after argument list" from inside a worker thread. Parsing it
+    // here turns a twenty-minute bisect into a red test.
+    const { WORKER_SOURCE } = await import("../src/workflow/worker-source.js");
+    expect(() => new Function(WORKER_SOURCE)).not.toThrow();
+  });
+});
 
 describe("workflowConcurrency", () => {
   it("never returns zero on a small machine", () => {
@@ -779,25 +792,6 @@ describe("pause and the concurrency limit", () => {
  * ------------------------------------------------------------------------- */
 
 describe("Claude Code option compatibility", () => {
-  it("names opts.schema instead of quietly returning raw text", async () => {
-    // Claude Code's canonical example is `agent(p, {schema: FINDINGS})`, which
-    // there returns a validated object. Ignoring it hands the script a string,
-    // and the script then reads a field off it — so the run dies several lines
-    // later with "cannot read properties of undefined", nowhere near the cause.
-    const stub = stubHost();
-    const result = await run("return await agent('go', { schema: { type: 'object' } });", {
-      host: stub.host,
-    });
-
-    expect(result.status).toBe("failed");
-    expect(result.error).toMatch(/opts\.schema/);
-    // Named *and* answered: a ported script's author needs the workaround, not
-    // just the word "unsupported".
-    expect(result.error).toMatch(/JSON\.parse/);
-    // And it never spent a model call finding out.
-    expect(stub.calls).toHaveLength(0);
-  });
-
   it("names a misspelt option rather than ignoring it", async () => {
     const stub = stubHost();
     const result = await run("return await agent('go', { agenttype: 'Explore' });", { host: stub.host });
@@ -825,5 +819,392 @@ describe("Claude Code option compatibility", () => {
     );
 
     expect(result.value).toBe('["a0/a0","b1/b1"]');
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * budget
+ * ------------------------------------------------------------------------- */
+
+describe("the budget global", () => {
+  it("reports no target, because pi has none to report", () => {
+    // Claude Code sets `budget.total` from a "+500k" directive. pi has no such
+    // directive, so "no target set" is not a gap here — it is the permanent
+    // correct answer, and it is the state every documented guard is written
+    // against.
+    // Asserted as booleans, not through JSON: `JSON.stringify(Infinity)` is
+    // "null", which would pass this test for a `remaining()` that returned null.
+    return run(
+      "return JSON.stringify({ noTarget: budget.total === null, unbounded: budget.remaining() === Infinity, spent: budget.spent() });",
+      { host: stubHost().host },
+    ).then(result => {
+      expect(result.status).toBe("completed");
+      expect(JSON.parse(result.value as string)).toEqual({ noTarget: true, unbounded: true, spent: 0 });
+    });
+  });
+
+  it("counts the output tokens of settled agents, and only those", () => {
+    // Claude Code's budget counts *output* tokens. `getLifetimeTotal` sums
+    // input + output + cacheWrite, so reusing it here would over-report by an
+    // order of magnitude on a cache-heavy run.
+    const stub = stubHost(() => ({ ok: true, text: "x", tokens: 9_000, outputTokens: 300 }));
+    return run("await agent('a'); await agent('b'); return budget.spent();", {
+      host: stub.host,
+    }).then(result => {
+      expect(result.value).toBe(600);
+    });
+  });
+
+  it("runs Claude Code's loop-until-budget pattern verbatim", () => {
+    // Copied from the Workflow tool description. With no target the loop must
+    // not execute — `budget.total` is the guard, exactly as written there.
+    const stub = stubHost();
+    return run(
+      "const found = [];\n"
+        + "while (budget.total && budget.remaining() > 50_000) { found.push(await agent('find')); }\n"
+        + "return found.length;",
+      { host: stub.host },
+    ).then(result => {
+      expect(result.status).toBe("completed");
+      expect(result.value).toBe(0);
+      expect(stub.calls).toHaveLength(0);
+    });
+  });
+
+  it("runs Claude Code's static-scaling pattern verbatim", () => {
+    return run("return budget.total ? Math.floor(budget.total / 100_000) : 5;", {
+      host: stubHost().host,
+    }).then(result => {
+      expect(result.value).toBe(5);
+    });
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * agent({ schema })
+ * ------------------------------------------------------------------------- */
+
+describe("structured output", () => {
+  const FINDINGS = {
+    type: "object",
+    properties: { findings: { type: "array", items: { type: "string" } } },
+    required: ["findings"],
+  };
+  const schemaLiteral = JSON.stringify(FINDINGS);
+
+  it("hands the script an object, not a string", async () => {
+    // The whole point of the option. `instanceof` is the assertion that matters:
+    // it only holds if the value was parsed *inside* the script's own realm.
+    const stub = stubHost(() => ({ ok: true, text: '{"findings":["a","b"]}' }));
+    const result = await run(
+      `const r = await agent('go', { schema: ${schemaLiteral} });\n`
+        + "return JSON.stringify([typeof r, r instanceof Object, r.findings instanceof Array, r.findings.length]);",
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(JSON.parse(result.value as string)).toEqual(["object", true, true, 2]);
+  });
+
+  it("passes the compiled schema to the host", async () => {
+    const stub = stubHost(() => ({ ok: true, text: '{"findings":[]}' }));
+    await run(`return await agent('go', { schema: ${schemaLiteral} });`, { host: stub.host });
+
+    expect(stub.calls[0].schema).toBeDefined();
+    expect(stub.calls[0].schema?.schema).toEqual(FINDINGS);
+  });
+
+  it("fails the call when the host returns prose instead", async () => {
+    // A host that ignores `schema` must fail loudly. The runtime is the one
+    // place that can promise the script the shape it asked for.
+    const stub = stubHost(() => ({ ok: true, text: "I found two things." }));
+    const result = await run(
+      `const r = await agent('go', { schema: ${schemaLiteral} });\nreturn r === null;`,
+      { host: stub.host },
+    );
+
+    expect(result.value).toBe(true);
+    expect(agentEntries(result.progress).at(-1)).toMatchObject({ state: "error" });
+    expect(String(agentEntries(result.progress).at(-1)?.error)).toMatch(/not JSON|did not match/);
+  });
+
+  it("fails the call when the answer parses but does not match", async () => {
+    const stub = stubHost(() => ({ ok: true, text: '{"wrong":1}' }));
+    const result = await run(
+      `const r = await agent('go', { schema: ${schemaLiteral} });\nreturn r === null;`,
+      { host: stub.host },
+    );
+
+    expect(result.value).toBe(true);
+    expect(String(agentEntries(result.progress).at(-1)?.error)).toMatch(/findings/);
+  });
+
+  it("rejects a schema that cannot be one, before spending a model call", async () => {
+    for (const bad of ["5", "'x'", "[]", "{ type: 'array' }"]) {
+      const stub = stubHost();
+      const result = await run(`return await agent('go', { schema: ${bad} });`, { host: stub.host });
+      expect(result.status, `schema ${bad}`).toBe("failed");
+      expect(result.error).toMatch(/schema/);
+      expect(stub.calls, `schema ${bad}`).toHaveLength(0);
+    }
+  });
+
+  it("refuses schema together with resume", async () => {
+    // A resumed child re-prompts a session whose tool set was fixed when it
+    // started, so it has no StructuredOutput tool to answer through.
+    const stub = stubHost();
+    const result = await run(
+      "await agent('first', { label: 'a' });\n"
+        + `return await agent('again', { resume: 'a', schema: ${schemaLiteral} });`,
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/mutually exclusive/);
+  });
+
+  it("gives a schema call its own journal key", async () => {
+    const plain: WorkflowJournalEntry[] = [];
+    await run("return await agent('go');", {
+      host: stubHost().host,
+      journal: { append: entry => plain.push(entry) },
+    });
+
+    const schemad: WorkflowJournalEntry[] = [];
+    await run(`return await agent('go', { schema: ${schemaLiteral} });`, {
+      host: stubHost(() => ({ ok: true, text: '{"findings":[]}' })).host,
+      journal: { append: entry => schemad.push(entry) },
+    });
+
+    // Same prompt, different contract — a resume must not replay one as the other.
+    expect(schemad[0].key).not.toBe(plain[0].key);
+  });
+
+  it("declines a replayed answer that no longer matches", async () => {
+    // The key covers a schema that changed; this covers a journal that was
+    // edited, or torn mid-write. Either would hand the script a null from an
+    // entry the journal claims succeeded.
+    const stub = stubHost(() => ({ ok: true, text: '{"findings":["fresh"]}' }));
+    const stale: WorkflowJournalEntry[] = [];
+    await run(`return await agent('go', { schema: ${schemaLiteral} });`, {
+      host: stubHost(() => ({ ok: true, text: '{"findings":["old"]}' })).host,
+      journal: { append: entry => stale.push(entry) },
+    });
+    stale[0] = { ...stale[0], text: "not json at all" };
+
+    const result = await run(`return (await agent('go', { schema: ${schemaLiteral} })).findings[0];`, {
+      host: stub.host,
+      journal: { entries: stale },
+    });
+
+    expect(result.value).toBe("fresh");
+    expect(result.replayedCount).toBe(0);
+    expect(stub.calls).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * nested workflow()
+ * ------------------------------------------------------------------------- */
+
+describe("nested workflow()", () => {
+  /** A stub host that also serves saved workflows out of a map. */
+  function nestingHost(
+    library: Record<string, string>,
+    reply?: (request: WorkflowSpawnRequest) => WorkflowSpawnResult,
+  ) {
+    const stub = stubHost(reply);
+    const asked: unknown[] = [];
+    return {
+      calls: stub.calls,
+      aborted: stub.aborted,
+      asked,
+      host: {
+        ...stub.host,
+        loadWorkflow(ref: { name?: string; scriptPath?: string }) {
+          asked.push(ref);
+          const script = ref.name !== undefined ? library[ref.name] : undefined;
+          return script !== undefined
+            ? { ok: true as const, script }
+            : { ok: false as const, message: `No saved workflow named "${ref.name}".` };
+        },
+      } satisfies WorkflowHost,
+    };
+  }
+
+  const child = (name: string, body: string) =>
+    `export const meta = { name: "${name}", description: "d" };\n${body}\n`;
+
+  it("runs the child and returns its value", async () => {
+    const stub = nestingHost({ audit: child("audit", "return 'from the child';") });
+    const result = await run("return await workflow('audit');", { host: stub.host });
+
+    expect(result.status).toBe("completed");
+    expect(result.value).toBe("from the child");
+    expect(stub.asked).toEqual([{ name: "audit" }]);
+  });
+
+  it("passes args and exposes the child's own meta", async () => {
+    const stub = nestingHost({
+      audit: child("audit", "return JSON.stringify([args.n, meta.name]);"),
+    });
+    const result = await run("return await workflow('audit', { n: 7 });", { host: stub.host });
+
+    expect(JSON.parse(result.value as string)).toEqual([7, "audit"]);
+  });
+
+  it("shares the parent's agent counter, so ids never collide", async () => {
+    const stub = nestingHost({ audit: child("audit", "await agent('child-a'); return 1;") });
+    const result = await run("await agent('parent'); await workflow('audit'); return 1;", {
+      host: stub.host,
+    });
+
+    const ids = agentEntries(result.progress).map(entry => entry.agentId);
+    expect(new Set(ids).size).toBe(new Set(ids).size);
+    expect([...new Set(ids)]).toEqual(["wf-agent-0", "wf-agent-1"]);
+    // The run reports both as its own — there is only one run.
+    expect(result.agentCount).toBe(2);
+  });
+
+  it("shares the parent's concurrency limit", async () => {
+    // One permit across the boundary: the child's agent cannot start until the
+    // parent's has finished. This is free under one-worker nesting and would
+    // have had to be plumbed under any design with two.
+    let live = 0;
+    let peak = 0;
+    const stub = nestingHost({ audit: child("audit", "await agent('child'); return 1;") }, () => {
+      live++;
+      peak = Math.max(peak, live);
+      live--;
+      return { ok: true, text: "x" };
+    });
+    await run("await parallel([() => agent('a'), () => workflow('audit')]); return 1;", {
+      host: stub.host,
+      concurrency: 1,
+    });
+
+    expect(peak).toBe(1);
+  });
+
+  it("files the child's agents under their own phase group", async () => {
+    const stub = nestingHost({ audit: child("audit", "await agent('scan'); return 1;") });
+    const result = await run("phase('Review'); await agent('a'); await workflow('audit'); return 1;", {
+      host: stub.host,
+    });
+
+    const titles = result.progress
+      .filter((entry): entry is Extract<WorkflowEntry, { type: "workflow_phase" }> =>
+        entry.type === "workflow_phase")
+      .map(entry => entry.title);
+    expect(titles).toContain("Review");
+    expect(titles).toContain("▸ audit");
+    // Distinct indices, or the two would collapse into one group.
+    const groups = buildPhaseGroups(result.progress);
+    expect(groups.map(group => group.title)).toEqual(["Review", "▸ audit"]);
+    expect(groups[1].agents).toHaveLength(1);
+  });
+
+  it("does not let the child's phase leak back to the parent", async () => {
+    const stub = nestingHost({ audit: child("audit", "phase('Scan'); await agent('c'); return 1;") });
+    const result = await run(
+      "phase('Review'); await workflow('audit'); await agent('after'); return 1;",
+      { host: stub.host },
+    );
+
+    const after = agentEntries(result.progress).find(entry => entry.label === "after");
+    expect(after?.phaseTitle).toBe("Review");
+  });
+
+  it("keeps a child's phase from aliasing a parent phase of the same name", async () => {
+    const stub = nestingHost({ audit: child("audit", "phase('Scan'); await agent('c'); return 1;") });
+    const result = await run("phase('Scan'); await agent('p'); await workflow('audit'); return 1;", {
+      host: stub.host,
+    });
+
+    const entries = agentEntries(result.progress);
+    const parent = entries.find(entry => entry.label === "p");
+    const nested = entries.find(entry => entry.label === "c");
+    expect(parent?.phaseIndex).not.toBe(nested?.phaseIndex);
+    expect(nested?.phaseTitle).toBe("▸ audit › Scan");
+  });
+
+  it("refuses to nest more than one level, by name", async () => {
+    const stub = nestingHost({
+      outer: child("outer", "return await workflow('inner');"),
+      inner: child("inner", "return 1;"),
+    });
+    const result = await run("try { await workflow('outer'); return 'no throw'; } "
+      + "catch (error) { return error.message; }", { host: stub.host });
+
+    expect(String(result.value)).toMatch(/cannot be nested more than one level/);
+    expect(String(result.value)).toContain("outer");
+  });
+
+  it("lets a script catch an unknown name", async () => {
+    const stub = nestingHost({});
+    const result = await run(
+      "try { await workflow('nope'); return 'no throw'; } catch (error) { return error.message; }",
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(String(result.value)).toContain("nope");
+  });
+
+  it("lets a script catch a child that is not a workflow", async () => {
+    const stub = nestingHost({ broken: "return 1;" });
+    const result = await run(
+      "try { await workflow('broken'); return 'no throw'; } catch (error) { return error.message; }",
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(String(result.value)).toMatch(/meta/i);
+  });
+
+  it("is fatal on a host that cannot load workflows at all", async () => {
+    // A missing capability is a wiring error, not a runtime condition — same
+    // treatment as a `gate` on a host with no runGate. "Fatal" means
+    // parallel/pipeline rethrow rather than folding it to null; a script's own
+    // try/catch can still swallow it, exactly as for a fatal agent() error.
+    const result = await run("return await workflow('audit');", { host: stubHost().host });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/cannot run nested workflows/);
+  });
+
+  it("does not let parallel fold a fatal nested error into a null", async () => {
+    const result = await run(
+      "const r = await parallel([() => workflow('audit')]);\nreturn JSON.stringify(r);",
+      { host: stubHost().host },
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/cannot run nested workflows/);
+  });
+
+  it("caps how many nested runs one workflow may make", async () => {
+    const stub = nestingHost({ audit: child("audit", "return 1;") });
+    const result = await run(
+      "for (let i = 0; i < 5; i++) await workflow('audit');\nreturn 'done';",
+      { host: stub.host, nestedCap: 2 },
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/cap of 2 nested/);
+  });
+
+  it("journals the child's agents as the run's own", async () => {
+    const entries: WorkflowJournalEntry[] = [];
+    const script = "await agent('parent'); await workflow('audit'); return 1;";
+    const library = { audit: child("audit", "await agent('child'); return 1;") };
+    await run(script, { host: nestingHost(library).host, journal: { append: e => entries.push(e) } });
+
+    expect(entries.map(entry => entry.index)).toEqual([0, 1]);
+
+    const replayHost = nestingHost(library);
+    const replayed = await run(script, { host: replayHost.host, journal: { entries } });
+    expect(replayed.replayedCount).toBe(2);
+    expect(replayHost.calls).toHaveLength(0);
   });
 });

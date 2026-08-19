@@ -15,7 +15,8 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
-import { journalKey, type WorkflowJournalEntry } from "./journal.js";
+import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
+import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "./progress.js";
 import { WORKER_SOURCE } from "./worker-source.js";
@@ -28,6 +29,9 @@ export const WORKFLOW_AGENT_CAP = 1000;
 
 /** Items one `parallel()` or `pipeline()` call may take. */
 export const WORKFLOW_ITEM_CAP = 4096;
+
+/** Nested `workflow()` invocations allowed per run. */
+export const WORKFLOW_NESTED_CAP = 256;
 
 /** How much of a prompt or result is kept for the UI. */
 const PREVIEW_LENGTH = 200;
@@ -63,6 +67,14 @@ export interface WorkflowSpawnRequest {
    */
   effort?: string;
   isolation?: "worktree";
+  /**
+   * Compiled from the script's `agent({ schema })`.
+   *
+   * The host must give the child a `StructuredOutput` tool built from it and
+   * return the validated payload as JSON text. Compiled rather than raw so the
+   * runtime can re-check the answer without re-parsing the schema per call.
+   */
+  schema?: CompiledSchema;
   phaseIndex?: number;
   phaseTitle?: string;
   /**
@@ -87,6 +99,15 @@ export interface WorkflowSpawnResult {
   /** The user dismissed it rather than it failing; renders as skipped. */
   skipped?: boolean;
   tokens?: number;
+  /**
+   * Output tokens only, for the script's `budget.spent()`.
+   *
+   * Separate from {@link tokens}, which is the lifetime total. Claude Code's
+   * budget counts output, and a fan-out's re-sent input would swamp it.
+   */
+  outputTokens?: number;
+  /** Whether the child needed an extra prompt to produce its structured answer. */
+  structuredRetried?: boolean;
   toolCalls?: number;
   /**
    * Where the child actually ran.
@@ -120,6 +141,16 @@ export interface WorkflowGateResult {
 }
 
 /** The one seam between a workflow and the rest of the extension. */
+/** How a script names another workflow: a saved name, or a path to a file. */
+export interface WorkflowScriptRef {
+  name?: string;
+  scriptPath?: string;
+}
+
+export type WorkflowScriptSource =
+  | { ok: true; script: string; path?: string }
+  | { ok: false; message: string };
+
 export interface WorkflowHost {
   spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
   /** Called for every in-flight agent when the run aborts. */
@@ -144,6 +175,18 @@ export interface WorkflowHost {
    * instead of skipping it.
    */
   runGate?(command: string, options: { agentId: string; cwd?: string }): Promise<WorkflowGateResult>;
+  /**
+   * Resolve a nested `workflow()` reference to source.
+   *
+   * The runtime knows nothing about the filesystem or about pi, so it asks. It
+   * still decides whether what comes back *is* a workflow — see
+   * {@link validateScript} — because those rules belong with the runtime that
+   * enforces them everywhere else.
+   *
+   * Optional for the same reason as {@link resumeAgent}: a host without it
+   * rejects `workflow()` outright rather than silently running nothing.
+   */
+  loadWorkflow?(ref: WorkflowScriptRef): Promise<WorkflowScriptSource> | WorkflowScriptSource;
 }
 
 /**
@@ -204,6 +247,14 @@ export interface RunWorkflowOptions {
    * control. Fired before the first agent starts.
    */
   onControl?(control: WorkflowControl): void;
+  /**
+   * How many nested `workflow()` invocations one run may make in total.
+   *
+   * Each costs a compile and a scope rather than a thread, so the ceiling is
+   * generous — but unbounded is worse than capped, on the same reasoning as
+   * {@link agentCap}.
+   */
+  nestedCap?: number;
   /**
    * Replay and record, for `resumeFromRunId`.
    *
@@ -351,6 +402,8 @@ interface AgentCallPayload {
   resume?: string;
   /** Reasoning effort, already validated against pi's thinking levels worker-side. */
   effort?: string;
+  /** Raw JSON Schema from `agent({ schema })`, compiled before anything spawns. */
+  schema?: unknown;
 }
 
 type WorkerMessage =
@@ -400,6 +453,35 @@ interface CompletedChild {
  * `result.gate`, and this then shapes that outcome rather than running it
  * again.
  */
+/**
+ * Hold a schema'd result to its schema, host-side.
+ *
+ * The child's own tool already validated whatever it passed, so this normally
+ * agrees. It exists for the cases where nothing did: a host that ignores
+ * `schema` entirely, a replayed journal entry from before the schema changed,
+ * or a payload that reached us some other way. The script asked for a shape;
+ * exactly one place should be able to promise it.
+ */
+function applySchema(result: WorkflowSpawnResult, compiled: CompiledSchema): WorkflowSpawnResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.text ?? "");
+  } catch {
+    return {
+      ...result,
+      ok: false,
+      error: "The agent did not return structured output: its answer was not JSON.",
+    };
+  }
+  const verdict = compiled.check(parsed);
+  if (verdict === true) return result;
+  return {
+    ...result,
+    ok: false,
+    error: `The agent's answer did not match the requested schema: ${verdict}`,
+  };
+}
+
 async function applyGate(
   result: WorkflowSpawnResult,
   command: string,
@@ -438,9 +520,15 @@ function unawaitedLaunchMessage(labels: readonly string[]): string {
  * worker is live resolves instead, carrying the failure in `status` — by then
  * there is a progress log worth handing back.
  */
-export async function runWorkflow(options: RunWorkflowOptions): Promise<WorkflowRunResult> {
-  const { script, host } = options;
-
+/**
+ * Everything a script must satisfy before it is compiled.
+ *
+ * Extracted so a nested `workflow()` is held to exactly the same standard as a
+ * top-level run: same size limit, same character rules, same `meta` contract.
+ * The host resolves a reference to source; deciding whether that source is a
+ * workflow stays here, where the rules live.
+ */
+export function validateScript(script: string): { meta: WorkflowMeta; body: string } {
   if (script.length > MAX_SCRIPT_LENGTH) {
     throw new WorkflowRuntimeError(
       `Workflow script is ${script.length} characters, over the limit of ${MAX_SCRIPT_LENGTH}.`,
@@ -451,9 +539,15 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       "Workflow script contains control characters. Only tab, carriage return and newline are allowed.",
     );
   }
+  return extractMeta(script);
+}
+
+export async function runWorkflow(options: RunWorkflowOptions): Promise<WorkflowRunResult> {
+  const { script, host } = options;
+
   assertBoundarySafe(options.args, "args");
 
-  const { meta, body } = extractMeta(script);
+  const { meta, body } = validateScript(script);
   const agentCap = options.agentCap ?? WORKFLOW_AGENT_CAP;
   const itemCap = options.itemCap ?? WORKFLOW_ITEM_CAP;
   const semaphore = new Semaphore(options.concurrency ?? workflowConcurrency());
@@ -512,6 +606,18 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     wake?: () => void;
   }
   const liveAgents = new Map<number, LiveAgent>();
+
+  /**
+   * Output tokens this run has spent, mirrored to the script as
+   * `budget.spent()`.
+   *
+   * The host owns the number and every response carries it, rather than the
+   * worker accumulating its own: two counters would drift, and there is nothing
+   * to gain from the second one. Nor is there observable staleness — tokens
+   * only accrue through agents, and the script only learns anything through
+   * agent responses.
+   */
+  let spentOutputTokens = 0;
 
   let paused = false;
   /** Read through a call for the same reason `intent()` is — see below. */
@@ -577,6 +683,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       metaJson: JSON.stringify(meta),
       argsJson: options.args === undefined ? undefined : JSON.stringify(options.args),
       itemCap,
+      nestedCap: options.nestedCap ?? WORKFLOW_NESTED_CAP,
     },
   });
 
@@ -592,7 +699,9 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       // already finishing is not an unawaited launch either.
       openLaunches.delete(callId);
       if (settled) return;
-      worker.postMessage({ type: "response", callId, ok, value, error, fatal });
+      // `spent` rides on every response, so the worker's `budget.spent()` is a
+      // mirror of this number rather than a second tally of its own.
+      worker.postMessage({ type: "response", callId, ok, value, error, fatal, spent: spentOutputTokens });
     };
 
     const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount" | "replayedCount">) => {
@@ -674,6 +783,20 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         }
       }
 
+      // Compiled before anything is scheduled. A schema the runtime cannot use
+      // is a script bug, so it is fatal like a typo'd resume label — folding it
+      // into a null would surface as an agent that mysteriously returned
+      // nothing, and it costs no model call to say so here.
+      let compiledSchema: CompiledSchema | undefined;
+      if (payload.schema !== undefined) {
+        const compilation = compileJsonSchema(payload.schema);
+        if (!compilation.ok) {
+          respond(callId, false, undefined, compilation.message, true);
+          return;
+        }
+        compiledSchema = compilation.compiled;
+      }
+
       if (agentCount >= agentCap) {
         // Fatal, so parallel()/pipeline() rethrow instead of folding it into a
         // null. A cap that silently drops work is worse than no cap.
@@ -712,7 +835,24 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       // running, so it must not hold a concurrency slot that a live agent
       // could use. The row still appears in the tree — the run reads as the
       // same shape it had the first time, just faster.
-      const replayed = replayAt(index, journalKey(payload));
+      // The payload's `schema` is the raw object; the key wants it serialized,
+      // so the spread is narrowed rather than passed through.
+      const keyInput: JournalKeyInput = {
+        ...payload,
+        schema: payload.schema !== undefined ? JSON.stringify(payload.schema) : undefined,
+      };
+      let replayed = replayAt(index, journalKey(keyInput));
+      // A replayed answer still has to satisfy the schema. The key covers a
+      // schema that *changed*, but not a journal that was hand-edited, and not
+      // the empty text a torn entry leaves behind — either would hand the
+      // script a null from an entry the journal claims succeeded.
+      if (replayed !== undefined && compiledSchema !== undefined) {
+        const recheck = applySchema({ ok: true, text: replayed.text ?? "" }, compiledSchema);
+        if (!recheck.ok) {
+          prefixIntact = false;
+          replayed = undefined;
+        }
+      }
       if (replayed !== undefined) {
         replayedCount++;
         const replayedText = replayed.text ?? "";
@@ -741,7 +881,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         return;
       }
 
-      const key = journalKey(payload);
+      const key = journalKey(keyInput);
       const resumeMark = payload.resume !== undefined ? ({ resumed: true } as const) : {};
 
       /** A skip the user asked for, before the child ever started. */
@@ -817,6 +957,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     agentType,
                     ...(model !== undefined ? { model } : {}),
                     ...(payload.effort !== undefined ? { effort: payload.effort } : {}),
+                    ...(compiledSchema !== undefined ? { schema: compiledSchema } : {}),
                     ...(isolation !== undefined ? { isolation } : {}),
                     ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
                     ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
@@ -835,7 +976,17 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                 ...(model !== undefined ? { model } : {}),
                 ...(isolation !== undefined ? { isolation } : {}),
               });
-              if (payload.gate !== undefined && runGate !== undefined) {
+              // Re-checked here, not just in the child's tool: this is the one
+              // place that decides the script's value matches the schema it
+              // asked for, so a host that ignored `schema` fails loudly instead
+              // of handing the script prose. Before the gate, because a gate
+              // verifies work and there is no work to verify if the shape is
+              // wrong — and the reader should see the schema error, not a gate
+              // error standing in front of it.
+              if (compiledSchema !== undefined && result.ok) {
+                result = applySchema(result, compiledSchema);
+              }
+              if (result.ok && payload.gate !== undefined && runGate !== undefined) {
                 result = await applyGate(result, payload.gate, agentId, runGate);
               }
             }
@@ -858,6 +1009,11 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             emit([{ ...base, queuedAt, attempt, lastAttemptReason: "user-retry" }]);
             continue;
           }
+
+          // Counted before the response is sent, so the very call that spent
+          // them already sees them in `budget.spent()`. Failed and skipped
+          // agents count too — they burned the tokens either way.
+          spentOutputTokens += result.outputTokens ?? 0;
 
           const finishedAt = Date.now();
           const common = {
@@ -904,6 +1060,44 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       }
     }
 
+    /**
+     * Resolve one `workflow(ref)` and hand the child's source back compiled.
+     *
+     * Resolution failures are non-fatal — Claude Code documents `workflow()` as
+     * throwing on an unknown name so a script can catch it and carry on. A host
+     * with no `loadWorkflow` at all is fatal, matching how a missing `runGate`
+     * or `resumeAgent` is treated: a capability the script asked for and this
+     * host cannot provide is a wiring error, not a runtime condition.
+     */
+    async function handleLoadWorkflow(callId: number, ref: WorkflowScriptRef): Promise<void> {
+      const loadWorkflow = host.loadWorkflow?.bind(host);
+      if (loadWorkflow === undefined) {
+        respond(callId, false, undefined, "This workflow host cannot run nested workflows.", true);
+        return;
+      }
+      let source: WorkflowScriptSource;
+      try {
+        source = await loadWorkflow(ref);
+      } catch (error) {
+        respond(callId, false, undefined, error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (!source.ok) {
+        respond(callId, false, undefined, source.message);
+        return;
+      }
+      try {
+        const child = validateScript(source.script);
+        respond(callId, true, {
+          name: child.meta.name,
+          metaJson: JSON.stringify(child.meta),
+          body: child.body,
+        });
+      } catch (error) {
+        respond(callId, false, undefined, error instanceof Error ? error.message : String(error));
+      }
+    }
+
     worker.on("message", (message: WorkerMessage) => {
       if (settled) return;
       switch (message.type) {
@@ -911,11 +1105,15 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           emit(message.entries);
           break;
         case "call":
+          if (message.method === "workflow") {
+            void handleLoadWorkflow(message.callId, message.payload as WorkflowScriptRef);
+            break;
+          }
           if (message.method !== "agent") {
             respond(message.callId, false, undefined, `Unknown workflow host method "${message.method}".`, true);
             break;
           }
-          void handleAgent(message.callId, message.payload);
+          void handleAgent(message.callId, message.payload as AgentCallPayload);
           break;
         case "complete": {
           // The script is done, so every launch it made should have been

@@ -37,8 +37,8 @@
  * author never intended to write.
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isSymlink, isUnsafeName, safeReadFile } from "../memory.js";
 import { hasMetaDeclaration } from "./meta.js";
@@ -106,6 +106,34 @@ export function readSavedWorkflow(name: string, cwd: string): SavedWorkflow {
         ? `Available: ${known.join(", ")}.`
         : "Save one as `<name>.js` in one of those directories, or pass `script`/`scriptPath` instead."),
   };
+}
+
+/**
+ * Resolve a reference — a saved name, or a path — to source.
+ *
+ * The one place that decides what a reference means, so the tool's `name` /
+ * `scriptPath` parameters and a script's nested `workflow()` cannot drift apart
+ * on precedence or on what counts as a workflow.
+ */
+export function resolveWorkflowSource(
+  ref: { name?: string; scriptPath?: string },
+  cwd: string,
+): SavedWorkflow {
+  const path = ref.scriptPath?.trim();
+  if (path !== undefined && path !== "") {
+    const resolved = isAbsolute(path) ? path : join(cwd, path);
+    try {
+      return { ok: true, script: readFileSync(resolved, "utf-8"), path: resolved };
+    } catch (err) {
+      return {
+        ok: false,
+        message: `Could not read workflow script "${resolved}": ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+  const name = ref.name?.trim();
+  if (name !== undefined && name !== "") return readSavedWorkflow(name, cwd);
+  return { ok: false, message: "A workflow reference needs a `name` or a `scriptPath`." };
 }
 
 /** Every saved workflow name, de-duplicated across roots and sorted. */

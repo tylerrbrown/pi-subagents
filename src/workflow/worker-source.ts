@@ -86,6 +86,16 @@ const PRELUDE = ${JSON.stringify(DETERMINISM_PRELUDE)};
 let nextCallId = 1;
 const pendingCalls = new Map();
 
+/**
+ * Output tokens this run has spent, as last reported by the host.
+ *
+ * A mirror, not a tally: every response carries the host's current total, so
+ * there is exactly one counter and it cannot drift. Between responses it cannot
+ * be stale in any way the script could observe — tokens only accrue through
+ * agents, and an agent's response is the only thing the script waits on.
+ */
+let spentOutput = 0;
+
 function callHost(method, payload) {
   // Drain first, so the phase() that named this agent reaches the host ahead of
   // the agent entry rather than a tick behind it.
@@ -99,6 +109,7 @@ function callHost(method, payload) {
 
 port.on("message", function (message) {
   if (!message || message.type !== "response") return;
+  if (typeof message.spent === "number") spentOutput = message.spent;
   const waiter = pendingCalls.get(message.callId);
   if (!waiter) return;
   pendingCalls.delete(message.callId);
@@ -153,6 +164,35 @@ function flushProgress() {
  * ------------------------------------------------------------------ */
 
 let realmObjectPrototype = null;
+/**
+ * The realm's own \`JSON.parse\`.
+ *
+ * Module-scope, not local to main(), because \`agent({ schema })\` parses its
+ * result here — outside main's closure — and the object has to carry the
+ * *script's* Object.prototype, not the worker's, or \`instanceof Object\` fails
+ * inside the script it was handed to.
+ */
+let realmParse = null;
+
+/**
+ * The top-level script's scope.
+ *
+ * Module-scope because a nested \`workflow()\` needs the realm-native function
+ * compiler that \`main()\` builds, and because the compiled child function is
+ * cached per body — see {@link workflowIn}.
+ */
+let rootScope = null;
+/**
+ * The vm context every script runs in.
+ *
+ * Held so a nested \`workflow()\` can compile its child there. Compiled from
+ * *outside* the realm, with \`vm.Script\`, because the context itself has
+ * \`codeGeneration.strings\` off — the script cannot build code, but the worker
+ * that owns it still can.
+ */
+let realmContext = null;
+/** Nested invocations made so far, against \`workerData.nestedCap\`. */
+let nestedCount = 0;
 
 function boundaryError(what, path) {
   return new Error(
@@ -290,36 +330,79 @@ const AGENT_OPTIONS = [
   "gate",
   "resume",
   "effort",
+  "schema",
 ];
 
 /** Claude Code options this runtime does not have, and why. */
-const UNSUPPORTED_AGENT_OPTIONS = {
-  schema: "there is no structured-output mode here, so the call would return the agent's raw text. "
-    + "Ask for JSON in the prompt and JSON.parse what comes back.",
-};
+const UNSUPPORTED_AGENT_OPTIONS = {};
 
 /* ------------------------------------------------------------------ *
  * Script globals
  * ------------------------------------------------------------------ */
 
-let ambientPhaseIndex;
-let ambientPhaseTitle;
+/**
+ * Phase indices are allocated once for the whole run, so parent and child never
+ * collide. What is per-scope is the *title to index* map: a child's
+ * \`phase("Scan")\` must not resolve to the parent's "Scan".
+ */
 let nextPhaseIndex = 0;
-const phaseIndexByTitle = new Map();
 
-function definePhase(title) {
-  let index = phaseIndexByTitle.get(title);
+/**
+ * One script's view of the world.
+ *
+ * A nested \`workflow()\` runs in this same worker and this same vm context —
+ * which is what makes it share the run's semaphore, agent counter, journal,
+ * abort signal and budget without any of them being plumbed anywhere. What it
+ * must NOT share is ambient phase state, so that lives here and the child's
+ * globals are closures over its own scope.
+ */
+function makeScope(name, depth) {
+  const scope = {
+    name: name,
+    depth: depth,
+    // Prefixed into every phase title the child defines, which is the whole of
+    // how a nested run reads as its own group in the progress tree — no new
+    // entry type, no renderer change.
+    prefix: name === undefined ? "" : "\u25b8 " + name,
+    ambientPhaseIndex: undefined,
+    ambientPhaseTitle: undefined,
+    phaseIndexByTitle: new Map(),
+  };
+  scope.agent = function (prompt, opts) {
+    return agentIn(scope, prompt, opts);
+  };
+  scope.phase = function (title) {
+    return phaseIn(scope, title);
+  };
+  scope.log = function (message) {
+    return logIn(scope, message);
+  };
+  scope.workflow = function (ref, args) {
+    return workflowIn(scope, ref, args);
+  };
+  scope.console = makeConsole(scope);
+  return scope;
+}
+
+/** A scope's title for a phase: the child's own group, or the parent's bare title. */
+function scopedTitle(scope, title) {
+  if (scope.prefix === "") return title;
+  return title === undefined ? scope.prefix : scope.prefix + " \u203a " + title;
+}
+
+function definePhaseIn(scope, title) {
+  let index = scope.phaseIndexByTitle.get(title);
   if (index !== undefined) return index;
   index = nextPhaseIndex++;
-  phaseIndexByTitle.set(title, index);
-  emit({ type: "workflow_phase", index: index, title: title });
+  scope.phaseIndexByTitle.set(title, index);
+  emit({ type: "workflow_phase", index: index, title: scopedTitle(scope, title) });
   return index;
 }
 
-function phase(title) {
+function phaseIn(scope, title) {
   const text = requireText(title, "phase(title)");
-  ambientPhaseIndex = definePhase(text);
-  ambientPhaseTitle = text;
+  scope.ambientPhaseIndex = definePhaseIn(scope, text);
+  scope.ambientPhaseTitle = scopedTitle(scope, text);
 }
 
 function describe(value) {
@@ -338,20 +421,25 @@ function describe(value) {
   return String(value);
 }
 
-function log(message) {
-  emit({ type: "workflow_log", message: describe(message) });
+/** Attribute a line to the child that wrote it; logs carry no phase of their own. */
+function logPrefix(scope) {
+  return scope.prefix === "" ? "" : scope.prefix + ": ";
 }
 
-function makeConsole() {
+function logIn(scope, message) {
+  emit({ type: "workflow_log", message: logPrefix(scope) + describe(message) });
+}
+
+function makeConsole(scope) {
   const write = function () {
     const parts = [];
     for (let i = 0; i < arguments.length; i++) parts.push(describe(arguments[i]));
-    emit({ type: "workflow_log", message: parts.join(" ") });
+    emit({ type: "workflow_log", message: logPrefix(scope) + parts.join(" ") });
   };
   return { log: write, info: write, warn: write, error: write, debug: write };
 }
 
-async function agent(prompt, opts) {
+async function agentIn(scope, prompt, opts) {
   const text = requireText(prompt, "agent(prompt)");
   const options = opts === undefined || opts === null ? {} : opts;
   if (typeof options !== "object" || Array.isArray(options)) {
@@ -379,6 +467,16 @@ async function agent(prompt, opts) {
   const gate = optionalText(options.gate, "agent() opts.gate");
   const resume = optionalText(options.resume, "agent() opts.resume");
   const effort = optionalText(options.effort, "agent() opts.effort");
+  const schema = options.schema;
+  if (schema !== undefined) {
+    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+      throw new Error("agent() opts.schema must be a JSON Schema object.");
+    }
+    // Structured clone would happily carry a Map or a cycle that neither the
+    // journal key nor the tool's parameters can survive. Same check the return
+    // value gets.
+    checkBoundary(schema, "agent() opts.schema");
+  }
   if (effort !== undefined && EFFORT_LEVELS.indexOf(effort) === -1) {
     throw new Error("agent() opts.effort must be one of: " + EFFORT_LEVELS.join(", ") + ".");
   }
@@ -408,6 +506,12 @@ async function agent(prompt, opts) {
         "agent() opts.resume and opts.effort are mutually exclusive: a resumed agent keeps the reasoning effort it was started with."
       );
     }
+    if (schema !== undefined) {
+      throw new Error(
+        "agent() opts.resume and opts.schema are mutually exclusive: a resumed child re-prompts the session it "
+          + "already had, whose tool set was fixed when it started — it has no StructuredOutput tool to answer through."
+      );
+    }
     if (gate !== undefined) {
       throw new Error("agent() opts.gate cannot be combined with opts.resume.");
     }
@@ -416,8 +520,8 @@ async function agent(prompt, opts) {
   // An explicit opts.phase files this agent under that phase without moving
   // the ambient one, so a stray verify step does not re-point the phases that
   // follow it.
-  const phaseIndex = phaseName !== undefined ? definePhase(phaseName) : ambientPhaseIndex;
-  const phaseTitle = phaseName !== undefined ? phaseName : ambientPhaseTitle;
+  const phaseIndex = phaseName !== undefined ? definePhaseIn(scope, phaseName) : scope.ambientPhaseIndex;
+  const phaseTitle = phaseName !== undefined ? scopedTitle(scope, phaseName) : scope.ambientPhaseTitle;
 
   const result = await callHost("agent", {
     prompt: text,
@@ -430,8 +534,19 @@ async function agent(prompt, opts) {
     gate: gate,
     resume: resume,
     effort: effort,
+    schema: schema,
   });
-  return result === undefined ? null : result;
+  if (result === undefined || result === null) return null;
+  if (schema === undefined) return result;
+  // Parsed with the realm's own JSON.parse so the script gets an object whose
+  // prototype is its own — \`x instanceof Object\` and \`x.list instanceof Array\`
+  // both hold, and it survives assertBoundary if the script returns it.
+  try {
+    return realmParse(result);
+  } catch (error) {
+    logIn(scope, "agent(): the host returned a structured result that is not JSON");
+    return null;
+  }
 }
 
 /**
@@ -492,18 +607,135 @@ async function pipeline(items, ...stages) {
   return toRealmArray(settled);
 }
 
+/**
+ * The \`workflow(nameOrRef, args?)\` global.
+ *
+ * Runs another workflow inline. The child executes in *this* worker and *this*
+ * vm context, as a function whose parameters shadow the globals — which is why
+ * it shares the run's concurrency cap, agent counter, abort signal, journal and
+ * budget without any of them being passed anywhere: there is only ever one of
+ * each. What it does not share is ambient phase state, which lives on the scope.
+ *
+ * One level only, as in Claude Code. The child's \`workflow\` is present and
+ * throws rather than absent, so the error names the limit instead of reading
+ * \`workflow is not defined\`.
+ */
+async function workflowIn(scope, nameOrRef, args) {
+  if (scope.depth > 0) {
+    throw new Error(
+      "workflow() cannot be nested more than one level deep — you are already inside the workflow '" +
+        scope.name + "'. Call the agents inline instead."
+    );
+  }
+
+  let ref;
+  if (typeof nameOrRef === "string") {
+    if (nameOrRef.trim() === "") throw new Error("workflow(nameOrRef) expects a non-empty name.");
+    ref = { name: nameOrRef };
+  } else if (nameOrRef && typeof nameOrRef === "object" && !Array.isArray(nameOrRef)) {
+    const scriptPath = optionalText(nameOrRef.scriptPath, "workflow() scriptPath");
+    const name = optionalText(nameOrRef.name, "workflow() name");
+    if (scriptPath === undefined && name === undefined) {
+      throw new Error("workflow({ ... }) expects a \`name\` or a \`scriptPath\`.");
+    }
+    ref = { name: name, scriptPath: scriptPath };
+  } else {
+    throw new Error("workflow(nameOrRef) expects a saved workflow name or { scriptPath }.");
+  }
+
+  const label = ref.name !== undefined ? ref.name : ref.scriptPath;
+  if (args !== undefined) checkBoundary(args, 'workflow("' + label + '") args');
+
+  if (nestedCount >= workerData.nestedCap) {
+    // Fatal, like the agent cap: a limit that silently drops work would be
+    // worse than no limit.
+    const error = new Error(
+      "Workflow exceeded its cap of " + workerData.nestedCap + " nested workflow() calls."
+    );
+    error.workflowFatal = true;
+    throw error;
+  }
+  nestedCount++;
+
+  let loaded;
+  try {
+    loaded = await callHost("workflow", ref);
+  } catch (error) {
+    // Resolution failures are the script's to handle — Claude Code documents
+    // workflow() as throwing on an unknown name so a script can catch it.
+    // Attributed, so a caught error says which reference failed.
+    if (isFatal(error)) throw error;
+    throw new Error('workflow("' + label + '"): ' + describe(error));
+  }
+
+  const child = makeScope(loaded.name, scope.depth + 1);
+  // The child's own group, defined before its first agent so a child that never
+  // calls phase() still reads as its own section rather than falling into the
+  // parent's un-phased bucket.
+  child.ambientPhaseIndex = definePhaseIn(child, undefined);
+  child.ambientPhaseTitle = scopedTitle(child, undefined);
+
+  let run;
+  try {
+    const compiled = new vm.Script(
+      // \`meta\` is deliberately not a parameter: the body still opens with its
+      // own \`const meta = { ... }\` (extractMeta strips only the \`export\`), so a
+      // parameter of that name would collide with it.
+      "(async (agent, phase, log, workflow, console, args) => {" + PRELUDE + "\\n" + loaded.body + "\\n})",
+      { filename: "workflow:" + loaded.name + ".js", lineOffset: -1 }
+    );
+    run = compiled.runInContext(realmContext);
+  } catch (error) {
+    throw new Error('workflow("' + label + '"): ' + describe(error));
+  }
+
+  const value = await run(child.agent, child.phase, child.log, child.workflow, child.console, args);
+  checkBoundary(value, 'the result of workflow("' + label + '")');
+  return value;
+}
+
+/**
+ * The \`budget\` global.
+ *
+ * \`total\` is permanently null, and that is the honest answer rather than a
+ * stub: Claude Code fills it from the user's "+500k" directive and pi has no
+ * such directive, so "no target set" is the state this runtime is always in.
+ * Every pattern Claude Code documents guards on exactly that — \`while
+ * (budget.total && ...)\`, \`budget.total ? ... : 5\` — so those scripts run here
+ * unchanged and take the branch they were written for. Leaving \`budget\`
+ * undefined instead would turn a graceful guard into a ReferenceError.
+ *
+ * \`spent()\` is real. It differs from Claude Code's in scope: theirs pools the
+ * main loop and every workflow in the turn, ours counts this run's agents.
+ */
+function makeBudget() {
+  return {
+    total: null,
+    spent: function () {
+      return spentOutput;
+    },
+    remaining: function () {
+      // Infinity, not a number, because there is no target to subtract from.
+      return Infinity;
+    },
+  };
+}
+
 /* ------------------------------------------------------------------ *
  * Run
  * ------------------------------------------------------------------ */
 
 async function main() {
+  rootScope = makeScope(undefined, 0);
   const sandbox = {
-    agent: agent,
+    agent: rootScope.agent,
     parallel: parallel,
     pipeline: pipeline,
-    phase: phase,
-    log: log,
-    console: makeConsole(),
+    phase: rootScope.phase,
+    log: rootScope.log,
+    workflow: rootScope.workflow,
+    budget: makeBudget(),
+    console: rootScope.console,
   };
   const context = vm.createContext(sandbox, {
     name: "workflow",
@@ -513,7 +745,8 @@ async function main() {
   realmObjectPrototype = vm.runInContext("Object.prototype", context);
   realmNewArray = vm.runInContext("(function () { return []; })", context);
   realmPush = vm.runInContext("(function (array, value) { array.push(value); })", context);
-  const realmParse = vm.runInContext("JSON.parse", context);
+  realmParse = vm.runInContext("JSON.parse", context);
+  realmContext = context;
 
   // meta and args are materialised *inside* the realm rather than injected, so
   // the script sees objects whose prototype is its own Object.prototype and
