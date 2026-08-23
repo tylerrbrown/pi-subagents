@@ -49,6 +49,8 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
+Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). The `peerDependencies` range declares it, so npm flags an older pi at install time.
+
 ## Quick Start
 
 The parent agent spawns sub-agents using the `Agent` tool:

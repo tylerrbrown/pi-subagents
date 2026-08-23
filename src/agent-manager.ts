@@ -1254,17 +1254,20 @@ export class AgentManager {
     const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
     this.startups.clear();
+    if (pi) {
+      // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
+      // on the shutdown path, which cannot wait for git. Started before the awaited
+      // shutdown below rather than after it, so the git calls have that window to
+      // finish in instead of racing the process exit that follows.
+      const prune = (repo: string) => { pruneWorktrees(pi, repo).catch(() => {}); };
+      prune(process.cwd());
+      // Also prune repos that caller-supplied cwds created worktrees in — a clean
+      // exit with in-flight agents would otherwise leave stale registrations there.
+      for (const repo of this.worktreeRepos) prune(repo);
+    }
     // Awaited, unlike the eviction path: pi awaits this extension's `session_shutdown`
     // handler and the process exits right after it returns, so anything left unawaited
     // here never runs at all. Bounded — each call carries its own ceiling, concurrently.
     await Promise.all(sessions.map(session => shutdownChildSession(session)));
-    if (!pi) return;
-    // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
-    // on the shutdown path, which cannot wait for git.
-    const prune = (repo: string) => { pruneWorktrees(pi, repo).catch(() => {}); };
-    prune(process.cwd());
-    // Also prune repos that caller-supplied cwds created worktrees in — a clean
-    // exit with in-flight agents would otherwise leave stale registrations there.
-    for (const repo of this.worktreeRepos) prune(repo);
   }
 }
