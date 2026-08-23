@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too
-- **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
+- **Shared agent types** — load version-controlled definitions only from `.claude/agents/<name>.md`, with Claude/Pi tool-name compatibility
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
@@ -235,25 +235,15 @@ Group completions render each agent as a separate block. The LLM receives struct
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
 
-Default agents can be **ejected** (`/agents` → select agent → Eject) to export them as `.md` files for customization, **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** per-project with `enabled: false` frontmatter.
+Embedded default agents can be disabled through project settings. This fork's project configuration disables them so only shared definitions run.
 
 ## Custom Agents
 
-Define custom agent types by creating `.md` files. The frontmatter `name:` is the `subagent_type` and dispatch identity, falling back to the filename when absent; `display_name` only changes the UI label. Claiming a default agent's name overrides it.
-
-Agents are discovered from three locations (higher priority wins):
-
-| Priority | Location | Scope |
-|----------|----------|-------|
-| 1 (highest) | `.pi/agents/<name>.md` | Project — pi's config dir; authoritative, and where `/agents` writes |
-| 2 | `.agents/agents/<name>.md` | Project — the shared cross-tool `.agents` workspace (same convention as `.agents/skills/`) |
-| 3 | `$PI_CODING_AGENT_DIR/agents/<name>.md` (default `~/.pi/agent/agents/<name>.md`) | Global — available everywhere |
-
-Project-level agents override global ones with the same name, so you can customize a global agent for a specific project. If both project locations define the same name, **`.pi/agents/` wins** — `.pi` stays the project authority; `.agents/agents/` is an additional read location for projects that keep their agent assets in the `.agents` workspace. The global location follows the upstream `PI_CODING_AGENT_DIR` env var — set it to relocate all pi-coding-agent state (agents, skills, settings) to a custom directory. An agent's name is its frontmatter `name:`, falling back to the filename, so two files can now claim the same one — the later load wins, and the warning below names the file that took over.
+Define agent types in `.claude/agents/<name>.md`. The frontmatter `name:` is the `subagent_type`; the filename is the fallback. Definitions hot-reload before each spawn and are read-only in `/agents`. PascalCase Claude built-ins are normalized to Pi names, and `Glob` maps to `find`.
 
 An unreadable or unparseable agent file is skipped, not fatal — a warning names the file and the error. If it was overriding a same-named agent, a second line names the file that loads instead. Set `strictAgentFiles: true` in `subagents.json` (or `/agents → Settings → Strict agent files`) to fail startup on a broken file instead; mid-session reloads still only warn.
 
-### Example: `.pi/agents/auditor.md`
+### Example: `.claude/agents/auditor.md`
 
 ```markdown
 ---
@@ -400,6 +390,9 @@ Launch a sub-agent.
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `tools` | string[] | no | Pi built-ins or `ext:<extension>/<tool>` selectors added for this fresh run only |
+| `skills` | string[] | no | Named skills added for this fresh run only |
+| `extensions` | string[] | no | Installed extension identifiers added for this fresh run only; paths are rejected |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
@@ -436,22 +429,14 @@ Send a steering message to a running agent. The message interrupts after the cur
 The `/agents` command opens an interactive menu:
 
 ```
-Running agents (2) — 1 running, 1 done     ← only shown when agents exist
-Agent types (6)                             ← unified list: defaults + custom
-Create new agent                            ← manual wizard or AI-generated
-Settings                                    ← max concurrency, max turns, grace turns, join mode
+Running agents (2) — 1 running, 1 done
+Agent types (6) — inspect definitions only
+Settings
 ```
 
-- **Running agents** — select one to open its live conversation viewer. While it's still running, press `Enter` to open the steering composer, then `Enter` again to send a message that redirects the agent (same mechanism as the `steer_subagent` tool; `Esc` or an empty submit returns), or press `x` (then `x` again to confirm) to stop/abort it — including **background** agents, which a global Esc can't unambiguously target (Esc still stops a blocking foreground `Agent` call). A stopped agent reports its partial output flagged as incomplete, not as a completion.
-- **Agent types** — unified list with source indicators: `•` (project), `◦` (global), `✕` (disabled). Each row shows the agent's model, and the highlighted agent's full description appears below the list. The model column flags `(unavailable, fallback: inherit)` when a configured model can't be resolved (it would silently inherit the parent model), and shows `(→ provider/id)` when it resolves to a different provider or version than configured. Select an agent to manage it:
-  - **Default agents** (no override): Eject (export as `.md`), Disable
-  - **Default agents** (ejected/overridden): Edit, Disable, Reset to default, Delete
-  - **Custom agents**: Edit, Disable, Delete
-  - **Disabled agents**: Enable, Edit, Delete
-- **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
-- **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list (marked `✕`) and can be re-enabled
-- **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
-- **Settings** — configure max concurrency, default max turns, grace turns, and join mode at runtime
+- **Running agents** — open the live conversation viewer, steer with `Enter`, or stop with `x`.
+- **Agent types** — inspect description, model, tools, and source. Definitions cannot be created, edited, disabled, or deleted here.
+- **Settings** — configure runtime behavior.
 
 ## Graceful Max Turns
 
@@ -524,9 +509,9 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 
 **Fallback agent** (`fallbackSubagent`, default `general-purpose`): the agent used when a caller-supplied `subagent_type` doesn't resolve to exactly one enabled agent — unknown, disabled, or ambiguous because two agents differ only by case. Name any enabled agent to route those calls there instead, or set `none` for **strict**, fail-closed dispatch: the call is refused with an error listing the available types, and nothing spawns. Strict mode matters most for background and scheduled calls, which would otherwise start executing a substituted agent before the caller learns anything. Also settable from `/agents → Settings → Fallback agent`. The boolean `false` is accepted as a spelling of `none`, because it would otherwise be dropped as the wrong type and silently leave the permissive default in place. Every other value is read as an agent name, so a mistaken `off` fails loudly at dispatch rather than meaning one thing in the settings file and another in the resolver. A fallback agent that is itself unknown or disabled is a misconfiguration and is reported rather than quietly replaced. Note the default is unchanged and stays permissive by design: with `disableDefaultAgents` and no `general-purpose` of your own, an unresolvable type still resolves to a built-in config carrying *all* tools — set `none` (or name one of your own agents) to close that.
 
-**Strict agent files** (`strictAgentFiles`, default `false`): when on, an unreadable or unparseable [agent file](#custom-agents) aborts extension load at startup and names the file, instead of being skipped with a warning — so a checked-in `.pi/agents/` can't silently fall through to a same-named agent from another location. Startup only: the mid-session reload that runs on each `Agent` call keeps warning either way, since a bad edit shouldn't kill a session on an unrelated spawn. Also settable from `/agents → Settings → Strict agent files`.
+**Strict agent files** (`strictAgentFiles`, default `false`): when on, an unreadable or unparseable [agent file](#custom-agents) aborts extension load at startup and names the file, instead of being skipped with a warning — so a checked-in `.claude/agents/` cannot silently disappear. Startup only: the mid-session reload that runs on each `Agent` call keeps warning either way, since a bad edit shouldn't kill a session on an unrelated spawn. Also settable from `/agents → Settings → Strict agent files`.
 
-**Disable defaults** (`disableDefaultAgents`, default `false`): when on, the three built-in agents (general-purpose, Explore, Plan) are not registered — only your project/global custom agents are advertised and spawnable. User-defined agents are unaffected, including ones that override a default by name. The Agent tool's type list updates on the next pi session (the tool schema is registered at startup).
+**Disable defaults** (`disableDefaultAgents`, default `false`): when on, the three built-in agents (general-purpose, Explore, Plan) are not registered — only shared `.claude/agents` definitions are advertised and spawnable. User-defined agents are unaffected, including ones that override a default by name. The Agent tool's type list updates on the next pi session (the tool schema is registered at startup).
 
 **Agent mentions** (`agentMentions`, default `"model"`): whether [`@handle message`](#agent-mentions) at the prompt addresses that subagent instead of the main model — messaging, resuming or starting it — and whether `@` offers agents alongside pi's file completion. `"model"` and `"direct"` differ only in [who starts an agent that isn't running](#starting-a-new-agent): an off-screen clone of this conversation, via a `<system-reminder>` and a real `Agent` call, or this extension, immediately and with no model call. Messaging and resuming are direct in both. `"off"` gates all three actions plus the suggestion list, so `@` means only "attach a file" again and every `@…` prompt reaches the main model verbatim. Toggle via `/agents → Settings → Agent mentions`; applied live. The booleans this setting used to take are still read — `true` as `"model"`, `false` as `"off"`.
 
@@ -563,7 +548,7 @@ Independent of `reportUsage`: this one is what you read, that one is what your s
 Launch an autonomous agent. Available types:
 {{typeList}}
 
-Custom agents live in .pi/agents/ or {{agentDir}}/agents/.
+Custom agents live in .claude/agents/.
 ```
 
 Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{isolationGuideline}}` and `{{scheduleGuideline}}` (each expands with its own leading newline + `- ` bullet when the matching feature is on — place them directly after your last rule line; empty when [worktree isolation](#turning-worktrees-off) / scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
@@ -787,7 +772,7 @@ src/
 
   # Agent registry
   default-agents.ts   # Embedded default agent configs (general-purpose, Explore, Plan)
-  custom-agents.ts    # Load user-defined agents from .pi/agents/, .agents/agents/, and global agents
+  custom-agents.ts    # Load shared definitions from .claude/agents/
   agent-types.ts      # Unified agent registry (defaults + user), tool name resolution
   agent-file-toggle.ts # Locate/edit an agent's .md: enabled: toggle, eject to frontmatter
   agent-color.ts      # Claude Code/Agency Agents name color parsing and badge rendering

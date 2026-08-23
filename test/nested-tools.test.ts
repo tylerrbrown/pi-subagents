@@ -15,7 +15,7 @@ let spawn: ReturnType<typeof vi.fn>;
 let spawnAndWait: ReturnType<typeof vi.fn>;
 
 function writeAgent(name: string, extra = "") {
-  const dir = join(cwd, ".pi", "agents");
+  const dir = join(cwd, ".claude", "agents");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${name}.md`), `---\ndescription: ${name}\ntools: read\n${extra}---\n${name}\n`);
 }
@@ -112,7 +112,7 @@ describe("child-safe nested Agent tools", () => {
 
   it("keeps agent discovery rooted in inherited config, not the working directory", async () => {
     const workCwd = mkdtempSync(join(tmpdir(), "nested-tools-work-"));
-    const workAgentDir = join(workCwd, ".pi", "agents");
+    const workAgentDir = join(workCwd, ".claude", "agents");
     mkdirSync(workAgentDir, { recursive: true });
     writeFileSync(join(workAgentDir, "intruder.md"), "---\ndescription: intruder\n---\nintruder\n");
 
@@ -156,7 +156,7 @@ describe("child-safe nested Agent tools", () => {
     // A worktree-isolated parent hands its own config root down. Resolving from
     // it must not swap the registry the main session and every other agent read.
     const otherCwd = mkdtempSync(join(tmpdir(), "nested-tools-config-"));
-    const otherAgentDir = join(otherCwd, ".pi", "agents");
+    const otherAgentDir = join(otherCwd, ".claude", "agents");
     mkdirSync(otherAgentDir, { recursive: true });
     writeFileSync(join(otherAgentDir, "branch-only.md"), "---\ndescription: branch-only\n---\nbranch-only\n");
     const before = getAvailableTypes();
@@ -180,6 +180,7 @@ describe("child-safe nested Agent tools", () => {
   });
 
   it("applies the scopeModels allowlist to a caller-supplied model", async () => {
+    mkdirSync(join(cwd, ".pi"), { recursive: true });
     writeFileSync(
       join(cwd, ".pi", "settings.json"),
       JSON.stringify({ enabledModels: ["anthropic/allowed"] }),

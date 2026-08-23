@@ -128,7 +128,7 @@ describe("toolDescriptionMode", () => {
       "resume",
       "steer_subagent",
       'isolation: "worktree"',
-      ".pi/agents/",
+      ".claude/agents/",
       "self-contained",
     ]) {
       expect(desc).toContain(contract);
@@ -151,7 +151,7 @@ describe("toolDescriptionMode", () => {
       "resume",
       "steer_subagent",
       "worktree",
-      ".pi/agents/",
+      ".claude/agents/",
       "self-contained",
       "model",
       "thinking",
@@ -337,7 +337,7 @@ describe("toolDescriptionMode", () => {
   // The tool description is the only thing the orchestrator LLM knows about an
   // agent's capabilities before spawning it. `tools: none` and an `ext:`-only
   // `tools:` both parse to zero built-ins (custom-agents.ts parseToolsField),
-  // and test/fixtures/.pi/agents/tools-none.md pins that the *runtime* really
+  // and test/fixtures/.claude/agents/tools-none.md pins that the *runtime* really
   // does drop every built-in. So the description must not claim otherwise —
   // an agent advertised as having `bash` that cannot run `bash` gets routed
   // work it can only fail at.
@@ -345,9 +345,9 @@ describe("toolDescriptionMode", () => {
     function withAgent(name: string, frontmatter: string, settings?: Record<string, unknown>) {
       const extra = frontmatter ? `${frontmatter}\n` : "";
       return setup(settings, () => {
-        mkdirSync(join(tmpDir, ".pi", "agents"), { recursive: true });
+        mkdirSync(join(tmpDir, ".claude", "agents"), { recursive: true });
         writeFileSync(
-          join(tmpDir, ".pi", "agents", `${name}.md`),
+          join(tmpDir, ".claude", "agents", `${name}.md`),
           `---\ndescription: ${name} agent.\n${extra}---\n\nBody.\n`,
         );
       });
@@ -369,7 +369,7 @@ describe("toolDescriptionMode", () => {
     });
 
     it("`tools: none` with extensions loaded is not described as having no tools", () => {
-      // Zero built-ins is not zero tools: test/fixtures/.pi/agents/tools-none.md
+      // Zero built-ins is not zero tools: test/fixtures/.claude/agents/tools-none.md
       // pins that such an agent still surfaces alpha_read, alpha_write, beta_tool.
       // Saying "none" understates it and routes work away from the only agent
       // that could do it — the mirror of the bug this suffix used to have.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
+import { resolveAgentInvocationConfig, resolveJoinMode, validateCapabilityAdditions } from "../src/invocation-config.js";
 import type { AgentConfig } from "../src/types.js";
 
 function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -49,6 +49,37 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.runInBackground).toBe(false);
     expect(resolved.isolated).toBe(false);
     expect(resolved.isolation).toBe("worktree");
+  });
+
+  it("keeps per-run capability additions separate from the agent definition", () => {
+    const config = makeConfig({ skills: ["base-skill"], extensions: ["base-ext"] });
+    const resolved = resolveAgentInvocationConfig(config, {
+      tools: ["bash"],
+      skills: ["run-skill"],
+      extensions: ["run-ext"],
+    });
+
+    expect(resolved.tools).toEqual(["bash"]);
+    expect(resolved.skills).toEqual(["run-skill"]);
+    expect(resolved.extensions).toEqual(["run-ext"]);
+    expect(config).toEqual(makeConfig({ skills: ["base-skill"], extensions: ["base-ext"] }));
+  });
+
+  it("normalizes known per-run tools and rejects raw extension tool names", () => {
+    expect(validateCapabilityAdditions({ tools: ["Read", "Glob", "ext:chrome/find"] })).toEqual({
+      tools: ["read", "find", "ext:chrome/find"],
+      skills: undefined,
+      extensions: undefined,
+    });
+    expect(() => validateCapabilityAdditions({ tools: ["chrome_find"] })).toThrow(/Unknown per-run tool/);
+  });
+
+  it("rejects per-run extension paths while allowing extension identifiers", () => {
+    expect(validateCapabilityAdditions({ extensions: ["chrome-profile-bridge", "recall-inject"] }).extensions)
+      .toEqual(["chrome-profile-bridge", "recall-inject"]);
+    for (const path of ["./local.ts", "C:/local.ts", "/tmp/local.ts", "~/.pi/local.ts", "dir/local.ts", "dir\\local.ts", "https://host/ext.ts", "@scope/extension"]) {
+      expect(() => validateCapabilityAdditions({ extensions: [path] })).toThrow(/identifier, not a path/);
+    }
   });
 
   it("uses tool-call params when no agent config is available", () => {

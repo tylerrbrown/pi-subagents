@@ -1134,7 +1134,7 @@ describe("resuming an evicted agent by name", () => {
     await flush();
     vi.mocked(runAgent).mockClear();
     writeFileSync(
-      join(process.cwd(), ".pi", "agents", "scout.md"),
+      join(process.cwd(), ".claude", "agents", "scout.md"),
       "---\ndescription: scouts\nenabled: false\n---\nbody",
     );
 
@@ -1161,7 +1161,7 @@ describe("resuming an evicted agent by name", () => {
     subagentsExtension(b.pi);
     booted = b.lifecycle;
     // Spawn while it is still enabled, then disable, mention, re-enable.
-    const file = join(process.cwd(), ".pi", "agents", "scout.md");
+    const file = join(process.cwd(), ".claude", "agents", "scout.md");
     writeFileSync(file, "---\ndescription: scouts\n---\nbody");
     finishedRun(fakeSession());
     await evict(await spawnBackground(b.tools, "scout"));

@@ -73,15 +73,15 @@ export interface SubagentsSettings {
    * Startup only, by design. Mid-session reloads (one per `Agent` call) keep
    * warning: a bad edit at 3pm should not kill the session on the next
    * unrelated spawn, where the failure would look disconnected from its cause.
-   * For a checked-in `.pi/agents/`, failing at startup is the point — the
+   * For checked-in `.claude/agents/`, failing at startup is the point — the
    * alternative is running a *different* agent than the file names.
    * Defaults to false.
    */
   strictAgentFiles?: boolean;
   /**
    * When true, the three built-in default agents (general-purpose, Explore, Plan)
-   * are not registered at startup. User-defined agents from project/global custom
-   * agent dirs are completely unaffected — only the hardcoded DEFAULT_AGENTS are suppressed.
+   * are not registered at startup. Shared `.claude/agents` definitions are
+   * unaffected — only the hardcoded DEFAULT_AGENTS are suppressed.
    * Defaults to false.
    */
   disableDefaultAgents?: boolean;

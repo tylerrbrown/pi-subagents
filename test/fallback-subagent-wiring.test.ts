@@ -48,7 +48,7 @@ let originalHome: string | undefined;
  *  dispatch is resolved — and a "disabled" fixture that never loads would make
  *  the disabled-type test pass merely because the name was unknown. */
 function writeAgents(): void {
-  const dir = join(cwd, ".pi", "agents");
+  const dir = join(cwd, ".claude", "agents");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "scout.md"), "---\ndescription: Scout\ntools: read\n---\nScout.\n");
   writeFileSync(join(dir, "retired.md"), "---\ndescription: Retired\ntools: read\nenabled: false\n---\nRetired.\n");

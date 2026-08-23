@@ -1,10 +1,10 @@
 /**
- * custom-agents.ts — Load user-defined agents from project (.pi/agents/, plus the shared .agents/agents/ workspace) and global ($PI_CODING_AGENT_DIR/agents/, default ~/.pi/agent/agents/) locations.
+ * custom-agents.ts — Load user-defined agents from <cwd>/.claude/agents/.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
 
@@ -24,15 +24,7 @@ import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./t
 const RESERVED_IN_TYPE = ":";
 
 /**
- * Scan for custom agent .md files from multiple locations.
- * Discovery hierarchy (higher priority wins):
- *   1. Project:   <cwd>/.pi/agents/*.md (authoritative — also where /agents writes)
- *   2. Workspace: <cwd>/.agents/agents/*.md (shared cross-tool .agents workspace, read-only)
- *   3. Global:    $PI_CODING_AGENT_DIR/agents/*.md (default: ~/.pi/agent/agents/*.md)
- *
- * Project-level agents override global ones with the same name. On a name clash
- * between the two project locations, .pi/agents wins — .pi stays the project
- * authority; .agents/agents is an additional read location.
+ * Scan <cwd>/.claude/agents for custom agent .md files.
  * Any name is allowed — names matching defaults (e.g. "Explore") override them.
  *
  * An agent's type comes from its frontmatter `name:`, falling back to the
@@ -42,14 +34,8 @@ const RESERVED_IN_TYPE = ":";
  * filename clash, and `warnSkippedOverride` reports the substitution.
  */
 export function loadCustomAgents(cwd: string, strict = false): Map<string, AgentConfig> {
-  const globalDir = join(getAgentDir(), "agents");
-  const workspaceProjectDir = join(cwd, ".agents", "agents");
-  const projectDir = join(cwd, ".pi", "agents");
-
   const agents = new Map<string, AgentConfig>();
-  loadFromDir(globalDir, agents, "global", strict);            // lowest priority
-  loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
-  loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  loadFromDir(join(cwd, ".claude", "agents"), agents, "project", strict);
 
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();
@@ -145,7 +131,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
  * unparseable `.md` used to abort activation, so pi exited before the TUI.
  *
  * The path is as much of the fix as the recovery: a bare YAML error ("line 2,
- * column 14") is unactionable when agents come from three directories at once,
+ * column 14") is unactionable without the offending file's path,
  * and the only other symptom is `Unknown agent type`, which reads like a typo.
  *
  * Under `strict` the same failure rethrows, still naming the path, so callers
@@ -250,7 +236,11 @@ function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelecto
   const entries = csvList(val, BUILTIN_TOOL_NAMES);
   const isWildcard = (e: string) => e === "*" || e.toLowerCase() === "all";
   const hasWildcard = entries.some(isWildcard);
-  const plain = entries.filter(e => !isWildcard(e) && !e.startsWith("ext:"));
+  const canonical = new Map(BUILTIN_TOOL_NAMES.map(name => [name.toLowerCase(), name]));
+  const normalize = (name: string) => name.toLowerCase() === "glob"
+    ? "find"
+    : canonical.get(name.toLowerCase()) ?? name;
+  const plain = entries.filter(e => !isWildcard(e) && !e.startsWith("ext:")).map(normalize);
   const extEntries = entries.filter(e => e.startsWith("ext:"));
   return {
     builtinToolNames: hasWildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,

@@ -209,6 +209,7 @@ beforeEach(() => {
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
   vi.mocked(createNestedSubagentTools).mockClear();
+  vi.mocked(preloadSkills).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
 });
@@ -726,6 +727,7 @@ import {
   getToolNamesForType,
 } from "../src/agent-types.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
+import { preloadSkills } from "../src/skill-loader.js";
 
 const BUILTINS_7 = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
@@ -931,6 +933,76 @@ describe("agent-runner session persistence", () => {
       "/repo/.seams/pi-sessions/seam-plan-reviewer",
       { parentSession: "/sessions/parent.jsonl" },
     );
+  });
+});
+
+describe("agent-runner per-run capability additions", () => {
+  it("adds tools, skills, and extensions without leaking into a second run", async () => {
+    const config = makeConfig({ builtinToolNames: ["read"], extensions: false, skills: false });
+    const agentConfig = makeAgentConfig({ builtinToolNames: ["read"], extensions: false, skills: false });
+    vi.mocked(getConfig).mockReturnValue(config);
+    vi.mocked(getAgentConfig).mockReturnValue(agentConfig);
+    vi.mocked(getToolNamesForType).mockReturnValue(["read"]);
+    withExtensions({ "/ext/run.ts": ["run_ext_tool"] });
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      tools: ["bash"],
+      skills: ["run-skill"],
+      extensions: ["/ext/run.ts"],
+    });
+
+    expect(lastToolsPassed()).toEqual(expect.arrayContaining(["read", "bash", "run_ext_tool"]));
+    expect(preloadSkills).toHaveBeenCalledWith(["run-skill"], "/tmp");
+
+    createAgentSession.mockClear();
+    defaultResourceLoaderCtor.mockClear();
+    vi.mocked(preloadSkills).mockClear();
+    withExtensions({ "/ext/run.ts": ["run_ext_tool"] });
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "again", { pi });
+
+    expect(lastToolsPassed()).toEqual(["read"]);
+    expect(lastLoaderOpts().noExtensions).toBe(true);
+    expect(preloadSkills).not.toHaveBeenCalled();
+    expect(config).toEqual(makeConfig({ builtinToolNames: ["read"], extensions: false, skills: false }));
+  });
+
+  it("keeps disallowed_tools authoritative over a per-run tool addition", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ builtinToolNames: ["read"], extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ builtinToolNames: ["read"], extensions: false, disallowedTools: ["bash"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "go", { pi, tools: ["bash"] });
+
+    expect(lastToolsPassed()).toEqual(["read"]);
+  });
+
+  it("suppresses per-run skills and extensions when isolated", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false, skills: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false, skills: false }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ "/ext/run.ts": ["run_ext_tool"] });
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      isolated: true,
+      skills: ["run-skill"],
+      extensions: ["/ext/run.ts"],
+    });
+
+    expect(preloadSkills).not.toHaveBeenCalled();
+    expect(lastLoaderOpts()).toEqual(expect.objectContaining({
+      noExtensions: true,
+      additionalExtensionPaths: undefined,
+    }));
+    expect(lastToolsPassed()).not.toContain("run_ext_tool");
   });
 });
 

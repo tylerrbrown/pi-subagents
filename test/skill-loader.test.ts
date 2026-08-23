@@ -62,6 +62,11 @@ describe("preloadSkills", () => {
     expect(preloadSkills(["writing-go"], tmpDir)[0].content).toContain("Writing Go");
   });
 
+  it("loads a named skill from project .claude/skills", () => {
+    writeSkillDir(join(tmpDir, ".claude", "skills"), "shared-review", "# Shared Review");
+    expect(preloadSkills(["shared-review"], tmpDir)[0].content).toContain("Shared Review");
+  });
+
   it("loads a top-level <name>/SKILL.md from getAgentDir()/skills", () => {
     writeSkillDir(globalRoot(), "writing-python", "# Writing Python");
     expect(preloadSkills(["writing-python"], tmpDir)[0].content).toContain("Writing Python");

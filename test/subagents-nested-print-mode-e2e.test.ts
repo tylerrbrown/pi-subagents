@@ -113,7 +113,7 @@ function toolCall(
 }
 
 function writeAgents(cwd: string, agents: Record<string, string>): void {
-  const dir = join(cwd, ".pi", "agents");
+  const dir = join(cwd, ".claude", "agents");
   mkdirSync(dir, { recursive: true });
   for (const [name, frontmatter] of Object.entries(agents)) {
     writeFileSync(

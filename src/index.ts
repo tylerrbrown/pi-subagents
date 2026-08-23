@@ -10,14 +10,13 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
-import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
@@ -25,7 +24,7 @@ import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode, validateCapabilityAdditions } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
@@ -36,7 +35,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentCapabilityAdditions, type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -259,7 +258,7 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
  *   Rendering both "*" tells the orchestrator a tool-less agent can run `bash`.
  * - empty-with-extensions vs empty-without. Zero built-ins does NOT imply zero
  *   tools: `tools: none` alongside `extensions:` still surfaces every extension
- *   tool (see test/fixtures/.pi/agents/tools-none.md, which expects three). Calling
+ *   tool (see test/fixtures/.claude/agents/tools-none.md, which expects three). Calling
  *   that "none" understates the agent instead of overstating it — better, but still
  *   wrong, and it would route work away from the only agent able to do it. "none"
  *   is therefore reserved for agents that genuinely can call nothing: `isolated`
@@ -355,7 +354,7 @@ export default function (pi: ExtensionAPI) {
   // the initial load, which happens hundreds of lines before settings are applied.
   let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
 
-  /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
+  /** Reload shared .claude/agents definitions and merge with enabled defaults. */
   const reloadCustomAgents = (strict = false) => {
     const userAgents = loadCustomAgents(process.cwd(), strict);
     registerAgents(userAgents);
@@ -1077,7 +1076,7 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Disable default agents configuration ----
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
-  // Plan) are not registered. User-defined agents from project/global custom
+  // Plan) are not registered. Shared .claude/agents definitions
   // agent dirs are completely unaffected — only DEFAULT_AGENTS are suppressed.
   // Defaults to false; opt-in via `/agents → Settings` or subagents.json.
   // State lives in agent-types.ts (isDefaultsDisabled) because registerAgents
@@ -1346,7 +1345,7 @@ export default function (pi: ExtensionAPI) {
   const compactAgentToolDescription = `Launch an autonomous agent for complex, multi-step tasks. Agent types:
 ${buildCompactTypeListText()}
 
-Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
+Custom agents: .claude/agents/<name>.md (shared, read-only in /agents).
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
@@ -1360,7 +1359,7 @@ Notes:
 Available agent types and the tools they have access to:
 ${buildTypeListText()}
 
-Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
+Custom agents are defined in .claude/agents/<name>.md and picked up automatically. Definitions are read-only in /agents.
 
 When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
 
@@ -1474,7 +1473,7 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
       subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
+        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Definitions load only from .claude/agents/*.md.`,
       }),
       model: Type.Optional(
         Type.String({
@@ -1493,6 +1492,15 @@ Terse command-style prompts produce shallow, generic work.
           minimum: 1,
         }),
       ),
+      tools: Type.Optional(Type.Array(Type.String(), {
+        description: "Built-in tool names or ext: selectors to add for this run only. The agent's disallowed_tools still wins.",
+      })),
+      skills: Type.Optional(Type.Array(Type.String(), {
+        description: "Named skills to add for this run only. Ignored when isolated is true.",
+      })),
+      extensions: Type.Optional(Type.Array(Type.String(), {
+        description: "Extension names or paths to add for this run only. Ignored when isolated is true.",
+      })),
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Defaults to true — the agent runs detached, returning its ID immediately, and you are notified on completion. Set false only when your very next action depends on the result; the call then blocks and returns the agent's full output inline.",
@@ -1709,6 +1717,17 @@ Terse command-style prompts produce shallow, generic work.
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
+      let capabilityAdditions: AgentCapabilityAdditions;
+      try {
+        capabilityAdditions = validateCapabilityAdditions({
+          tools: resolvedConfig.tools,
+          skills: resolvedConfig.skills,
+          extensions: resolvedConfig.extensions,
+        });
+      } catch (err) {
+        return textResult(err instanceof Error ? err.message : String(err));
+      }
+      const hasCapabilityAdditions = Object.values(capabilityAdditions).some((value) => value?.length);
       // Whether this spawn writes its .output transcript. Per-agent
       // frontmatter (`output_transcript`) wins; otherwise the project/global
       // default applies. `attachTranscript` below is the SOLE gate — every
@@ -1752,6 +1771,9 @@ Terse command-style prompts produce shallow, generic work.
 
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
+        if (hasCapabilityAdditions) {
+          return textResult("Per-run tools, skills, and extensions cannot be scheduled; define them on the agent or launch it now.");
+        }
         if (!isSchedulingEnabled()) {
           return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
         }
@@ -1795,6 +1817,9 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
+        if (hasCapabilityAdditions) {
+          return textResult("Per-run tools, skills, and extensions cannot be added while resuming an existing session; start a fresh agent.");
+        }
         const existing = manager.getRecord(params.resume);
         if (!existing || existing.parentAgentId) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
@@ -1888,6 +1913,7 @@ Terse command-style prompts produce shallow, generic work.
           thinkingLevel: thinking,
           isBackground: true,
           isolation,
+          ...capabilityAdditions,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
@@ -2017,6 +2043,7 @@ Terse command-style prompts produce shallow, generic work.
           inheritContext,
           thinkingLevel: thinking,
           isolation,
+          ...capabilityAdditions,
           invocation: agentInvocation,
           signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
@@ -2247,10 +2274,6 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- /agents interactive menu ----
 
-  // Directory resolution and the frontmatter edits live in agent-file-toggle.ts
-  // so they are reachable from tests — this command handler is only registered
-  // through `registerCommand`, which every test mocks.
-
   function getModelLabel(type: string, registry?: ModelRegistry): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
@@ -2295,8 +2318,6 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Scheduled jobs (${jobCount})`);
     }
 
-    // Actions
-    options.push("Create new agent");
     options.push("Settings");
 
     const noAgentsMsg = allNames.length === 0 && agents.length === 0
@@ -2321,8 +2342,6 @@ Terse command-style prompts produce shallow, generic work.
     } else if (choice.startsWith("Scheduled jobs (")) {
       await showSchedulesMenu(ctx, scheduler);
       await showAgentsMenu(ctx);
-    } else if (choice === "Create new agent") {
-      await showCreateWizard(ctx);
     } else if (choice === "Settings") {
       await showSettings(ctx);
       await showAgentsMenu(ctx);
@@ -2450,337 +2469,15 @@ Terse command-style prompts produce shallow, generic work.
       ctx.ui.notify(`Agent config not found for "${name}".`, "warning");
       return;
     }
+    ctx.ui.notify(
+      `${cfg.description}
+Model: ${getModelLabel(name, ctx.modelRegistry)}
+Tools: ${formatToolsSuffix(cfg)}
+Source: ${cfg.sourcePath ?? "embedded"}
 
-    const file = locateAgentFile(name, cfg.sourcePath);
-    const isDefault = cfg.isDefault === true;
-    const disabled = cfg.enabled === false;
-
-    let menuOptions: string[];
-    if (disabled && file) {
-      // Disabled agent with a file — offer Enable
-      menuOptions = isDefault
-        ? ["Enable", "Edit", "Reset to default", "Delete", "Back"]
-        : ["Enable", "Edit", "Delete", "Back"];
-    } else if (isDefault && !file) {
-      // Default agent with no .md override
-      menuOptions = ["Eject (export as .md)", "Disable", "Back"];
-    } else if (isDefault && file) {
-      // Default agent with .md override (ejected)
-      menuOptions = ["Edit", "Disable", "Reset to default", "Delete", "Back"];
-    } else {
-      // User-defined agent
-      menuOptions = ["Edit", "Disable", "Delete", "Back"];
-    }
-
-    const choice = await ctx.ui.select(name, menuOptions);
-    if (!choice || choice === "Back") return;
-
-    if (choice === "Edit" && file) {
-      const content = readFileSync(file.path, "utf-8");
-      const edited = await ctx.ui.editor(`Edit ${name}`, content);
-      if (edited !== undefined && edited !== content) {
-        const { writeFileSync } = await import("node:fs");
-        writeFileSync(file.path, edited, "utf-8");
-        reloadCustomAgents();
-        ctx.ui.notify(`Updated ${file.path}`, "info");
-      }
-    } else if (choice === "Delete") {
-      if (file) {
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
-        if (confirmed) {
-          unlinkSync(file.path);
-          reloadCustomAgents();
-          ctx.ui.notify(`Deleted ${file.path}`, "info");
-        }
-      }
-    } else if (choice === "Reset to default" && file) {
-      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`);
-      if (confirmed) {
-        unlinkSync(file.path);
-        reloadCustomAgents();
-        ctx.ui.notify(`Restored default ${name}`, "info");
-      }
-    } else if (choice.startsWith("Eject")) {
-      await ejectAgent(ctx, name, cfg);
-    } else if (choice === "Disable") {
-      await disableAgent(ctx, name);
-    } else if (choice === "Enable") {
-      await enableAgent(ctx, name);
-    }
-  }
-
-  /** Eject a default agent: write its embedded config as a .md file. */
-  async function ejectAgent(ctx: ExtensionCommandContext, name: string, cfg: AgentConfig) {
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
-    ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
-      if (!overwrite) return;
-    }
-
-    const content = serializeAgentFile(cfg);
-
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, content, "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Ejected ${name} to ${targetPath}`, "info");
-  }
-
-  /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
-  async function disableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
-    if (file) {
-      // Existing file — set enabled: false in frontmatter (idempotent)
-      const content = readFileSync(file.path, "utf-8");
-      const { content: updated, outcome } = disableInContent(content);
-      if (outcome === "already-disabled") {
-        ctx.ui.notify(`${name} is already disabled.`, "info");
-        return;
-      }
-      if (outcome === "no-frontmatter") {
-        // Nothing to edit — say so rather than rewriting the file unchanged and
-        // reporting success for a change that never happened.
-        ctx.ui.notify(`Cannot disable ${name}: ${file.path} has no frontmatter block.`, "error");
-        return;
-      }
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(file.path, updated, "utf-8");
-      reloadCustomAgents();
-      ctx.ui.notify(`Disabled ${name} (${file.path})`, "info");
-      return;
-    }
-
-    // No file (built-in default) — create a stub
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
-    ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Disabled ${name} (${targetPath})`, "info");
-  }
-
-  /** Enable a disabled agent by removing enabled: false from its frontmatter. */
-  async function enableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
-    if (!file) return;
-
-    const content = readFileSync(file.path, "utf-8");
-    const { content: updated, changed } = enableInContent(content);
-    if (!changed && !isEmptyStub(updated)) {
-      // The file carries no `enabled: false` to remove, so it was never disabled
-      // by us — reporting success here would hide a no-op.
-      ctx.ui.notify(`${name} is not disabled in ${file.path}.`, "info");
-      return;
-    }
-    const { writeFileSync } = await import("node:fs");
-
-    // If the file was just a stub ("---\n---\n"), delete it to restore the built-in default
-    if (isEmptyStub(updated)) {
-      unlinkSync(file.path);
-      reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (removed ${file.path})`, "info");
-    } else {
-      writeFileSync(file.path, updated, "utf-8");
-      reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (${file.path})`, "info");
-    }
-  }
-
-  async function showCreateWizard(ctx: ExtensionCommandContext) {
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
-    ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-
-    const method = await ctx.ui.select("Creation method", [
-      "Generate with Claude (recommended)",
-      "Manual configuration",
-    ]);
-    if (!method) return;
-
-    if (method.startsWith("Generate")) {
-      await showGenerateWizard(ctx, targetDir);
-    } else {
-      await showManualWizard(ctx, targetDir);
-    }
-  }
-
-  async function showGenerateWizard(ctx: ExtensionCommandContext, targetDir: string) {
-    const description = await ctx.ui.input("Describe what this agent should do");
-    if (!description) return;
-
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
-    if (!name) return;
-
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
-      if (!overwrite) return;
-    }
-
-    ctx.ui.notify("Generating agent definition...", "info");
-
-    const generatePrompt = `Create a custom pi sub-agent definition file based on this description: "${description}"
-
-Write a markdown file to: ${targetPath}
-
-The file format is a markdown file with YAML frontmatter and a system prompt body:
-
-\`\`\`markdown
----
-description: <one-line description shown in UI>
-color: <optional agent name badge color: red, blue, green, yellow, purple, orange, pink, cyan, an Agency Agents alias, or quoted "#RRGGBB">
-tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
-thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
-max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
-prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
-extensions: <true (inherit all MCP/extension tools), false (none), or comma-separated names. Default: true>
-skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
-disallowed_tools: <comma-separated tool names to block, even if otherwise available. Omit for none>
-inherit_context: <true to fork parent conversation into agent so it sees chat history. Default: false>
-run_in_background: <pin this agent to background (true) or foreground (false). Omit to follow the backgroundByDefault setting, which is background>
-output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
-isolated: <true for no extension/MCP tools, only built-in tools. Default: false>
-memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>${
-      // Offering the field on a project that turned worktrees off would bake a
-      // request that is refused at spawn time into a file that outlives the
-      // session — the #231 pathology (models fill the fields they are shown)
-      // one layer up. Built per invocation, so this read is live.
-      isWorktreeIsolationEnabled()
-        ? `\nisolation: <"worktree" to run in isolated git worktree; "off" to refuse one even when the caller asks. Omit for normal>`
-        : ""
-    }
----
-
-<system prompt body — instructions for the agent>
-\`\`\`
-
-Guidelines for choosing settings:
-- For read-only tasks (review, analysis): tools: read, bash, grep, find, ls
-- For code modification tasks: include edit, write
-- Use prompt_mode: append if the agent should keep the default system prompt and add specialization on top
-- Use prompt_mode: replace for fully custom agents with their own personality/instructions
-- Set inherit_context: true if the agent needs to know what was discussed in the parent conversation
-- Set isolated: true if the agent should NOT have access to MCP servers or other extensions
-- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session, isolation: worktree commits, and memory still write) — set those too if that's the goal
-- Only include frontmatter fields that differ from defaults — omit fields where the default is fine
-
-Write the file using the write tool. Only write the file, nothing else.`;
-
-    const { record } = await manager.spawnAndWait(pi, ctx, "general-purpose", generatePrompt, {
-      description: `Generate ${name} agent`,
-      maxTurns: 5,
-    });
-
-    if (record.status === "error") {
-      ctx.ui.notify(`Generation failed: ${record.error}`, "warning");
-      return;
-    }
-
-    reloadCustomAgents();
-
-    if (existsSync(targetPath)) {
-      ctx.ui.notify(`Created ${targetPath}`, "info");
-    } else {
-      ctx.ui.notify("Agent generation completed but file was not created. Check the agent output.", "warning");
-    }
-  }
-
-  async function showManualWizard(ctx: ExtensionCommandContext, targetDir: string) {
-    // 1. Name
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
-    if (!name) return;
-
-    // 2. Description
-    const description = await ctx.ui.input("Description (one line)");
-    if (!description) return;
-
-    // 3. Tools
-    const toolChoice = await ctx.ui.select("Tools", ["all", "none", "read-only (read, bash, grep, find, ls)", "custom..."]);
-    if (!toolChoice) return;
-
-    let tools: string;
-    if (toolChoice === "all") {
-      tools = BUILTIN_TOOL_NAMES.join(", ");
-    } else if (toolChoice === "none") {
-      tools = "none";
-    } else if (toolChoice.startsWith("read-only")) {
-      tools = "read, bash, grep, find, ls";
-    } else {
-      const customTools = await ctx.ui.input("Tools (comma-separated)", BUILTIN_TOOL_NAMES.join(", "));
-      if (!customTools) return;
-      tools = customTools;
-    }
-
-    // 4. Model
-    const modelChoice = await ctx.ui.select("Model", [
-      "inherit (parent model)",
-      "haiku",
-      "sonnet",
-      "opus",
-      "custom...",
-    ]);
-    if (!modelChoice) return;
-
-    let model: string | undefined;
-    if (modelChoice === "haiku") model = "anthropic/claude-haiku-4-5";
-    else if (modelChoice === "sonnet") model = "anthropic/claude-sonnet-4-6";
-    else if (modelChoice === "opus") model = "anthropic/claude-opus-4-6";
-    else if (modelChoice === "custom...") {
-      model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
-    }
-
-    // 5. Thinking
-    // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.
-    const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]);
-    if (!thinkingChoice) return;
-
-    // 6. System prompt
-    const systemPrompt = await ctx.ui.editor("System prompt", "");
-    if (systemPrompt === undefined) return;
-
-    const content = buildNewAgentFile({
-      description,
-      tools,
-      model,
-      thinking: thinkingChoice === "inherit" ? undefined : thinkingChoice,
-      systemPrompt,
-    });
-
-    mkdirSync(targetDir, { recursive: true });
-    const targetPath = join(targetDir, `${name}.md`);
-
-    if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
-      if (!overwrite) return;
-    }
-
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, content, "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Created ${targetPath}`, "info");
+Definitions are read-only in /agents.`,
+      "info",
+    );
   }
 
   /**

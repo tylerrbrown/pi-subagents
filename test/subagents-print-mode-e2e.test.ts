@@ -124,7 +124,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(run.modelCalls).toBeGreaterThanOrEqual(3);
   });
 
-  it("spawns a FRONTMATTER-defined (.pi/agents/*.md) agent and its prompt reaches the child", async () => {
+  it("spawns a FRONTMATTER-defined (.claude/agents/*.md) agent and its prompt reaches the child", async () => {
     // A project agent whose body is a distinctive system prompt. Proving the
     // child SAW it proves the full chain: the extension discovers the .md from
     // process.cwd(), parses its frontmatter, and runAgent's buildAgentPrompt
@@ -132,9 +132,9 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     const MARKER = "SPYMARKER_FRONTMATTER_REACHED_CHILD";
     const cwd = mkdtempSync(join(tmpdir(), "subagents-fm-"));
     tmpDirs.push(cwd);
-    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    mkdirSync(join(cwd, ".claude", "agents"), { recursive: true });
     writeFileSync(
-      join(cwd, ".pi", "agents", "echo-spy.md"),
+      join(cwd, ".claude", "agents", "echo-spy.md"),
       `---\ndescription: "Echoes a marker proving its frontmatter prompt reached the child."\n---\n${MARKER}\n`,
     );
 
@@ -163,14 +163,14 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(toolResults[0]).not.toMatch(/Unknown agent type/i);
   });
 
-  it("spawns a FRONTMATTER-defined (.agents/agents/*.md) agent and its prompt reaches the child", async () => {
+  it("spawns a frontmatter-defined .claude/agents agent and its prompt reaches the child", async () => {
     const MARKER = "SPYMARKER_AGENTS_FRONTMATTER_REACHED_CHILD";
     const cwd = mkdtempSync(join(tmpdir(), "subagents-agents-fm-"));
     tmpDirs.push(cwd);
-    mkdirSync(join(cwd, ".agents", "agents"), { recursive: true });
+    mkdirSync(join(cwd, ".claude", "agents"), { recursive: true });
     writeFileSync(
-      join(cwd, ".agents", "agents", "agents-spy.md"),
-      `---\ndescription: "Echoes a marker from the .agents/agents workspace dir."\n---\n${MARKER}\n`,
+      join(cwd, ".claude", "agents", "agents-spy.md"),
+      `---\ndescription: "Echoes a marker from the shared agent directory."\n---\n${MARKER}\n`,
     );
 
     run = await runPrintMode({
@@ -202,9 +202,9 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     // would mean color leaking into transcripts, headless output and the parent prompt.
     const cwd = mkdtempSync(join(tmpdir(), "subagents-color-"));
     tmpDirs.push(cwd);
-    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    mkdirSync(join(cwd, ".claude", "agents"), { recursive: true });
     writeFileSync(
-      join(cwd, ".pi", "agents", "painted.md"),
+      join(cwd, ".claude", "agents", "painted.md"),
       '---\nname: Painted Agent\ncolor: purple\ndescription: "A colored agent."\n---\nBe brief.\n',
     );
 

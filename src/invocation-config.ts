@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
+import type { AgentCapabilityAdditions, AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -54,6 +55,22 @@ export function isolationParam(enabled: boolean): Partial<typeof isolationParamS
   return enabled ? isolationParamShape : {};
 }
 
+export function validateCapabilityAdditions(additions: AgentCapabilityAdditions): AgentCapabilityAdditions {
+  const builtins = new Map(BUILTIN_TOOL_NAMES.map((name) => [name.toLowerCase(), name]));
+  const tools = additions.tools?.map((raw) => {
+    if (/^ext:[A-Za-z0-9@._-]+(?:\/[A-Za-z0-9_.:-]+)?$/.test(raw)) return raw;
+    const name = raw.toLowerCase() === "glob" ? "find" : builtins.get(raw.toLowerCase());
+    if (!name) throw new Error(`Unknown per-run tool "${raw}". Use a Pi built-in or ext:<extension>/<tool>.`);
+    return name;
+  });
+  for (const extension of additions.extensions ?? []) {
+    if (!/^[A-Za-z0-9@._-]+$/.test(extension)) {
+      throw new Error(`Per-run extension "${extension}" must be an installed extension identifier, not a path.`);
+    }
+  }
+  return { tools, skills: additions.skills, extensions: additions.extensions };
+}
+
 interface AgentInvocationParams {
   model?: string;
   thinking?: string;
@@ -61,6 +78,9 @@ interface AgentInvocationParams {
   run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
+  tools?: string[];
+  skills?: string[];
+  extensions?: string[];
   /**
    * Untyped on purpose. Both tool schemas now build this field conditionally
    * and spread it, which erases TypeBox's literal inference to `unknown` (the
@@ -106,6 +126,9 @@ export function resolveAgentInvocationConfig(
   runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;
+  tools?: string[];
+  skills?: string[];
+  extensions?: string[];
 } {
   // Precedence first, collapse second — reversing these loses the veto, since
   // an agent file's "off" only outranks a caller's "worktree" while it is still
@@ -122,6 +145,9 @@ export function resolveAgentInvocationConfig(
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation,
+    tools: params.tools,
+    skills: params.skills,
+    extensions: params.extensions,
   };
 }
 

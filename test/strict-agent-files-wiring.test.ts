@@ -42,7 +42,7 @@ function writeSettings(settings: Record<string, unknown>): void {
 }
 
 function writeBrokenAgent(): string {
-  const dir = join(cwd, ".pi", "agents");
+  const dir = join(cwd, ".claude", "agents");
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "broken.md");
   writeFileSync(path, BROKEN);

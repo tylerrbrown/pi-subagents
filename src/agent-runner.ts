@@ -26,7 +26,7 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentCapabilityAdditions, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 
 /**
@@ -385,7 +385,7 @@ export interface ToolActivity {
   toolName: string;
 }
 
-export interface RunOptions {
+export interface RunOptions extends AgentCapabilityAdditions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
@@ -594,22 +594,37 @@ export async function runAgent(
   const extras: PromptExtras = {};
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
 
-  // Resolve extensions/skills: isolated overrides to false
-  const extensions = options.isolated ? false : config.extensions;
+  // Per-run additions are derived locally; the registered agent definition is
+  // never mutated, so concurrent and later runs retain their original scope.
+  const addedTools = options.tools ?? [];
+  const addedBuiltinTools = addedTools.filter((name) => !name.startsWith("ext:"));
+  const addedExtSelectors = addedTools.filter((name) => name.startsWith("ext:"));
+  const unique = (values: string[]) => [...new Set(values)];
+
+  // Resolve extensions/skills: isolated overrides all per-run additions.
+  const extensions = options.isolated
+    ? false
+    : options.extensions?.length
+      ? unique([...(config.extensions === true ? ["*"] : Array.isArray(config.extensions) ? config.extensions : []), ...options.extensions])
+      : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
   // isolation is an intentional override, not a misconfiguration.
   const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
-  const skills = options.isolated ? false : config.skills;
+  const skills = options.isolated
+    ? false
+    : options.skills?.length
+      ? unique([...(Array.isArray(config.skills) ? config.skills : []), ...options.skills])
+      : config.skills;
 
-  // Skill preloading: when skills is string[], preload their content into prompt
-  if (Array.isArray(skills)) {
+  // Named skills are preloaded; `skills: true` still leaves normal discovery on.
+  if (Array.isArray(skills) && skills.length > 0) {
     const loaded = preloadSkills(skills, configCwd);
     if (loaded.length > 0) {
       extras.skillBlocks = loaded;
     }
   }
 
-  let toolNames = getToolNamesForType(type);
+  let toolNames = unique([...getToolNamesForType(type), ...addedBuiltinTools]);
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
@@ -646,7 +661,7 @@ export async function runAgent(
 
   // When skills is string[], we've already preloaded them into the prompt.
   // Still pass noSkills: true since we don't need the skill loader to load them again.
-  const noSkills = skills === false || Array.isArray(skills);
+  const noSkills = options.isolated || config.skills !== true;
 
   const agentDir = getAgentDir();
 
@@ -668,7 +683,7 @@ export async function runAgent(
   // which extensions load. `ext:foo` against an extension that `extensions:` excluded
   // is an orphan and warns after reload. `isolated` means no extension tools at all.
   const { extNames, narrowing } = parseExtSelectors(
-    options.isolated ? [] : (agentConfig?.extSelectors ?? []),
+    options.isolated ? [] : [...(agentConfig?.extSelectors ?? []), ...addedExtSelectors],
   );
   const noExtensions = extensions === false;
 
@@ -725,9 +740,10 @@ export async function runAgent(
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
   // this produced a silently broken agent (#75) — pi-mono accepted the bogus name
   // into the allowlist, then dropped it at registration with no signal back.
-  if (agentConfig?.builtinToolNames?.length) {
+  const requestedBuiltinTools = [...(agentConfig?.builtinToolNames ?? []), ...addedBuiltinTools];
+  if (requestedBuiltinTools.length) {
     const knownBuiltins = new Set(BUILTIN_TOOL_NAMES);
-    for (const name of agentConfig.builtinToolNames) {
+    for (const name of requestedBuiltinTools) {
       if (!knownBuiltins.has(name)) {
         options.onToolActivity?.({
           type: "end",

@@ -11,6 +11,13 @@ export type { ThinkingLevel };
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
 
+/** Capabilities added to one agent run without changing its saved definition. */
+export interface AgentCapabilityAdditions {
+  tools?: string[];
+  skills?: string[];
+  extensions?: string[];
+}
+
 /** Names of the three embedded default agents. */
 export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as const;
 

@@ -2,10 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
-import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
   let tmpDir: string;
@@ -28,18 +26,14 @@ describe("loadCustomAgents", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function writeAgentIn(projectDir: ".agents" | ".pi", name: string, content: string) {
+  function writeAgentIn(projectDir: ".agents" | ".pi" | ".claude", name: string, content: string) {
     const dir = join(tmpDir, projectDir, "agents");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${name}.md`), content);
   }
 
   function writeAgent(name: string, content: string) {
-    writeAgentIn(".pi", name, content);
-  }
-
-  function writeWorkspaceAgent(name: string, content: string) {
-    writeAgentIn(".agents", name, content);
+    writeAgentIn(".claude", name, content);
   }
 
   it("returns empty map when custom agent dirs do not exist", () => {
@@ -47,58 +41,19 @@ describe("loadCustomAgents", () => {
     expect(result.size).toBe(0);
   });
 
-  it("loads a workspace project agent from .agents/agents", () => {
-    writeWorkspaceAgent("reviewer", `---
-description: Workspace Reviewer
----
-
-Workspace prompt.`);
-
-    const result = loadCustomAgents(tmpDir);
-    expect(result.size).toBe(1);
-    expect(result.get("reviewer")?.description).toBe("Workspace Reviewer");
-    expect(result.get("reviewer")?.systemPrompt).toBe("Workspace prompt.");
-    expect(result.get("reviewer")?.source).toBe("project");
-  });
-
-  it(".pi/agents overrides .agents/agents on a name clash", () => {
-    writeWorkspaceAgent("dupe", `---
-description: Workspace Project
----
-
-Workspace prompt.`);
-    writeAgent("dupe", `---
-description: Pi Project
----
-
-Pi prompt.`);
-
-    const result = loadCustomAgents(tmpDir);
-    expect(result.size).toBe(1);
-    expect(result.get("dupe")?.description).toBe("Pi Project");
-    expect(result.get("dupe")?.systemPrompt).toBe("Pi prompt.");
-  });
-
-  it("workspace project agents override global agents", () => {
+  it("discovers only project agents from .claude/agents", () => {
+    writeAgent("claude", "---\ndescription: Claude agent\n---\n\nClaude prompt.");
+    writeAgentIn(".pi", "pi", "---\ndescription: Pi agent\n---\n\nPi prompt.");
+    writeAgentIn(".agents", "workspace", "---\ndescription: Workspace agent\n---\n\nWorkspace prompt.");
     const globalAgentDir = join(tmpDir, "global-agent-dir");
     process.env.PI_CODING_AGENT_DIR = globalAgentDir;
-    const globalAgents = join(globalAgentDir, "agents");
-    mkdirSync(globalAgents, { recursive: true });
-    writeFileSync(join(globalAgents, "dupe.md"), `---
-description: Global
----
-
-Global prompt.`);
-    writeWorkspaceAgent("dupe", `---
-description: Workspace Project
----
-
-Workspace prompt.`);
+    mkdirSync(join(globalAgentDir, "agents"), { recursive: true });
+    writeFileSync(join(globalAgentDir, "agents", "global.md"), "---\ndescription: Global agent\n---\n\nGlobal prompt.");
 
     const result = loadCustomAgents(tmpDir);
-    expect(result.size).toBe(1);
-    expect(result.get("dupe")?.description).toBe("Workspace Project");
-    expect(result.get("dupe")?.systemPrompt).toBe("Workspace prompt.");
+
+    expect([...result.keys()]).toEqual(["claude"]);
+    expect(result.get("claude")?.sourcePath).toBe(join(tmpDir, ".claude", "agents", "claude.md"));
   });
 
   it("loads a basic agent with all frontmatter fields", () => {
@@ -319,6 +274,17 @@ None.`);
     expect(result.get("explicit-none")!.excludeExtensions).toBeUndefined();
   });
 
+  it("normalizes Claude built-in tool names to Pi names case-insensitively", () => {
+    writeAgent("claude-tools", `---
+tools: Read, WRITE, Edit, Bash, Grep, Glob
+---
+
+Shared tools.`);
+
+    expect(loadCustomAgents(tmpDir).get("claude-tools")!.builtinToolNames)
+      .toEqual(["read", "write", "edit", "bash", "grep", "find"]);
+  });
+
   it("passes through unknown tool names (not filtered)", () => {
     writeAgent("custom-tools", `---
 tools: read, my_custom_tool, grep
@@ -488,7 +454,7 @@ Second agent.`);
   });
 
   it("skips non-.md files", () => {
-    const dir = join(tmpDir, ".pi", "agents");
+    const dir = join(tmpDir, ".claude", "agents");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "notes.txt"), "not an agent");
     writeFileSync(join(dir, "real.md"), `---
@@ -610,7 +576,7 @@ description: Reviews code
 Agent prompt.`);
 
     expect(loadCustomAgents(tmpDir).get("code-review")!.sourcePath)
-      .toBe(join(tmpDir, ".pi", "agents", "blubb.md"));
+      .toBe(join(tmpDir, ".claude", "agents", "blubb.md"));
   });
 
   it("falls back to the filename for an empty or blank declared name", () => {
@@ -710,12 +676,11 @@ Agent prompt.`);
     // swap that never happened, and points at an agent that is unchanged.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      writeWorkspaceAgent("scoped", "---\ndescription: An unrelated agent\n---\n\nBody.");
       writeAgent("scoped", "---\nname: my-plugin:reviewer\ndescription: Reviews code\n---\n\nBody.");
 
       const result = loadCustomAgents(tmpDir);
 
-      expect(result.get("scoped")?.description).toBe("An unrelated agent");
+      expect(result.get("scoped")).toBeUndefined();
       const message = warn.mock.calls.map(args => String(args[0])).join("\n");
       expect(message).toContain("reserved for plugin-scoped identifiers");
       expect(message).not.toContain("now loads from");
@@ -911,7 +876,7 @@ Good body.`);
       loadCustomAgents(tmpDir);
 
       const message = warn.mock.calls.map(args => String(args[0])).join("\n");
-      expect(message).toContain(join(tmpDir, ".pi", "agents", "broken.md"));
+      expect(message).toContain(join(tmpDir, ".claude", "agents", "broken.md"));
       expect(message).toContain("Nested mappings are not allowed");
     } finally {
       warn.mockRestore();
@@ -924,14 +889,14 @@ Good body.`);
   it("warns when a skipped file was overriding an agent that stays resolvable", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      writeWorkspaceAgent("dup", "---\ndescription: Earlier definition\n---\n\nEarlier body.");
+      writeAgent("a-earlier", "---\nname: dup\ndescription: Earlier definition\n---\n\nEarlier body.");
       writeAgent("dup", "---\nname: dup\ndescription: Use this: that\n---\n\nBroken body.");
 
       const result = loadCustomAgents(tmpDir);
 
       expect(result.get("dup")?.description).toBe("Earlier definition");
       const message = warn.mock.calls.map(args => String(args[0])).join("\n");
-      expect(message).toContain(`Agent "dup" now loads from ${join(tmpDir, ".agents", "agents", "dup.md")} instead`);
+      expect(message).toContain(`Agent "dup" now loads from ${join(tmpDir, ".claude", "agents", "a-earlier.md")} instead`);
     } finally {
       warn.mockRestore();
     }
@@ -942,7 +907,7 @@ Good body.`);
   it("does not claim a fallback when the shadowed definition is disabled", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      writeWorkspaceAgent("dup", "---\ndescription: Earlier definition\nenabled: false\n---\n\nEarlier body.");
+      writeAgent("a-earlier", "---\nname: dup\ndescription: Earlier definition\nenabled: false\n---\n\nEarlier body.");
       writeAgent("dup", "---\nname: dup\ndescription: Use this: that\n---\n\nBroken body.");
 
       loadCustomAgents(tmpDir);
@@ -974,7 +939,7 @@ Good body.`);
   it("throws naming the file when strict, and skips it when not", () => {
     writeAgent("broken", "---\nname: broken\ndescription: Use this: that\n---\n\nBroken.");
     writeAgent("healthy", "---\ndescription: Fine\n---\n\nFine.");
-    const brokenPath = join(tmpDir, ".pi", "agents", "broken.md");
+    const brokenPath = join(tmpDir, ".claude", "agents", "broken.md");
 
     expect(() => loadCustomAgents(tmpDir, true)).toThrow(brokenPath);
     expect(() => loadCustomAgents(tmpDir, true)).toThrow("Nested mappings are not allowed");
@@ -1029,138 +994,4 @@ Good body.`);
     }
   });
 
-  it("honors PI_CODING_AGENT_DIR for global custom agent discovery", () => {
-    const altAgentDir = mkdtempSync(join(tmpdir(), "pi-alt-agent-"));
-    const originalEnv = process.env.PI_CODING_AGENT_DIR;
-    process.env.PI_CODING_AGENT_DIR = altAgentDir;
-    try {
-      const globalAgentsDir = join(altAgentDir, "agents");
-      mkdirSync(globalAgentsDir, { recursive: true });
-      writeFileSync(
-        join(globalAgentsDir, "via-env.md"),
-        "---\ndescription: Discovered via env var\n---\n\nTest body.",
-      );
-
-      const result = loadCustomAgents(tmpDir);
-
-      // Agent is found at $PI_CODING_AGENT_DIR/agents, not at $HOME/.pi/agent/agents
-      expect(result.has("via-env")).toBe(true);
-      expect(result.get("via-env")!.description).toBe("Discovered via env var");
-    } finally {
-      if (originalEnv == null) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalEnv;
-      rmSync(altAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  // `/agents → Eject` writes an AgentConfig back out as frontmatter. That writer
-  // and this loader are the two halves of one format, but nothing pinned them
-  // together — so a field can serialize to something the loader reads back
-  // differently, and the agent silently changes shape on eject.
-  describe("eject round-trip", () => {
-    function roundTrip(cfg: Partial<AgentConfig>) {
-      const full: AgentConfig = {
-        description: "Round trip agent",
-        systemPrompt: "Body prompt.",
-        promptMode: "append",
-        ...cfg,
-      } as AgentConfig;
-      writeAgent("rt", serializeAgentFile(full));
-      const loaded = loadCustomAgents(tmpDir).get("rt");
-      expect(loaded).toBeDefined();
-      return loaded!;
-    }
-
-    it("preserves an explicitly narrowed tool list", () => {
-      expect(roundTrip({ builtinToolNames: ["read", "grep"] }).builtinToolNames).toEqual(["read", "grep"]);
-    });
-
-    it("preserves the full built-in set", () => {
-      expect(roundTrip({ builtinToolNames: [...BUILTIN_TOOL_NAMES] }).builtinToolNames)
-        .toEqual([...BUILTIN_TOOL_NAMES]);
-    });
-
-    it("preserves an empty tool list instead of widening it to every built-in", () => {
-      // `tools: none` parses to [] on load, so ejecting an agent with zero
-      // built-ins must not write `tools: all` — that hands it the whole toolbox.
-      expect(roundTrip({ builtinToolNames: [] }).builtinToolNames).toEqual([]);
-    });
-
-    it("preserves the scalar and list fields it writes", () => {
-      const loaded = roundTrip({
-        displayName: "RT",
-        model: "anthropic/claude-haiku-4-5",
-        thinking: "low",
-        maxTurns: 7,
-        allowedSubagents: ["Explore"],
-        excludeExtensions: ["ext-beta"],
-        disallowedTools: ["write"],
-        inheritContext: true,
-        runInBackground: true,
-        outputTranscript: false,
-        isolated: true,
-        memory: "project",
-        isolation: "worktree",
-      });
-      expect(loaded.displayName).toBe("RT");
-      expect(loaded.model).toBe("anthropic/claude-haiku-4-5");
-      expect(loaded.thinking).toBe("low");
-      expect(loaded.maxTurns).toBe(7);
-      expect(loaded.allowedSubagents).toEqual(["Explore"]);
-      expect(loaded.excludeExtensions).toEqual(["ext-beta"]);
-      expect(loaded.disallowedTools).toEqual(["write"]);
-      expect(loaded.inheritContext).toBe(true);
-      expect(loaded.runInBackground).toBe(true);
-      expect(loaded.outputTranscript).toBe(false);
-      expect(loaded.isolated).toBe(true);
-      expect(loaded.memory).toBe("project");
-      expect(loaded.isolation).toBe("worktree");
-    });
-
-    // The writer used to emit `run_in_background` only when truthy, so an
-    // explicit `false` was dropped. Harmless while foreground was the default
-    // and omission meant the same thing — but with `backgroundByDefault` on,
-    // dropping it flips the ejected agent to background.
-    it("preserves an explicit run_in_background: false instead of dropping it", () => {
-      expect(roundTrip({ runInBackground: false }).runInBackground).toBe(false);
-    });
-
-    it("leaves run_in_background unset when the config doesn't pin it", () => {
-      // Absent must stay absent — writing a value would freeze the agent
-      // against the setting rather than letting it follow the default.
-      expect(roundTrip({}).runInBackground).toBeUndefined();
-    });
-
-    it("preserves the extension and skill list fields", () => {
-      // These serialize as bare CSV and are re-parsed by parseExtensionsSpec /
-      // the skills field. A generate/parse mismatch here is silent: the ejected
-      // agent loads fine but with a different extension or skill scope than the
-      // one that was ejected.
-      const loaded = roundTrip({
-        extensions: ["mcp", "pi-notify"],
-        skills: ["planning", "review"],
-        disallowedTools: ["write", "edit"],
-      });
-      expect(loaded.extensions).toEqual(["mcp", "pi-notify"]);
-      expect(loaded.skills).toEqual(["planning", "review"]);
-      expect(loaded.disallowedTools).toEqual(["write", "edit"]);
-    });
-
-    it("preserves the boolean forms of extensions and skills", () => {
-      const off = roundTrip({ extensions: false, skills: false });
-      expect(off.extensions).toBe(false);
-      expect(off.skills).toBe(false);
-    });
-
-    it("preserves allowed_subagents in both its list and `all` forms", () => {
-      expect(roundTrip({ allowedSubagents: "all" }).allowedSubagents).toBe("all");
-      expect(roundTrip({ allowedSubagents: ["Explore", "Plan"] }).allowedSubagents)
-        .toEqual(["Explore", "Plan"]);
-    });
-
-    it("preserves a description containing a colon", () => {
-      // Serialized via JSON.stringify precisely so YAML doesn't split on the colon.
-      expect(roundTrip({ description: "Scout: find things" }).description).toBe("Scout: find things");
-    });
-  });
 });

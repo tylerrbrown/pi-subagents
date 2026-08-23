@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Tyler fork contract** — Agent definitions load only from `.claude/agents`, `/agents` definition mutation is removed, and fresh Agent calls support validated per-run tool, skill, and installed-extension additions.
+
+
 ### Fixed
 - **Ctrl+C closes the conversation viewer** ([#255](https://github.com/tintinweb/pi-subagents/pull/255) — thanks [@elrond298](https://github.com/elrond298)). The overlay closed on `Esc` and `q` but swallowed `Ctrl+C`, the reflex key for backing out of a full-screen TUI view, leaving the viewer stuck on screen for anyone who reached for it.
 

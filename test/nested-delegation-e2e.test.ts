@@ -68,7 +68,7 @@ function findOutputFiles(root: string): string[] {
 }
 
 function writeAgents(cwd: string): void {
-  const dir = join(cwd, ".pi", "agents");
+  const dir = join(cwd, ".claude", "agents");
   mkdirSync(dir, { recursive: true });
   // Opts into nesting, restricted to one type — the allowlist path, not `all`.
   writeFileSync(

@@ -14,7 +14,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
 
@@ -95,7 +95,7 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+interface SpawnOptions extends AgentCapabilityAdditions {
   description: string;
   /**
    * Optional memorable name for this instance, becoming a second handle
@@ -421,6 +421,9 @@ export class AgentManager {
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
+      tools: options.tools,
+      skills: options.skills,
+      extensions: options.extensions,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,
       // Worktree wins for the working dir (the agent must run in the copy —

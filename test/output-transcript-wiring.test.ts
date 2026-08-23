@@ -75,7 +75,7 @@ describe("output_transcript agent wiring", () => {
     process.env.HOME = agentDir;
     mkdirSync(join(cwd, ".pi"), { recursive: true });
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));
-    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    mkdirSync(join(cwd, ".claude", "agents"), { recursive: true });
     process.chdir(cwd);
     vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
       await Promise.resolve();
@@ -98,7 +98,7 @@ describe("output_transcript agent wiring", () => {
   });
 
   it("creates no transcript when a custom agent sets output_transcript false", async () => {
-    writeFileSync(join(agentDir, "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\n---\n\nKeep data in memory.`);
+    writeFileSync(join(cwd, ".claude", "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\n---\n\nKeep data in memory.`);
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
@@ -117,7 +117,7 @@ describe("output_transcript agent wiring", () => {
   });
 
   it("also suppresses the background transcript", async () => {
-    writeFileSync(join(agentDir, "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\nrun_in_background: true\n---\n\nKeep data in memory.`);
+    writeFileSync(join(cwd, ".claude", "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\nrun_in_background: true\n---\n\nKeep data in memory.`);
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
@@ -175,7 +175,7 @@ describe("output_transcript agent wiring", () => {
 
   it("lets agent frontmatter output_transcript true override a project outputTranscript false", async () => {
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false }));
-    writeFileSync(join(agentDir, "agents", "audited.md"), `---\ndescription: Always keeps a transcript\noutput_transcript: true\n---\n\nWrite a transcript regardless of the project default.`);
+    writeFileSync(join(cwd, ".claude", "agents", "audited.md"), `---\ndescription: Always keeps a transcript\noutput_transcript: true\n---\n\nWrite a transcript regardless of the project default.`);
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 

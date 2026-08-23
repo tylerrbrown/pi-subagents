@@ -90,9 +90,9 @@ export function hermeticDir(opts: {
     writeFileSync(join(dir, ".pi", "subagents.json"), JSON.stringify(opts.settings));
   }
   if (opts.agentFiles) {
-    mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+    mkdirSync(join(dir, ".claude", "agents"), { recursive: true });
     for (const [name, content] of Object.entries(opts.agentFiles)) {
-      writeFileSync(join(dir, ".pi", "agents", `${name}.md`), content);
+      writeFileSync(join(dir, ".claude", "agents", `${name}.md`), content);
     }
   }
 
