@@ -48,7 +48,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
 
   let files: string[];
   try {
-    files = readdirSync(dir).filter(f => f.endsWith(".md"));
+    files = readdirSync(dir).filter((file) => file.endsWith(".md") && file.toLowerCase() !== "readme.md");
   } catch {
     return;
   }

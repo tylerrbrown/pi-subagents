@@ -453,6 +453,13 @@ Second agent.`);
     expect(result.has("agent2")).toBe(true);
   });
 
+  it("skips README.md in the shared agent directory", () => {
+    writeAgent("README", "# Agent documentation");
+    writeAgent("real", "---\ndescription: Real agent\n---\n\nReal prompt.");
+
+    expect([...loadCustomAgents(tmpDir).keys()]).toEqual(["real"]);
+  });
+
   it("skips non-.md files", () => {
     const dir = join(tmpDir, ".claude", "agents");
     mkdirSync(dir, { recursive: true });
