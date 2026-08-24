@@ -1946,40 +1946,44 @@ describe("AgentManager — names as additive aliases", () => {
     expect(manager.resolveMention("explore")).toMatchObject({ kind: "live", record: { id } });
   });
 
-  it("slugs a name that isn't typeable rather than rejecting the spawn", () => {
+  it("rejects a name outside the documented grammar", () => {
     resolvedRun();
     manager = new AgentManager();
-    const record = manager.getRecord(spawnNamed(manager, "Explore", "Auth Audit!"))!;
 
-    expect(record.alias).toBe("auth-audit");
+    expect(() => spawnNamed(manager, "Explore", "Auth Audit!")).toThrow(/letters, digits/);
   });
 
-  it("numbers an alias that collides with its own type handle", () => {
-    // `name: "explore"` on an Explore would otherwise produce two identical
-    // names on one record, and later a second agent could take one of them.
+  it("uses the type handle when the requested name is identical", () => {
     resolvedRun();
     manager = new AgentManager();
-    const record = manager.getRecord(spawnNamed(manager, "Explore", "explore"))!;
+    const id = spawnNamed(manager, "Explore", "explore");
+    const record = manager.getRecord(id)!;
 
     expect(record.handle).toBe("explore");
-    expect(record.alias).toBe("explore-2");
+    expect(record.alias).toBeUndefined();
+    expect(manager.resolveMention("explore")).toMatchObject({ kind: "live", record: { id } });
   });
 
-  it("stops a later type handle from colliding with an existing alias", () => {
+  it("fails loud when an explicit name is already held", () => {
     resolvedRun();
     manager = new AgentManager();
-    spawnNamed(manager, "Plan", "explore"); // alias squats the Explore name
-    const second = manager.getRecord(spawnNamed(manager, "Explore"))!;
+    spawnNamed(manager, "Plan", "drill-c");
 
-    expect(second.handle).toBe("explore-2");
+    expect(() => spawnNamed(manager, "Explore", "drill-c")).toThrow(/already in use/);
+  });
+
+  it("reserves every registered type handle against another type's alias", () => {
+    resolvedRun();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, () => ["Explore", "Plan"]);
+
+    expect(() => spawnNamed(manager, "Plan", "explore")).toThrow(/reserved for agent type/);
   });
 
   it("refuses to alias an agent to the reserved main handle", () => {
     resolvedRun();
     manager = new AgentManager();
-    const record = manager.getRecord(spawnNamed(manager, "Explore", "main"))!;
 
-    expect(record.alias).toBe("main-2");
+    expect(() => spawnNamed(manager, "Explore", "main")).toThrow(/reserved/);
   });
 
   it("gives an unnamed agent no alias at all", () => {

@@ -13,7 +13,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import { assignHandle, handleBase } from "./mention.js";
+import { assignHandle, handleBase, isReservedHandle } from "./mention.js";
 import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -261,6 +261,7 @@ export class AgentManager {
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
+    private getReservedTypeNames?: () => string[],
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
@@ -301,22 +302,48 @@ export class AgentManager {
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
+    const taken = this.takenHandles();
+    let handle: string | undefined;
+    let alias: string | undefined;
+    if (options.parentAgentId === undefined) {
+      if (options.reclaim) {
+        // Resuming reclaims the conversation's existing names exactly.
+        handle = options.reclaim.handle;
+        alias = options.reclaim.alias;
+      } else {
+        handle = assignHandle(handleBase(type), taken);
+        if (options.name !== undefined) {
+          if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(options.name)) {
+            throw new Error("Agent name must use 1-64 letters, digits, underscores, or hyphens.");
+          }
+          const requested = handleBase(options.name);
+          if (isReservedHandle(requested)) {
+            throw new Error(`Agent name "${options.name}" is reserved.`);
+          }
+          const ownTypeHandle = handleBase(type);
+          const reservedForOtherType = (this.getReservedTypeNames?.() ?? [])
+            .some((name) => handleBase(name) === requested && handleBase(name) !== ownTypeHandle);
+          if (reservedForOtherType) {
+            throw new Error(`Agent name "${options.name}" is reserved for agent type "${requested}".`);
+          }
+          if (requested !== handle) {
+            if (taken.has(requested)) {
+              throw new Error(`Agent name "${options.name}" is already in use. Choose another name or resume that agent.`);
+            }
+            alias = requested;
+          }
+        }
+      }
+    }
     const record: AgentRecord = {
       id,
       type,
       // Nested children are filtered out of every top-level surface, so no
       // handle: nothing can address them and they must not consume a name a
       // top-level sibling could otherwise take.
-      handle: options.parentAgentId !== undefined
-        ? undefined
-        // A reclaimed handle is used as-is: it belongs to the conversation this
-        // spawn is reopening, and re-deriving it would lose the numbering.
-        : options.reclaim?.handle ?? assignHandle(handleBase(type), this.takenHandles()),
+      handle,
       description: options.description,
-      // Reclaimed here, or filled in below from `name` — in which case it must
-      // see the handle this record just took, since both come out of the same
-      // namespace.
-      alias: options.parentAgentId === undefined ? options.reclaim?.alias : undefined,
+      alias,
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
@@ -336,12 +363,6 @@ export class AgentManager {
       rootSessionId: options.rootSessionId,
     };
     this.agents.set(id, record);
-    // After the insert, so `takenHandles()` already counts this record's own
-    // handle — a spawn named after its own type gets `explore-2`, not a
-    // duplicate `explore` that would make resolution ambiguous.
-    if (record.handle !== undefined && record.alias === undefined && options.name !== undefined) {
-      record.alias = assignHandle(handleBase(options.name), this.takenHandles());
-    }
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 

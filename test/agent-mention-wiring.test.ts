@@ -1345,6 +1345,31 @@ describe("handles as tool arguments", () => {
     expect(session.steer).toHaveBeenCalledWith("keep going");
   });
 
+  it("keeps three parallel requested names addressable", async () => {
+    const { tools } = boot();
+    const sessions = [fakeSession(), fakeSession(), fakeSession()];
+    let next = 0;
+    vi.mocked(runAgent).mockImplementation(
+      (_c: any, _t: any, _p: any, o: any) => new Promise(() => o.onSessionCreated?.(sessions[next++])) as any,
+    );
+
+    await Promise.all(["drill-a", "drill-b", "drill-c"].map((name) =>
+      tools.get("Agent").execute(
+        `tc-${name}`,
+        { prompt: "go", description: name, subagent_type: "Explore", name, run_in_background: true },
+        undefined, undefined, ctx(),
+      ),
+    ));
+    await flush();
+
+    const result = await tools.get("steer_subagent").execute(
+      "tc-steer", { agent_id: "drill-c", message: "report the extra field" }, undefined, undefined, ctx(),
+    );
+
+    expect(sessions[2].steer).toHaveBeenCalledWith("report the extra field");
+    expect(textOf(result)).not.toContain("Agent not found");
+  });
+
   it("reads a result by handle", async () => {
     const { tools } = boot();
     finishedRun(fakeSession());
