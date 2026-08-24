@@ -101,9 +101,9 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       builtinToolNames,
       extSelectors,
       disallowedTools: csvListOptional(fm.disallowed_tools),
-      extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
+      extensions: inheritField(fm.extensions ?? fm.inherit_extensions, false),
       excludeExtensions: csvListOptional(fm.exclude_extensions),
-      skills: inheritField(fm.skills ?? fm.inherit_skills),
+      skills: inheritField(fm.skills ?? fm.inherit_skills, false),
       model: str(fm.model),
       thinking: str(fm.thinking) as ThinkingLevel | undefined,
       maxTurns: nonNegativeInt(fm.max_turns),
@@ -287,8 +287,9 @@ function parseIsolation(val: unknown): IsolationMode | undefined {
  * Parse an inherit field (extensions, skills).
  * omitted/true → true (inherit all); false/"none"/empty → false; csv → listed names.
  */
-function inheritField(val: unknown): true | string[] | false {
-  if (val === undefined || val === null || val === true) return true;
+function inheritField(val: unknown, defaultValue: boolean): true | string[] | false {
+  if (val === undefined || val === null) return defaultValue;
+  if (val === true) return true;
   if (val === false || val === "none") return false;
   const items = csvList(val, []);
   return items.length > 0 ? items : false;

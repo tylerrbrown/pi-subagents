@@ -110,8 +110,8 @@ Just a prompt.`);
     expect(agent.color).toBeUndefined();
     expect(agent.description).toBe("minimal"); // defaults to filename
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES); // all tools
-    expect(agent.extensions).toBe(true); // inherit all
-    expect(agent.skills).toBe(true); // inherit all
+    expect(agent.extensions).toBe(false); // no extensions unless explicit
+    expect(agent.skills).toBe(false); // no skills unless explicit
     expect(agent.model).toBeUndefined();
     expect(agent.thinking).toBeUndefined();
     expect(agent.maxTurns).toBeUndefined();
@@ -126,6 +126,18 @@ Just a prompt.`);
     expect(agent.systemPrompt).toBe("Just a prompt.");
   });
 
+  it("preserves explicit extension and skill inheritance", () => {
+    writeAgent("explicit-all", `---
+extensions: true
+skills: true
+---
+Explicit inheritance.`);
+
+    const agent = loadCustomAgents(tmpDir).get("explicit-all")!;
+    expect(agent.extensions).toBe(true);
+    expect(agent.skills).toBe(true);
+  });
+
   it("uses sensible defaults when no frontmatter at all", () => {
     writeAgent("bare", "Just a system prompt, no frontmatter.");
 
@@ -135,6 +147,8 @@ Just a prompt.`);
     expect(agent.name).toBe("bare");
     expect(agent.description).toBe("bare");
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES);
+    expect(agent.extensions).toBe(false);
+    expect(agent.skills).toBe(false);
     expect(agent.systemPrompt).toBe("Just a system prompt, no frontmatter.");
   });
 
