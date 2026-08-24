@@ -189,6 +189,8 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("Use the read tool instead of cat");
     expect(prompt).toContain("Use the edit tool instead of sed");
     expect(prompt).toContain("Use the grep tool instead of");
+    expect(prompt).toContain("Preserve caller-supplied path spelling verbatim");
+    expect(prompt).not.toContain("Use absolute file paths");
   });
 
   it("append mode without parent prompt still has bridge", () => {

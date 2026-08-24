@@ -25,6 +25,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import { RELATIVE_PATH_GUIDANCE } from "./prompts.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
@@ -162,7 +163,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       "Launch a child-safe nested subagent for bounded delegated work. " +
       "Only use agent types allowed by this parent agent; nesting is depth-limited.",
     parameters: Type.Object({
-      prompt: Type.String({ description: "Self-contained task for the nested agent." }),
+      prompt: Type.String({ description: `Self-contained task for the nested agent. ${RELATIVE_PATH_GUIDANCE}` }),
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),

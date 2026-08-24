@@ -4,6 +4,9 @@
 
 import type { AgentConfig, EnvInfo } from "./types.js";
 
+export const RELATIVE_PATH_GUIDANCE =
+  "Preserve caller-supplied path spelling verbatim; do not expand repo-relative paths into absolute or home-directory paths. Relative paths resolve from the agent working directory.";
+
 /** Extra sections to inject into the system prompt (memory, skills, etc.). */
 export interface PromptExtras {
   /** Persistent memory content to inject (first 200 lines of MEMORY.md + instructions). */
@@ -83,7 +86,7 @@ You are operating as a sub-agent invoked to handle a specific task.
 - Use the find tool instead of bash find/ls for file search
 - Use the grep tool instead of bash grep/rg for content search
 - Make independent tool calls in parallel
-- Use absolute file paths
+- ${RELATIVE_PATH_GUIDANCE}
 - Do not use emojis
 - Be concise but complete
 </sub_agent_context>`;

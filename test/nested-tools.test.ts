@@ -89,6 +89,13 @@ afterEach(() => {
 });
 
 describe("child-safe nested Agent tools", () => {
+  it("tells nested Leads to preserve caller-supplied repo-relative paths", () => {
+    const agent = tools().find(tool => tool.name === "Agent")!;
+    const prompt = agent.parameters?.properties?.prompt?.description ?? "";
+    expect(prompt).toContain("Preserve caller-supplied path spelling verbatim");
+    expect(prompt).toContain("Relative paths resolve from the agent working directory");
+  });
+
   it("allows any enabled agent when allowed_subagents is omitted", async () => {
     const [agent] = tools();
     const result = await execute(agent, {

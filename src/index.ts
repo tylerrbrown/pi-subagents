@@ -31,6 +31,7 @@ import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { RELATIVE_PATH_GUIDANCE } from "./prompts.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -1458,10 +1459,11 @@ Terse command-style prompts produce shallow, generic work.
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
+      RELATIVE_PATH_GUIDANCE,
     ],
     parameters: Type.Object({
       prompt: Type.String({
-        description: "The task for the agent to perform.",
+        description: `The task for the agent to perform. ${RELATIVE_PATH_GUIDANCE}`,
       }),
       description: Type.String({
         description: "A short (3-5 word) description of the task (shown in UI).",

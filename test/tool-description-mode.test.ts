@@ -169,6 +169,16 @@ describe("toolDescriptionMode", () => {
     }
   });
 
+  it("tells the Lead to preserve caller-supplied repo-relative paths", () => {
+    const tool = setup().get("Agent");
+    const prompt = tool.parameters?.properties?.prompt?.description ?? "";
+    expect(prompt).toContain("Preserve caller-supplied path spelling verbatim");
+    expect(prompt).toContain("Relative paths resolve from the agent working directory");
+    expect(tool.promptGuidelines).toContain(
+      "Preserve caller-supplied path spelling verbatim; do not expand repo-relative paths into absolute or home-directory paths. Relative paths resolve from the agent working directory.",
+    );
+  });
+
   it("custom mode renders the project template with placeholders substituted", () => {
     const tools = setup({ toolDescriptionMode: "custom" }, () => {
       writeFileSync(

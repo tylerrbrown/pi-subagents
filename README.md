@@ -270,6 +270,8 @@ Then spawn it like any built-in type:
 Agent({ subagent_type: "auditor", prompt: "Review the auth module", description: "Security audit" })
 ```
 
+Paths in `prompt` are preserved as written. Repository-relative paths resolve from the agent working directory rather than the user home.
+
 ### Frontmatter Fields
 
 All fields are optional — sensible defaults for everything.
