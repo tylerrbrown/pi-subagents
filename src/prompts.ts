@@ -21,7 +21,7 @@ export interface PromptExtras {
 /**
  * Build the system prompt for an agent from its config.
  *
- * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)
+ * - "replace" mode: minimum specialist floor + env header + config.systemPrompt (no parent identity)
  * - "append" mode: parent system prompt + sub-agent context + env header + config.systemPrompt
  * - "append" with empty systemPrompt: pure parent clone
  *
@@ -100,9 +100,19 @@ You are operating as a sub-agent invoked to handle a specific task.
     return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + customSection + extrasSuffix;
   }
 
-  // "replace" mode — env header + the config's full system prompt
+  // "replace" mode — minimum specialist floor + env header + config prompt
   const replaceHeader = `You are a pi coding agent sub-agent.
 You have been invoked to handle a specific task autonomously.
+
+<specialist_floor>
+- Do not search for, enumerate, read, print, or leak secrets. Use only credential-loading operations this task explicitly names.
+- Do not invent files, test results, commands, or outcomes you did not observe.
+- Proof is observed output from a real command or a real path the user will use. Label unrun checks.
+- For implementation and bug-fix tasks that name tests, get them red then green before you stop.
+- Do not mutate files or external state unless this task authorizes it.
+- Do not restart services, send messages, or spend money unless this task says you may.
+- Stay inside the paths and tools in this task.
+</specialist_floor>
 
 ${envBlock}`;
 

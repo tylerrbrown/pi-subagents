@@ -153,6 +153,15 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("You are a specialized agent.");
     expect(prompt).toContain("/workspace");
     expect(prompt).toContain("You are a pi coding agent sub-agent");
+    expect(prompt).toContain(`<specialist_floor>
+- Do not search for, enumerate, read, print, or leak secrets. Use only credential-loading operations this task explicitly names.
+- Do not invent files, test results, commands, or outcomes you did not observe.
+- Proof is observed output from a real command or a real path the user will use. Label unrun checks.
+- For implementation and bug-fix tasks that name tests, get them red then green before you stop.
+- Do not mutate files or external state unless this task authorizes it.
+- Do not restart services, send messages, or spend money unless this task says you may.
+- Stay inside the paths and tools in this task.
+</specialist_floor>`);
   });
 
   it("replace mode ignores parent prompt", () => {
