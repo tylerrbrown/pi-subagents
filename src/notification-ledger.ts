@@ -17,7 +17,7 @@ export const MAX_CAPTURE_CHARS = 5_000_000;
 const MAX_CAPTURED_RECORD_CHARS = 8_000_000;
 const MAX_COUNT = 1_000_000_000;
 
-export type PersistedAgentStatus = "completed" | "steered" | "aborted" | "stopped" | "error";
+export type PersistedAgentStatus = "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error";
 
 export interface PersistedAgentSnapshot {
   version: typeof SUBAGENT_RECORD_VERSION;
@@ -90,7 +90,7 @@ function count(value: unknown): value is number {
 }
 
 function isTerminalStatus(value: unknown): value is PersistedAgentStatus {
-  return value === "completed" || value === "steered" || value === "aborted" || value === "stopped" || value === "error";
+  return value === "completed" || value === "steered" || value === "aborted" || value === "stopped" || value === "timeout" || value === "error";
 }
 
 function normalizeHandle(value: unknown): string | undefined | false {

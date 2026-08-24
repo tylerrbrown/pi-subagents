@@ -196,7 +196,7 @@ describe("status note reaches the parent through the real handlers", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("background user-stop → get_subagent_result flags STOPPED BY THE USER (not completed)", async () => {
+  it("background RPC stop → get_subagent_result names the extension, not the user (not completed)", async () => {
     // A background agent that never settles on its own — only a stop ends it.
     vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
     const { pi, tools, eventHandlers, lifecycle } = makePi();
@@ -211,7 +211,9 @@ describe("status note reaches the parent through the real handlers", () => {
     const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
     expect(id, "background spawn should surface an agent id").toBeTruthy();
 
-    // The user stops it — same path the viewer's stop key uses (manager.abort).
+    // Another extension stops it over the RPC channel. This is NOT the viewer's
+    // stop key: it reaches the same `manager.abort`, and claiming a human did
+    // it is exactly the conflation that made the 08/24 transcript unreadable.
     eventHandlers.get("subagents:rpc:stop")?.({ requestId: "r1", agentId: id });
 
     const res = await tools.get("get_subagent_result").execute(
@@ -219,7 +221,8 @@ describe("status note reaches the parent through the real handlers", () => {
     );
 
     const out = textOf(res);
-    expect(out).toContain("STOPPED BY THE USER");
+    expect(out).toContain("stopped by another extension");
+    expect(out).not.toContain("STOPPED BY THE USER");
     expect(out).toContain("the task was NOT finished");
     expect(out).not.toContain("Done"); // not surfaced as a normal completion
 
@@ -228,6 +231,33 @@ describe("status note reaches the parent through the real handlers", () => {
     // "everything the agent produced is above" would be a lie here. Folding the
     // two functions back together is exactly the regression this guards.
     expect(out).not.toContain("everything the agent produced is above");
+  });
+
+  it("background user stop → get_subagent_result flags STOPPED BY THE USER", async () => {
+    // The twin of the RPC case: the viewer/FleetView stop key calls
+    // `manager.abort(id)` with no reason, and that unattributed call is the one
+    // path where a human really is the cause.
+    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await bind(lifecycle);
+
+    const spawn = await tools.get("Agent").execute(
+      "tc4",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    const id = textOf(spawn).match(/Agent ID: (\S+)/)![1];
+
+    const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    expect(registry.getRecord(id)).toBeDefined();
+    // Last call, not the first: the mock accumulates across the whole file.
+    vi.mocked(runAgent).mock.calls.at(-1)![3].nestedRuntime.manager.abort(id);
+
+    const res = await tools.get("get_subagent_result").execute(
+      "tc5", { agent_id: id }, undefined, undefined, ctx(),
+    );
+    expect(textOf(res)).toContain("STOPPED BY THE USER");
   });
 });
 

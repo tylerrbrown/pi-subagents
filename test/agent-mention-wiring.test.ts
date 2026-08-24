@@ -1016,6 +1016,10 @@ describe("resuming an evicted agent by name", () => {
     const record = manager.getRecord(id);
     record.sessionFile = sessionPath();
     writeFileSync(record.sessionFile, "");
+    // Consumed: an unread result is now held for an hour, not ten minutes, so
+    // the short sweep only applies once someone has actually read it. Reading
+    // the result is also what a caller does before mentioning the agent again.
+    record.resultConsumed = true;
     record.completedAt = Date.now() - 11 * 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     return manager;

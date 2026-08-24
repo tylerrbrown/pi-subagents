@@ -8,7 +8,7 @@
  * through agent-runner).
  */
 
-import type { AgentRecord } from "./types.js";
+import type { AgentRecord, RunFailureKind, StopReason } from "./types.js";
 
 /**
  * Explicit parenthetical note for a non-normal terminal outcome, so the parent
@@ -19,10 +19,12 @@ import type { AgentRecord } from "./types.js";
  * turn limit was hit) — the parent should treat human intervention differently
  * from a budget cutoff.
  */
-export function getStatusNote(status: string): string {
+export function getStatusNote(status: string, stopReason?: StopReason): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER before completion — output is partial; the task was NOT finished)";
+      return ` (${stoppedBy(stopReason)} before completion — output is partial; the task was NOT finished)`;
+    case "timeout":
+      return " (TIMED OUT at its wall-clock deadline — output is partial; the task was NOT finished)";
     case "aborted":
       return " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
@@ -66,10 +68,12 @@ export function getStatusNote(status: string): string {
  * behavior) and adding an instruction (which can) are not equally safe bets.
  * Don't add either back without a way to measure it.
  */
-export function getForegroundOutcomeNote(status: string): string {
+export function getForegroundOutcomeNote(status: string, stopReason?: StopReason): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
+      return ` (${stoppedBy(stopReason)} — everything the agent produced is above; the task is unfinished)`;
+    case "timeout":
+      return " (TIMED OUT at its wall-clock deadline — everything the agent produced is above; the task is unfinished)";
     case "aborted":
       return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
     case "steered":
@@ -77,6 +81,62 @@ export function getForegroundOutcomeNote(status: string): string {
     default:
       return "";
   }
+}
+
+/**
+ * Provider back-pressure, as distinct from a broken run. Substring/status
+ * shapes rather than a provider-specific error type, because the text reaches
+ * us through pi's resolved `errorMessage` and every provider spells it its own
+ * way (`overloaded_error`, `429`, `503`, "rate limit").
+ */
+const OVERLOAD_PATTERN =
+  /\boverload(ed|ing)?|\brate[ _-]?limit|\b429\b|\b503\b|too many requests|service unavailable/i;
+
+/**
+ * Classify a run failure. Overload is called out because the parent's correct
+ * response differs: retry later, rather than fix the agent. Deliberately does
+ * NOT trigger a provider fallback — per `user-preferences.md` (MIN AI provider
+ * default), rerouting onto another provider is Tyler's explicit choice, not
+ * something the fork does behind him.
+ */
+export function classifyRunFailure(message: string | undefined): RunFailureKind {
+  return message && OVERLOAD_PATTERN.test(message) ? "overload" : "other";
+}
+
+/**
+ * Lead clause naming who stopped a run.
+ *
+ * Only a genuine user stop shouts. Three different paths used to set `stopped`
+ * — the conversation viewer, a cross-extension RPC abort, and
+ * `session_shutdown → abortAll()` — and all three claimed a human had
+ * intervened, so a session going down looked like Tyler pressing stop. An
+ * unattributed stop says only that it stopped: inventing a cause is the bug.
+ */
+function stoppedBy(stopReason?: StopReason): string {
+  switch (stopReason) {
+    case "user":
+      return "STOPPED BY THE USER";
+    case "rpc":
+      return "stopped by another extension";
+    case "shutdown":
+      return "stopped because the session shut down";
+    case "parent":
+      return "stopped because its parent agent finished";
+    default:
+      return "stopped";
+  }
+}
+
+/**
+ * Why a failed run failed, when that changes what the parent should do next.
+ * An overloaded provider is transient and is deliberately NOT rerouted — see
+ * `classifyRunFailure` — so the parent is told to retry rather than to fix
+ * something. Everything else already carries its own error text.
+ */
+export function getFailureNote(kind: RunFailureKind | undefined): string {
+  return kind === "overload"
+    ? " (the provider was overloaded — transient, and not rerouted to another provider; retry later)"
+    : "";
 }
 
 /**

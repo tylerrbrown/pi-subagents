@@ -33,6 +33,18 @@ describe("documented defaults (README:441)", () => {
     expect(getDefaultMaxTurns()).toBeUndefined();
   }, HEAVY_REIMPORT_MS);
 
+  it("the run deadline is unlimited by default", async () => {
+    const { getDefaultRunDeadlineMs } = await import("../src/agent-runner.js");
+    expect(getDefaultRunDeadlineMs()).toBeUndefined();
+  }, HEAVY_REIMPORT_MS);
+
+  // The one bound that is NOT unlimited by default: an unbounded blocking join
+  // is the defect the ceiling exists for, so shipping it off would ship the bug.
+  it("the blocking-wait ceiling defaults to five minutes", async () => {
+    const { getWaitCeilingMs } = await import("../src/wait-ceiling.js");
+    expect(getWaitCeilingMs()).toBe(5 * 60_000);
+  });
+
   it("nested subagent depth defaults to 2", async () => {
     const { getMaxSubagentDepth } = await import("../src/nested-tools.js");
     expect(getMaxSubagentDepth()).toBe(2);
