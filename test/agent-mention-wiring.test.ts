@@ -1237,10 +1237,10 @@ describe("resuming an evicted agent by name", () => {
     expect(manager.getRecord(resumedId).description).toBe("find flaky tests");
   });
 
-  it("does not let the tools steer or read an agent that is gone", async () => {
-    // A mention can resurrect it, but there is no live record to interrupt and
-    // no result to return — so the tools must say so rather than resolve to a
-    // tombstone and act on stale data.
+  it("does not steer an evicted agent but keeps its durable result retrievable", async () => {
+    // A mention can resurrect its live conversation and steering still requires
+    // a live record. Result retrieval is intentionally different: the parent
+    // session ledger retains the completed snapshot across live-record eviction.
     const { tools } = boot();
     finishedRun(fakeSession());
     await evict(await spawnBackground(tools));
@@ -1254,7 +1254,7 @@ describe("resuming an evicted agent by name", () => {
     );
 
     expect(textOf(steered)).toContain("Agent not found");
-    expect(textOf(read)).toContain("Agent not found");
+    expect(textOf(read)).toContain("first answer");
   });
 
   it("reports a session that is gone, rather than starting something else", async () => {

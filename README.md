@@ -30,10 +30,11 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
-- **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
+- **Durable completion notifications** - background results wait outside Pi's follow-up queue while the parent is busy, then coalesce into one bounded wake when it becomes idle. Explicit result retrieval durably consumes the wake without deleting the result, transcript, usage, or audit record
+- **Styled completion notifications** - background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start
-- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
+- **Schedule subagents** - pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results use the same durable, idle-gated completion path as manual background agents; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
 ## Install
@@ -61,7 +62,7 @@ Agent({
 })
 ```
 
-Agents run in the background by default: the call returns an ID immediately and notifies you on completion, carrying a preview of the result (use `get_subagent_result` for the full text). Pass `run_in_background: false` to block until the agent finishes and get its full output inline.
+Agents run in the background by default: the call returns an ID immediately and notifies you on completion, carrying a preview of the result (use `get_subagent_result` for the full text). If the parent is busy, completed agents stay in the session's durable notification ledger and coalesce into one bounded wake when the parent becomes idle. Retrieving a result durably consumes its pending wake without deleting the result, transcript, usage, or audit record. Pass `run_in_background: false` to block until the agent finishes and get its full output inline.
 
 ### Scheduling
 
@@ -83,7 +84,7 @@ Schedule formats:
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
 
-When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way.
+When a schedule fires, the spawn runs in background and its completion uses the same durable, idle-gated notification path as a manually spawned background agent. Your parent agent reasons about the result the same way.
 
 Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
 

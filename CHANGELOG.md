@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **Consumed background results no longer replay stale completion turns.** Completion snapshots plus consumption and wake-claim events now persist in the parent session. Busy parents retain completions outside Pi's follow-up queue and receive one bounded wake when idle, while `get_subagent_result` acknowledges consumption before returning without deleting result, transcript, usage, or audit data. Pi exposes no send receipt or idempotency key, so wake claims are at-most-once attempts; full results remain retrievable if a process exits after a claim.
 - **Agent prompts preserve repository-relative paths.** Lead-facing top-level and nested Agent schemas now keep caller-supplied path spelling intact and resolve relative paths from the agent working directory instead of expanding them against the user home.
 - **Ctrl+C closes the conversation viewer** ([#255](https://github.com/tintinweb/pi-subagents/pull/255) — thanks [@elrond298](https://github.com/elrond298)). The overlay closed on `Esc` and `q` but swallowed `Ctrl+C`, the reflex key for backing out of a full-screen TUI view, leaving the viewer stuck on screen for anyone who reached for it.
 

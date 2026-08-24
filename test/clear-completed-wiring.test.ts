@@ -2,15 +2,10 @@
  * clear-completed-wiring.test.ts — reproduces issue #108 end-to-end through the
  * REAL session lifecycle handlers + the REAL get_subagent_result tool.
  *
- * Bug: a background agent that has COMPLETED but whose result the LLM hasn't read
- * yet (resultConsumed=false) was wiped by clearCompleted() on session_start /
- * session_before_switch, so the next get_subagent_result returned "Agent not
- * found". The fix makes both handlers call clearCompleted(true), preserving
- * unread records (the 10-minute timer evicts them later).
- *
- * These tests exercise the wiring, not the manager method in isolation: spawn a
- * real background agent, let it complete, fire the real session event, then read
- * it back through the real tool — the exact path the reporter hit.
+ * Completed results now survive in the parent session's append-only ledger,
+ * rather than by leaking terminal AgentManager records across session switches.
+ * These tests pin both halves: a switched-to session cannot see the old result,
+ * while reopening the old branch reconstructs it through the real result tool.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,6 +24,7 @@ function makePi() {
   const tools = new Map<string, any>();
   const lifecycle = new Map<string, any>(); // pi.on(...) — session_start, session_before_switch, session_shutdown
   const events = new Map<string, any>(); // pi.events.on(...) — subagents:rpc:*, etc.
+  const entries: Array<{ customType: string; data?: unknown }> = [];
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
@@ -41,20 +37,20 @@ function makePi() {
         return vi.fn();
       }),
     },
-    appendEntry: vi.fn(),
+    appendEntry: vi.fn((customType: string, data?: unknown) => entries.push({ customType, data })),
     sendMessage: vi.fn(),
   } as any;
-  return { pi, tools, lifecycle, events };
+  return { pi, tools, lifecycle, events, entries };
 }
 
-function ctx() {
+function ctx(branch: unknown[] = [], sessionId = "s1") {
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+    sessionManager: { getSessionId: vi.fn(() => sessionId), getBranch: vi.fn(() => branch) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
 }
@@ -88,7 +84,7 @@ async function spawnCompletedBackgroundAgent(tools: Map<string, any>): Promise<s
   return id as string;
 }
 
-describe("issue #108: unread completed background agents survive session events", () => {
+describe("issue #108: unread completed background agents follow their parent session", () => {
   let tmpDir: string;
   let agentDir: string;
   let prevCwd: string;
@@ -121,38 +117,224 @@ describe("issue #108: unread completed background agents survive session events"
     vi.restoreAllMocks();
   });
 
-  it("session_before_switch (user switches sessions) does NOT wipe the unread result", async () => {
+  it("session_before_switch evicts the old session's terminal live record", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
 
-    // The exact #108 trigger: a session switch fires before the LLM read the result.
     await lifecycle.get("session_before_switch")?.();
 
     const res = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
-    const out = textOf(res);
-    expect(out).not.toContain("Agent not found");
-    expect(out).toContain("THE-RESULT-PAYLOAD");
+    expect(textOf(res)).toContain("Agent not found");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("session_start (/resume) does NOT wipe the unread result", async () => {
-    const { pi, tools, lifecycle } = makePi();
+  it("waits for an aborted running A agent to settle and persist before B can activate", async () => {
+    const { pi, tools, lifecycle, entries } = makePi();
+    subagentsExtension(pi);
+    const sessionA = ctx(entries, "session-a");
+    await lifecycle.get("session_start")?.({}, sessionA);
+
+    let aborted = false;
+    let settle!: () => void;
+    vi.mocked(runAgent).mockImplementation((_runCtx, _type, _prompt, options) =>
+      new Promise(resolve => {
+        options.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+        settle = () => resolve({
+          responseText: "A-DEFERRED-RESULT",
+          session: { dispose: vi.fn() } as any,
+          aborted: false,
+          steered: false,
+        });
+      }),
+    );
+
+    const spawned = await tools.get("Agent").execute(
+      "tc-running-a",
+      { prompt: "deferred", description: "Deferred A agent", subagent_type: "general-purpose", run_in_background: true },
+      undefined,
+      undefined,
+      sessionA,
+    );
+    const id = textOf(spawned).match(/Agent ID: (\S+)/)?.[1];
+    expect(id).toBeTruthy();
+
+    let switched = false;
+    const switching = lifecycle.get("session_before_switch")?.().then(() => { switched = true; });
+    await Promise.resolve();
+    expect(aborted).toBe(true);
+    expect(switched).toBe(false);
+
+    settle();
+    await switching;
+    expect(entries.some(entry =>
+      entry.customType === "subagents:record"
+      && JSON.stringify(entry.data).includes("A-DEFERRED-RESULT")
+    )).toBe(true);
+    const branchA = structuredClone(entries);
+
+    const sessionB = ctx([], "session-b");
+    await lifecycle.get("session_start")?.({}, sessionB);
+    const fromB = await tools.get("get_subagent_result").execute("tc-b", { agent_id: id }, undefined, undefined, sessionB);
+    expect(textOf(fromB)).toContain("Agent not found");
+    await lifecycle.get("agent_settled")?.({}, sessionB);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+
+    await lifecycle.get("session_before_switch")?.();
+    const reopenedA = ctx(branchA, "session-a");
+    await lifecycle.get("session_start")?.({}, reopenedA);
+    const fromA = await tools.get("get_subagent_result").execute("tc-a", { agent_id: id }, undefined, undefined, reopenedA);
+    expect(textOf(fromA)).toContain("A-DEFERRED-RESULT");
+
+    await lifecycle.get("session_shutdown")?.({}, reopenedA);
+  });
+
+  it("synchronously retries A persistence during switch before B can activate", async () => {
+    const { pi, tools, lifecycle, entries } = makePi();
+    subagentsExtension(pi);
+    const sessionA = ctx(entries, "session-a");
+    await lifecycle.get("session_start")?.({}, sessionA);
+
+    let settle!: () => void;
+    vi.mocked(runAgent).mockImplementation((_runCtx, _type, _prompt, options) =>
+      new Promise(resolve => {
+        settle = () => resolve({
+          responseText: "A-TRANSIENT-APPEND-RESULT",
+          session: { dispose: vi.fn() } as any,
+          aborted: false,
+          steered: false,
+        });
+        options.signal?.addEventListener("abort", () => {}, { once: true });
+      }),
+    );
+
+    const spawned = await tools.get("Agent").execute(
+      "tc-transient-a",
+      { prompt: "transient", description: "Transient A append", subagent_type: "general-purpose", run_in_background: true },
+      undefined,
+      undefined,
+      sessionA,
+    );
+    const id = textOf(spawned).match(/Agent ID: (\S+)/)?.[1];
+    expect(id).toBeTruthy();
+
+    const appendEntry = vi.mocked(pi.appendEntry);
+    const append = appendEntry.getMockImplementation()!;
+    let recordAttempts = 0;
+    appendEntry.mockImplementation((customType: string, data?: unknown) => {
+      if (customType === "subagents:record" && JSON.stringify(data).includes("A-TRANSIENT-APPEND-RESULT")) {
+        recordAttempts++;
+        if (recordAttempts === 1) throw new Error("transient A append failure");
+      }
+      return append(customType, data);
+    });
+
+    const switching = lifecycle.get("session_before_switch")?.();
+    await Promise.resolve();
+    settle();
+    await switching;
+
+    expect(recordAttempts).toBe(2);
+    expect(entries.some(entry =>
+      entry.customType === "subagents:record"
+      && JSON.stringify(entry.data).includes("A-TRANSIENT-APPEND-RESULT")
+    )).toBe(true);
+    const branchA = structuredClone(entries);
+
+    const sessionB = ctx([], "session-b");
+    await lifecycle.get("session_start")?.({}, sessionB);
+    expect(textOf(await tools.get("get_subagent_result").execute("tc-b", { agent_id: id }, undefined, undefined, sessionB)))
+      .toContain("Agent not found");
+
+    await lifecycle.get("session_before_switch")?.();
+    const reopenedA = ctx(branchA, "session-a");
+    await lifecycle.get("session_start")?.({}, reopenedA);
+    expect(textOf(await tools.get("get_subagent_result").execute("tc-a", { agent_id: id }, undefined, undefined, reopenedA)))
+      .toContain("A-TRANSIENT-APPEND-RESULT");
+
+    await lifecycle.get("session_shutdown")?.({}, reopenedA);
+  });
+
+  it("warns after bounded switch retries are exhausted and never carries A into B", async () => {
+    const { pi, tools, lifecycle, entries } = makePi();
+    subagentsExtension(pi);
+    const sessionA = ctx(entries, "session-a");
+    await lifecycle.get("session_start")?.({}, sessionA);
+
+    let settle!: () => void;
+    vi.mocked(runAgent).mockImplementation(() =>
+      new Promise(resolve => {
+        settle = () => resolve({
+          responseText: "A-EXHAUSTED-APPEND-RESULT",
+          session: { dispose: vi.fn() } as any,
+          aborted: false,
+          steered: false,
+        });
+      }),
+    );
+    const spawned = await tools.get("Agent").execute(
+      "tc-exhausted-a",
+      { prompt: "exhausted", description: "Exhausted A append", subagent_type: "general-purpose", run_in_background: true },
+      undefined,
+      undefined,
+      sessionA,
+    );
+    const id = textOf(spawned).match(/Agent ID: (\S+)/)?.[1];
+    expect(id).toBeTruthy();
+
+    const appendEntry = vi.mocked(pi.appendEntry);
+    const append = appendEntry.getMockImplementation()!;
+    let recordAttempts = 0;
+    appendEntry.mockImplementation((customType: string, data?: unknown) => {
+      if (customType === "subagents:record" && JSON.stringify(data).includes("A-EXHAUSTED-APPEND-RESULT")) {
+        recordAttempts++;
+        throw new Error("A record store offline");
+      }
+      return append(customType, data);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const switching = lifecycle.get("session_before_switch")?.();
+    await Promise.resolve();
+    settle();
+    await switching;
+
+    expect(recordAttempts).toBe(4);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(id as string));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("not attached to the next session"));
+    expect(entries.some(entry => JSON.stringify(entry.data).includes("A-EXHAUSTED-APPEND-RESULT"))).toBe(false);
+
+    const sessionB = ctx([], "session-b");
+    await lifecycle.get("session_start")?.({}, sessionB);
+    await lifecycle.get("agent_settled")?.({}, sessionB);
+    expect(recordAttempts).toBe(4);
+    expect(textOf(await tools.get("get_subagent_result").execute("tc-b", { agent_id: id }, undefined, undefined, sessionB)))
+      .toContain("Agent not found");
+
+    await lifecycle.get("session_shutdown")?.({}, sessionB);
+  });
+
+  it("session B cannot read A while reopening A restores its ledger result", async () => {
+    const { pi, tools, lifecycle, entries } = makePi();
     subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
+    const branchA = structuredClone(entries);
 
-    await lifecycle.get("session_start")?.({}, ctx());
+    await lifecycle.get("session_before_switch")?.();
+    await lifecycle.get("session_start")?.({}, ctx([], "session-b"));
+    const fromB = await tools.get("get_subagent_result").execute("tc-b", { agent_id: id }, undefined, undefined, ctx([], "session-b"));
+    expect(textOf(fromB)).toContain("Agent not found");
 
-    const res = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
-    const out = textOf(res);
-    expect(out).not.toContain("Agent not found");
-    expect(out).toContain("THE-RESULT-PAYLOAD");
+    await lifecycle.get("session_before_switch")?.();
+    await lifecycle.get("session_start")?.({}, ctx(branchA, "session-a"));
+    const fromA = await tools.get("get_subagent_result").execute("tc-a", { agent_id: id }, undefined, undefined, ctx(branchA, "session-a"));
+    expect(textOf(fromA)).toContain("THE-RESULT-PAYLOAD");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("once read, a session switch DOES evict it — the fix stays surgical, no leak", async () => {
+  it("a consumed terminal live record is also evicted on switch", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
@@ -161,7 +343,7 @@ describe("issue #108: unread completed background agents survive session events"
     const first = await tools.get("get_subagent_result").execute("tc-read1", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(first)).toContain("THE-RESULT-PAYLOAD");
 
-    // Now a session switch SHOULD clean it up (consumed records are not preserved).
+    // Session boundaries evict every terminal live manager record.
     await lifecycle.get("session_before_switch")?.();
 
     const second = await tools.get("get_subagent_result").execute("tc-read2", { agent_id: id }, undefined, undefined, ctx());

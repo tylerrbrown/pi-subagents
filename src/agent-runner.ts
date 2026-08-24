@@ -666,6 +666,8 @@ export async function runAgent(
   const agentDir = getAgentDir();
 
   // Extension loading:
+  // Local extensions are trusted executable code; these filters scope what the
+  // model sees and are not an authenticity check or sandbox.
   // - true  → all default-discovered extensions
   // - false → none (noExtensions)
   // - string[] → loader-level allowlist. Bare names keep the matching
@@ -1135,31 +1137,126 @@ export async function steerAgent(
 
 /**
  * Get the subagent's conversation messages as formatted text.
+ *
+ * With a budget, formatting stops as soon as the bound is reached instead of
+ * first materializing the whole transcript. The AgentRecord result remains
+ * untouched; this bounds only the durable conversation fallback.
  */
-export function getAgentConversation(session: AgentSession): string {
-  const parts: string[] = [];
-
-  for (const msg of session.messages) {
-    if (msg.role === "user") {
-      const text = typeof msg.content === "string"
-        ? msg.content
-        : extractText(msg.content);
-      if (text.trim()) parts.push(`[User]: ${text.trim()}`);
-    } else if (msg.role === "assistant") {
-      const textParts: string[] = [];
-      const toolCalls: string[] = [];
-      for (const c of msg.content) {
-        if (c.type === "text" && c.text) textParts.push(c.text);
-        else if (c.type === "toolCall") toolCalls.push(`  Tool: ${(c as any).name ?? (c as any).toolName ?? "unknown"}`);
+export function getAgentConversation(session: AgentSession, maxChars?: number): string {
+  if (maxChars === undefined) {
+    const parts: string[] = [];
+    for (const msg of session.messages) {
+      if (msg.role === "user") {
+        const text = typeof msg.content === "string" ? msg.content : extractText(msg.content);
+        if (text.trim()) parts.push(`[User]: ${text.trim()}`);
+      } else if (msg.role === "assistant") {
+        const textParts: string[] = [];
+        const toolCalls: string[] = [];
+        for (const c of msg.content) {
+          if (c.type === "text" && c.text) textParts.push(c.text);
+          else if (c.type === "toolCall") {
+            const call = c as typeof c & { name?: string; toolName?: string };
+            toolCalls.push(`  Tool: ${call.name ?? call.toolName ?? "unknown"}`);
+          }
+        }
+        if (textParts.length > 0) parts.push(`[Assistant]: ${textParts.join("\n")}`);
+        if (toolCalls.length > 0) parts.push(`[Tool Calls]:\n${toolCalls.join("\n")}`);
+      } else if (msg.role === "toolResult") {
+        const text = extractText(msg.content);
+        const truncated = text.length > 200 ? text.slice(0, 200) + "..." : text;
+        parts.push(`[Tool Result (${msg.toolName})]: ${truncated}`);
       }
-      if (textParts.length > 0) parts.push(`[Assistant]: ${textParts.join("\n")}`);
-      if (toolCalls.length > 0) parts.push(`[Tool Calls]:\n${toolCalls.join("\n")}`);
+    }
+    return parts.join("\n\n");
+  }
+
+  const budget = Math.max(0, Math.floor(maxChars));
+  const marker = "[Conversation truncated; use the child session or output transcript for the full conversation.]";
+  if (budget <= marker.length) return marker.slice(0, budget);
+  const contentBudget = budget - marker.length - 2;
+  const parts: string[] = [];
+  let length = 0;
+  let sectionCount = 0;
+  let truncated = false;
+
+  const append = (value: string, start = 0, end = value.length): boolean => {
+    const available = contentBudget - length;
+    const wanted = end - start;
+    if (wanted <= available) {
+      if (wanted > 0) parts.push(start === 0 && end === value.length ? value : value.slice(start, end));
+      length += wanted;
+      return true;
+    }
+    if (available > 0) parts.push(value.slice(start, start + available));
+    length += Math.max(0, available);
+    truncated = true;
+    return false;
+  };
+
+  const beginSection = (prefix: string): boolean => {
+    if (sectionCount > 0 && !append("\n\n")) return false;
+    sectionCount++;
+    return append(prefix);
+  };
+
+  const trimmedBounds = (value: string): [number, number] => {
+    let start = 0;
+    let end = value.length;
+    while (start < end && /\s/u.test(value[start])) start++;
+    while (end > start && /\s/u.test(value[end - 1])) end--;
+    return [start, end];
+  };
+
+  outer: for (const msg of session.messages) {
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        const [start, end] = trimmedBounds(msg.content);
+        if (start === end) continue;
+        if (!beginSection("[User]: ") || !append(msg.content, start, end)) break;
+      } else {
+        let began = false;
+        for (const content of msg.content) {
+          if (content.type !== "text" || !content.text) continue;
+          const [start, end] = trimmedBounds(content.text);
+          if (start === end) continue;
+          if (!began) {
+            if (!beginSection("[User]: ")) break outer;
+            began = true;
+          } else if (!append("\n")) break outer;
+          if (!append(content.text, start, end)) break outer;
+        }
+      }
+    } else if (msg.role === "assistant") {
+      let beganText = false;
+      for (const content of msg.content) {
+        if (content.type !== "text" || !content.text) continue;
+        if (!beganText) {
+          if (!beginSection("[Assistant]: ")) break outer;
+          beganText = true;
+        } else if (!append("\n")) break outer;
+        if (!append(content.text)) break outer;
+      }
+      let beganTools = false;
+      for (const content of msg.content) {
+        if (content.type !== "toolCall") continue;
+        const call = content as typeof content & { name?: string; toolName?: string };
+        if (!beganTools) {
+          if (!beginSection("[Tool Calls]:\n")) break outer;
+          beganTools = true;
+        } else if (!append("\n")) break outer;
+        if (!append(`  Tool: ${call.name ?? call.toolName ?? "unknown"}`)) break outer;
+      }
     } else if (msg.role === "toolResult") {
-      const text = extractText(msg.content);
-      const truncated = text.length > 200 ? text.slice(0, 200) + "..." : text;
-      parts.push(`[Tool Result (${msg.toolName})]: ${truncated}`);
+      let text = "";
+      for (const content of msg.content) {
+        if (content.type !== "text" || !content.text || text.length > 200) continue;
+        if (text) text += "\n";
+        text += content.text.slice(0, 201 - text.length);
+      }
+      const preview = text.length > 200 ? text.slice(0, 200) + "..." : text;
+      if (!beginSection(`[Tool Result (${msg.toolName})]: `) || !append(preview)) break;
     }
   }
 
-  return parts.join("\n\n");
+  return parts.join("") + (truncated ? `\n\n${marker}` : "");
 }

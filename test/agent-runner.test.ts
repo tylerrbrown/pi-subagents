@@ -706,6 +706,30 @@ describe("getAgentConversation", () => {
     expect(out).not.toContain("[Assistant]:");
     expect(out).toContain("[Tool Calls]:\n  Tool: search");
   });
+
+  it("honors a character budget incrementally and marks truncation without reading later blocks", () => {
+    const unread = {
+      type: "text",
+      get text(): string {
+        throw new Error("budgeted formatting read beyond its boundary");
+      },
+    };
+    const out = getAgentConversation(
+      fakeSession([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "x".repeat(1_000) },
+            unread,
+          ],
+        },
+      ]),
+      120,
+    );
+
+    expect(out.length).toBeLessThanOrEqual(120);
+    expect(out).toContain("Conversation truncated");
+  });
 });
 
 // ─── tool scoping (issues #47, #125) ─────────────────────────────────────

@@ -30,6 +30,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
+import { foldNotificationLedger, isPersistedAgentSnapshot, MAX_CAPTURE_CHARS, type NotificationAction, type PersistedAgentRecord, type PersistedAgentSnapshot, SUBAGENT_NOTIFICATION_VERSION, SUBAGENT_RECORD_VERSION } from "./notification-ledger.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { RELATIVE_PATH_GUIDANCE } from "./prompts.js";
 import { SubagentScheduler } from "./schedule.js";
@@ -156,15 +157,47 @@ function getStatusLabel(status: string, error?: string): string {
 
 /** Escape XML special characters to prevent injection in structured notifications. */
 function escapeXml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
-/** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
-  const status = getStatusLabel(record.status, record.error);
+function boundedText(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : value.slice(0, Math.max(0, maxChars - 1)) + "…";
+}
+
+/** Escape valid XML 1.0 text within a final-size budget. */
+function boundedXmlText(value: string, maxChars: number): string {
+  let escaped = "";
+  for (const char of value) {
+    const codePoint = char.codePointAt(0)!;
+    const valid = codePoint === 0x9
+      || codePoint === 0xa
+      || codePoint === 0xd
+      || (codePoint >= 0x20 && codePoint <= 0xd7ff)
+      || (codePoint >= 0xe000 && codePoint <= 0xfffd)
+      || (codePoint >= 0x10000 && codePoint <= 0x10ffff);
+    const next = escapeXml(valid ? char : "\ufffd");
+    if (escaped.length + next.length > maxChars - 1) return escaped + "…";
+    escaped += next;
+  }
+  return escaped;
+}
+
+type NotificationRecord = AgentRecord | PersistedAgentRecord;
+
+function isPersistedRecord(record: NotificationRecord): record is PersistedAgentRecord {
+  return "version" in record;
+}
+
+function getRecordOutputFile(record: NotificationRecord): string | undefined {
+  return isPersistedRecord(record) ? record.output.file : record.outputFile;
+}
+
+/** Format one complete, bounded Claude Code-style task notification. */
+function formatTaskNotification(record: NotificationRecord, showCost = false): string {
+  const status = getStatusLabel(record.status, record.error ? boundedText(record.error, 160) : undefined);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
-  const contextPercent = getSessionContextPercent(record.session);
+  const contextPercent = isPersistedRecord(record) ? record.contextPercent : getSessionContextPercent(record.session);
   const ctxXml = contextPercent !== null ? `<context_percent>${Math.round(contextPercent)}</context_percent>` : "";
   const compactXml = record.compactionCount ? `<compactions>${record.compactionCount}</compactions>` : "";
   // Only under `showCost`: this is LLM context, and a figure the orchestrator
@@ -173,19 +206,17 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
 
   const resultPreview = record.result
-    ? record.result.length > resultMaxLen
-      ? record.result.slice(0, resultMaxLen) + "\n...(truncated, use get_subagent_result for full output)"
-      : record.result
+    ? boundedText(record.result, 500) + (record.result.length > 500 ? "\n(truncated; retrieve by agent ID for full output)" : "")
     : "No output.";
 
   return [
     `<task-notification>`,
-    `<task-id>${record.id}</task-id>`,
-    record.toolCallId ? `<tool-use-id>${escapeXml(record.toolCallId)}</tool-use-id>` : null,
-    record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
-    `<status>${escapeXml(status)}</status>`,
-    `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
-    `<result>${escapeXml(resultPreview)}</result>`,
+    `<task-id>${boundedXmlText(record.id, 100)}</task-id>`,
+    record.toolCallId ? `<tool-use-id>${boundedXmlText(record.toolCallId, 300)}</tool-use-id>` : null,
+    getRecordOutputFile(record) ? `<output-file>${boundedXmlText(getRecordOutputFile(record)!, 500)}</output-file>` : null,
+    `<status>${boundedXmlText(status, 400)}</status>`,
+    `<summary>Agent "${boundedXmlText(record.description, 400)}" ${record.status}${getStatusNote(record.status)}</summary>`,
+    `<result>${boundedXmlText(resultPreview, 1_200)}</result>`,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
@@ -217,12 +248,12 @@ function buildDetails(
 }
 
 /** Build notification details for the custom message renderer. */
-function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, activity?: AgentActivity): NotificationDetails {
+function buildNotificationDetails(record: NotificationRecord, activity?: AgentActivity): NotificationDetails {
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
 
   return {
     id: record.id,
-    description: record.description,
+    description: boundedText(record.description, 200),
     status: record.status,
     toolUses: record.toolUses,
     turnCount: activity?.turnCount ?? 0,
@@ -233,13 +264,9 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     // be stuck with the old answer.
     totalCost: getLifetimeCost(record.lifetimeUsage),
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
-    outputFile: record.outputFile,
-    error: record.error,
-    resultPreview: record.result
-      ? record.result.length > resultMaxLen
-        ? record.result.slice(0, resultMaxLen) + "…"
-        : record.result
-      : "No output.",
+    outputFile: getRecordOutputFile(record) ? boundedText(getRecordOutputFile(record)!, 500) : undefined,
+    error: record.error ? boundedText(record.error, 200) : undefined,
+    resultPreview: record.result ? boundedText(record.result, 500) : "No output.",
   };
 }
 
@@ -385,87 +412,271 @@ export default function (pi: ExtensionAPI) {
   function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
   const pendingUsage = new PendingUsagePool();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  // ---- Durable completion notification ledger ----
   const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
+  const MAX_NOTIFICATION_CHARS = 12_000;
+  const MAX_NOTIFICATION_RECORDS = 3;
+  const MAX_NOTIFICATION_RETRIES = 3;
+  const MAX_SNAPSHOT_RETRY_RECORDS = 100;
+  const NOTIFICATION_RETRY_BASE_MS = 50;
+  // A queued result wait must observe completion before the held idle fast-path
+  // can fire, so successful waits can still suppress that redundant wake.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  let currentCtx: ExtensionContext | undefined;
+  let notificationTimer: ReturnType<typeof setTimeout> | undefined;
+  let notificationFlushActive = false;
+  let persistedRecords = new Map<string, PersistedAgentRecord>();
+  let pendingNotificationIds = new Set<string>();
+  let claimedNotificationIds = new Set<string>();
+  let consumedNotificationIds = new Set<string>();
+  const snapshotRetries = new Map<string, { record: AgentRecord; attempts: number }>();
+  let wakeRetryAttempts = 0;
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
+  function cancelNotificationTimer(): void {
+    if (notificationTimer !== undefined) clearTimeout(notificationTimer);
+    notificationTimer = undefined;
   }
 
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
+  function invalidateNotificationTimer(): void {
+    cancelNotificationTimer();
+    snapshotRetries.clear();
+    wakeRetryAttempts = 0;
+  }
+
+  function appendNotificationTransition(action: NotificationAction, agentIds: string[]): void {
+    if (agentIds.length === 0) return;
+    pi.appendEntry("subagents:notification", {
+      version: SUBAGENT_NOTIFICATION_VERSION,
+      action,
+      agentIds,
+    });
+  }
+
+  function applyNotificationTransition(action: NotificationAction, agentIds: string[]): void {
+    for (const id of agentIds) {
+      pendingNotificationIds.delete(id);
+      if (action === "wake_claimed") claimedNotificationIds.add(id);
+      else consumedNotificationIds.add(id);
+    }
+  }
+
+  function snapshotRecord(record: AgentRecord, notificationPending: boolean): PersistedAgentSnapshot | undefined {
+    if (record.status === "queued" || record.status === "running" || record.completedAt === undefined) return undefined;
+    const messages = record.session?.messages;
+    // Deliberately copy a bounded fallback into the parent session: the child
+    // runtime may be gone after restart. Full result text is not truncated, and
+    // the child/output paths below retain the underlying transcript location.
+    const conversation = messages ? getAgentConversation(record.session!, MAX_CAPTURE_CHARS) : undefined;
+    const snapshot = {
+      version: SUBAGENT_RECORD_VERSION,
+      id: record.id,
+      handles: { handle: record.handle, alias: record.alias },
+      type: record.type,
+      description: record.description,
+      status: record.status,
+      result: record.result,
+      error: record.error,
+      toolUses: record.toolUses,
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
+      lifetimeUsage: { ...record.lifetimeUsage },
+      compactionCount: record.compactionCount,
+      contextPercent: getSessionContextPercent(record.session),
+      toolCallId: record.toolCallId,
+      isBackground: record.isBackground,
+      output: { file: record.outputFile, sessionFile: record.sessionFile },
+      conversation,
+      notificationPending,
+    };
+    return isPersistedAgentSnapshot(snapshot) ? snapshot : undefined;
+  }
+
+  function appendCompletedRecord(record: AgentRecord, notificationPending: boolean, force = false): boolean {
+    const snapshot = snapshotRecord(record, notificationPending);
+    if (!snapshot) return false;
+    const previous = persistedRecords.get(record.id);
+    const duplicate = previous?.version === SUBAGENT_RECORD_VERSION
+      && previous.startedAt === snapshot.startedAt
+      && previous.completedAt === snapshot.completedAt
+      && previous.result === snapshot.result
+      && previous.notificationPending === snapshot.notificationPending;
+    if (!duplicate || force) pi.appendEntry("subagents:record", snapshot);
+    persistedRecords.set(record.id, snapshot);
+    snapshotRetries.delete(record.id);
+    if (!notificationPending) pendingNotificationIds.delete(record.id);
+    if (!duplicate) {
+      claimedNotificationIds.delete(record.id);
+      consumedNotificationIds.delete(record.id);
+    }
+    return true;
+  }
+
+  function queueSnapshotRetry(record: AgentRecord): void {
+    if (!snapshotRetries.has(record.id)) {
+      if (snapshotRetries.size >= MAX_SNAPSHOT_RETRY_RECORDS) return;
+      snapshotRetries.set(record.id, { record, attempts: 0 });
+    }
+    scheduleIdleNotificationFlush(NOTIFICATION_RETRY_BASE_MS);
+  }
+
+  function retrySnapshotPersistence(): string[] {
+    const exhausted: string[] = [];
+    for (const [id, retry] of snapshotRetries) {
+      if (manager.getRecord(id) !== retry.record) {
+        snapshotRetries.delete(id);
+        continue;
+      }
+      retry.attempts++;
+      try {
+        const pending = !retry.record.resultConsumed && retry.record.isBackground !== false;
+        if (appendCompletedRecord(retry.record, pending)) {
+          finishPersistedCompletion(retry.record);
+          continue;
+        }
+      } catch { /* count the failed append below */ }
+      if (retry.attempts >= MAX_NOTIFICATION_RETRIES) {
+        snapshotRetries.delete(id);
+        exhausted.push(id);
+      }
+    }
+    return exhausted;
+  }
+
+  function drainSnapshotPersistenceRetries(): string[] {
+    const exhausted: string[] = [];
+    while (snapshotRetries.size > 0) exhausted.push(...retrySnapshotPersistence());
+    return exhausted;
+  }
+
+  function canFlushNotifications(): boolean {
+    if (!currentCtx) return false;
+    return (currentCtx.isIdle?.() ?? true) && !(currentCtx.hasPendingMessages?.() ?? false);
+  }
+
+  function flushPendingNotifications(): void {
+    if (notificationFlushActive || pendingNotificationIds.size === 0 || !canFlushNotifications()) return;
+    notificationFlushActive = true;
+    try {
+      const records = [...pendingNotificationIds]
+        .filter(id => !consumedNotificationIds.has(id) && !claimedNotificationIds.has(id))
+        .map(id => persistedRecords.get(id))
+        .filter((record): record is PersistedAgentRecord => record !== undefined);
+      if (records.length === 0) return;
+
+      const selected = records.slice(0, MAX_NOTIFICATION_RECORDS);
+      const notifications = selected.map(record => formatTaskNotification(record, showCost)).join("\n\n");
+      const [first, ...rest] = selected;
+      const details = buildNotificationDetails(first);
+      if (rest.length > 0) details.others = rest.map(record => buildNotificationDetails(record));
+      const ids = records.map(record => record.id);
+      const omitted = records.length - selected.length;
+      const omission = omitted > 0
+        ? ` ${omitted} omitted from this bounded wake; retrieve every result with the agent IDs returned by Agent.`
+        : "";
+      const content = `Background agent completion${records.length === 1 ? "" : "s"}: ${records.length} finished.${omission}\n\n${notifications}\n\nUse get_subagent_result for full output.`;
+      if (content.length > MAX_NOTIFICATION_CHARS) return;
+
+      // Ponytail: append-before-send provides at-most-once wake attempts, not a
+      // receipt; Pi-core idempotency keys/receipts are the exactly-once upgrade.
+      try {
+        appendNotificationTransition("wake_claimed", ids);
+      } catch {
+        wakeRetryAttempts++;
+        if (wakeRetryAttempts < MAX_NOTIFICATION_RETRIES) {
+          scheduleIdleNotificationFlush(NOTIFICATION_RETRY_BASE_MS * 2 ** (wakeRetryAttempts - 1));
+        }
+        return;
+      }
+      wakeRetryAttempts = 0;
+      applyNotificationTransition("wake_claimed", ids);
+      try {
+        pi.sendMessage<NotificationDetails>({
+          customType: "subagent-notification",
+          content,
+          display: true,
+          details,
+        }, { triggerTurn: true });
+      } catch { /* the durable wake claim prevents an unsafe duplicate attempt */ }
+    } finally {
+      notificationFlushActive = false;
+    }
+  }
+
+  function scheduleIdleNotificationFlush(delay = NUDGE_HOLD_MS): void {
+    if (notificationTimer !== undefined) clearTimeout(notificationTimer);
+    notificationTimer = setTimeout(() => {
+      notificationTimer = undefined;
+      retrySnapshotPersistence();
+      flushPendingNotifications();
+      const retryAttempts = [...snapshotRetries.values()].map(retry => retry.attempts);
+      if (retryAttempts.length > 0) {
+        const nextAttempt = Math.min(...retryAttempts);
+        scheduleIdleNotificationFlush(NOTIFICATION_RETRY_BASE_MS * 2 ** nextAttempt);
+      }
+    }, delay);
+  }
+
+  function makeNotificationEligible(records: AgentRecord[]): void {
+    if (wakeRetryAttempts >= MAX_NOTIFICATION_RETRIES) wakeRetryAttempts = 0;
+    for (const record of records) {
+      if (record.resultConsumed || consumedNotificationIds.has(record.id) || claimedNotificationIds.has(record.id)) continue;
+      pendingNotificationIds.add(record.id);
+    }
+    if (pendingNotificationIds.size > 0) scheduleIdleNotificationFlush();
+  }
+
+  function consumeNotification(id: string): void {
+    if (!consumedNotificationIds.has(id)) {
+      appendNotificationTransition("consumed", [id]);
+      applyNotificationTransition("consumed", [id]);
+    }
+    if (pendingNotificationIds.size === 0 && notificationTimer !== undefined) {
+      clearTimeout(notificationTimer);
+      notificationTimer = undefined;
     }
   }
 
   // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500, showCost);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
-      customType: "subagent-notification",
-      content: notification + footer,
-      display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
-  }
-
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    makeNotificationEligible([record]);
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
-    (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
-
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
-          details,
-        }, { deliverAs: "followUp", triggerTurn: true });
-      });
+    (records, _partial) => {
+      for (const record of records) {
+        agentActivity.delete(record.id);
+        widget.markFinished(record.id);
+        fleet.onAgentFinished(record.id);
+      }
+      makeNotificationEligible(records);
       widget.update();
     },
     30_000,
   );
+
+  function finishPersistedCompletion(record: AgentRecord): void {
+    if (record.resultConsumed) {
+      agentActivity.delete(record.id);
+      widget.markFinished(record.id);
+      fleet.onAgentFinished(record.id);
+      widget.update();
+      return;
+    }
+
+    // Batch finalization will route it after all parallel calls are known.
+    if (currentBatchAgents.some(agent => agent.id === record.id)) {
+      widget.update();
+      return;
+    }
+
+    if (groupJoin.onAgentComplete(record) === "pass") sendIndividualNudge(record);
+    widget.update();
+  }
 
   /** Helper: build event data for lifecycle events from an AgentRecord. */
   function buildEventData(record: AgentRecord) {
@@ -508,8 +719,9 @@ export default function (pi: ExtensionAPI) {
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     // Nested children report only through their owning parent's scoped tools.
-    // Keep them out of top-level lifecycle, transcript, notification, and UI channels.
-    if (record.parentAgentId) return;
+    // A timed-out switch may also detach a non-cooperative child record; ignore
+    // its eventual late callback rather than appending it into the next session.
+    if (record.parentAgentId || manager.getRecord(record.id) !== record) return;
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -520,15 +732,14 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
-
-    // Skip notification if result was already consumed via get_subagent_result
-    if (record.resultConsumed) {
+    // Persistence is the eligibility boundary. A failed append must not escape
+    // the manager completion callback and must never wake from uncommitted data.
+    let persisted = false;
+    try {
+      persisted = appendCompletedRecord(record, !record.resultConsumed && record.isBackground !== false);
+    } catch { /* completion still settles locally; retry remains timer-owned */ }
+    if (!persisted) {
+      queueSnapshotRetry(record);
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
@@ -536,20 +747,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // If this agent is pending batch finalization (debounce window still open),
-    // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
-      widget.update();
-      return;
-    }
-
-    const result = groupJoin.onAgentComplete(record);
-    if (result === 'pass') {
-      sendIndividualNudge(record);
-    }
-    // 'held' → do nothing, group will fire later
-    // 'delivered' → group callback already fired
-    widget.update();
+    finishPersistedCompletion(record);
   }, undefined, (record) => {
     if (record.parentAgentId) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
@@ -666,6 +864,15 @@ export default function (pi: ExtensionAPI) {
     return resolved?.kind === "live" ? resolved.record : undefined;
   };
 
+  const resolvePersistedAgentRef = (ref: string): PersistedAgentRecord | undefined => {
+    const byId = persistedRecords.get(ref);
+    if (byId) return byId;
+    const normalized = ref.replace(/^@/, "").toLowerCase();
+    return [...persistedRecords.values()].find(record =>
+      record.handles.handle?.toLowerCase() === normalized || record.handles.alias?.toLowerCase() === normalized,
+    );
+  };
+
   const registryEntry = {
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
@@ -681,7 +888,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   // --- Cross-extension RPC via pi.events ---
-  let currentCtx: ExtensionContext | undefined;
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -690,6 +896,8 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  let sessionSwitchPromise: Promise<void> | undefined;
+  let shutdownPromise: Promise<void> | undefined;
   /** Whether the `@handle` autocomplete wrapper has been stacked on pi's provider. */
   let mentionProviderRegistered = false;
 
@@ -718,12 +926,19 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    invalidateNotificationTimer();
     currentCtx = ctx;
+    const ledger = foldNotificationLedger(ctx.sessionManager.getBranch());
+    persistedRecords = ledger.records;
+    pendingNotificationIds = ledger.pending;
+    claimedNotificationIds = ledger.claimed;
+    consumedNotificationIds = ledger.consumed;
+    if (pendingNotificationIds.size > 0) scheduleIdleNotificationFlush();
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
     }
-    manager.clearCompleted(true);
+    manager.clearCompleted();
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -763,6 +978,11 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("agent_settled", (_event, ctx) => {
+    currentCtx = ctx;
+    flushPendingNotifications();
+  });
+
   /** Agent types `@` can start, in the shape the roster wants. */
   const mentionTypes = (): TypeInfo[] =>
     getAvailableTypes().map(name => ({ name, description: getAgentConfig(name)?.description ?? name }));
@@ -780,6 +1000,7 @@ export default function (pi: ExtensionAPI) {
    * notification either way.
    */
   pi.on("input", async (event, ctx) => {
+    currentCtx = ctx;
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
@@ -990,34 +1211,74 @@ export default function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
 
-  pi.on("session_before_switch", () => {
-    manager.clearCompleted(true);
-    scheduler.stop();
+  pi.on("session_before_switch", async () => {
+    if (sessionSwitchPromise) return sessionSwitchPromise;
+    sessionSwitchPromise = (async () => {
+      // Stop timer-owned delivery without discarding A's pending snapshots.
+      // They are drained synchronously below while appendEntry still targets A.
+      cancelNotificationTimer();
+      manager.abortAll();
+      // Keep A active until every cooperative completion callback has appended
+      // to A. AgentManager bounds the stopped-run wait through child disposal.
+      await manager.waitForAll();
+
+      // A completion may have armed a retry while settling. Exhaust its existing
+      // bounded attempts synchronously while appendEntry still targets A; no
+      // retry may survive long enough to attach the record to B.
+      cancelNotificationTimer();
+      const exhaustedSnapshots = drainSnapshotPersistenceRetries();
+      if (exhaustedSnapshots.length > 0) {
+        console.warn(
+          `[pi-subagents] Failed to persist ${exhaustedSnapshots.length} agent completion record(s) `
+          + `after ${MAX_NOTIFICATION_RETRIES} retries during session switch; records were not attached to the next session: `
+          + exhaustedSnapshots.join(", "),
+        );
+      }
+      invalidateNotificationTimer();
+      currentCtx = undefined;
+      persistedRecords.clear();
+      pendingNotificationIds.clear();
+      claimedNotificationIds.clear();
+      consumedNotificationIds.clear();
+      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = undefined;
+      currentBatchAgents = [];
+      groupJoin.dispose();
+      agentActivity.clear();
+      manager.clearCompleted();
+      scheduler.stop();
+    })();
+    try {
+      await sessionSwitchPromise;
+    } finally {
+      sessionSwitchPromise = undefined;
+    }
   });
 
-  // On shutdown, abort all agents immediately and clean up.
-  // If the session is going down, there's nothing left to consume agent results.
-  pi.on("session_shutdown", async () => {
-    rpcHandle?.unsubSpawn();
-    rpcHandle?.unsubStop();
-    rpcHandle?.unsubPing();
-    rpcHandle = undefined;
-    currentCtx = undefined;
-    // Only release the global slot if this activation claimed it — a child
-    // session's shutdown must not delete the root session's registry entry.
-    if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
-      delete (globalThis as any)[MANAGER_KEY];
-    }
-    scheduler.stop();
-    manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
-    fleet.dispose();
-    // Awaited: it emits `session_shutdown` into every retained child session so
-    // extensions bound there can release what they armed in `session_start` (#242).
-    // pi awaits this handler, and the process exits right after — unawaited, those
-    // handlers would never run. Internally bounded, so a hung one can't strand quit.
-    await manager.dispose();
+  // On shutdown, abort all agents immediately and clean up. Idempotent because
+  // hosts may deliver shutdown after a completed session switch.
+  pi.on("session_shutdown", () => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      if (sessionSwitchPromise) await sessionSwitchPromise;
+      invalidateNotificationTimer();
+      rpcHandle?.unsubSpawn();
+      rpcHandle?.unsubStop();
+      rpcHandle?.unsubPing();
+      rpcHandle = undefined;
+      currentCtx = undefined;
+      // Only release the global slot if this activation claimed it — a child
+      // session's shutdown must not delete the root session's registry entry.
+      if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
+        delete (globalThis as any)[MANAGER_KEY];
+      }
+      scheduler.stop();
+      manager.abortAll();
+      fleet.dispose();
+      // Awaited and internally bounded so child extension shutdown cannot strand quit.
+      await manager.dispose();
+    })();
+    return shutdownPromise;
   });
 
   // Live widget: show running agents above editor.
@@ -1646,6 +1907,7 @@ Terse command-style prompts produce shallow, generic work.
     // ---- Execute ----
 
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+      currentCtx = ctx;
       // Ensure we have UI context for widget rendering
       widget.setUICtx(ctx.ui as UICtx);
 
@@ -1874,6 +2136,12 @@ Terse command-style prompts produce shallow, generic work.
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
+        // Foreground resume bypasses AgentManager.onComplete. Persist its fresh
+        // terminal answer as inline-consumed before any return can expose it.
+        if (!appendCompletedRecord(record, false, true)) {
+          throw new Error(`Could not persist resumed agent "${params.resume}".`);
+        }
+        record.resultConsumed = true;
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
@@ -2151,31 +2419,36 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
-      const record = resolveAgentRef(params.agent_id);
-      if (!record || record.parentAgentId) {
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+      currentCtx = ctx;
+      const liveRecord = resolveAgentRef(params.agent_id);
+      if (liveRecord?.parentAgentId) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+      const record: NotificationRecord | undefined = liveRecord ?? resolvePersistedAgentRef(params.agent_id);
+      if (!record) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
-      // Wait for completion if requested. Cancellation stops only this tool
-      // call; the background agent keeps running and remains unconsumed so its
-      // completion notification can still be delivered.
-      // Queued agents have no promise yet (it's created when the queue starts
-      // them), so poll until they leave the queue, then await like a running one.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
-        while (record.status === "queued") {
+      // Wait for completion if requested. Persisted records are terminal
+      // snapshots; queued/running waiting semantics remain live-manager owned.
+      if (liveRecord && params.wait && (liveRecord.status === "running" || liveRecord.status === "queued")) {
+        while (liveRecord.status === "queued") {
           await abortable(
             new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
             signal,
           );
         }
-        if (record.promise) await abortable(record.promise, signal);
+        if (liveRecord.promise) await abortable(liveRecord.promise, signal);
       }
+
+      const terminal = record.status !== "running" && record.status !== "queued";
+      const needsConsumption = terminal && !consumedNotificationIds.has(record.id);
 
       const displayName = getDisplayName(record.type);
       const duration = formatDuration(record.startedAt, record.completedAt);
       const tokens = formatLifetimeTokens(record);
-      const contextPercent = getSessionContextPercent(record.session);
+      const contextPercent = isPersistedRecord(record) ? record.contextPercent : getSessionContextPercent(record.session);
       const statsParts = [`Tool uses: ${record.toolUses}`];
       if (tokens) statsParts.push(tokens);
       if (showCost) {
@@ -2194,26 +2467,34 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status === "running") {
         output += "Agent is still running. Use wait: true or check back later.";
       } else if (record.status === "error") {
-        output += `Error: ${record.error}${partialOutputSuffix(record)}`;
+        output += `Error: ${record.error}${partialOutputSuffix(record as AgentRecord)}`;
       } else {
         output += record.result?.trim() || "No output.";
       }
 
-      // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
-        record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+      if (params.verbose) {
+        const conversation = isPersistedRecord(record)
+          ? record.conversation
+          : record.session ? getAgentConversation(record.session) : undefined;
+        if (conversation) output += `\n\n--- Agent Conversation ---\n${conversation}`;
+        output += `\n\n--- Delivery Audit ---\nWake claimed: ${claimedNotificationIds.has(record.id) ? "yes" : "no"}\nConsumed: ${terminal ? "yes" : "no"}`;
       }
 
-      // Verbose: include full conversation
-      if (params.verbose && record.session) {
-        const conversation = getAgentConversation(record.session);
-        if (conversation) {
-          output += `\n\n--- Agent Conversation ---\n${conversation}`;
+      const result = textResult(output);
+      // Build the complete result first. The synchronous appends are the final
+      // operations before return, so failures reject without acknowledging data
+      // the caller never received.
+      if (needsConsumption) {
+        if (liveRecord) {
+          const pending = !liveRecord.resultConsumed && liveRecord.isBackground !== false;
+          if (!appendCompletedRecord(liveRecord, pending, true)) {
+            throw new Error(`Could not persist completed agent "${record.id}".`);
+          }
         }
+        consumeNotification(record.id);
+        if (liveRecord) liveRecord.resultConsumed = true;
       }
-
-      return textResult(output);
+      return result;
     },
   }));
 

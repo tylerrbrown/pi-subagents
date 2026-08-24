@@ -202,6 +202,11 @@ interface ResumeOptions {
 /** Best-effort ceiling on one child's shutdown handlers, so teardown can't strand a quit. */
 const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
 
+/** Stamp a terminal boundary that never precedes the run boundary. */
+function completeRecord(record: AgentRecord): void {
+  record.completedAt = Math.max(record.completedAt ?? Date.now(), record.startedAt);
+}
+
 /**
  * Close the extension lifecycle `runAgent` opened with `bindExtensions`, then dispose.
  *
@@ -252,8 +257,16 @@ export class AgentManager {
 
   /** Queue of background agents waiting to start. */
   private queue: { id: string; start: () => void }[] = [];
-  /** Number of currently running background agents. */
-  private runningBackground = 0;
+  /** Top-level background records that currently own a concurrency slot. */
+  private backgroundSlots = new Set<string>();
+
+  private acquireBackgroundSlot(record: AgentRecord): void {
+    if (occupiesPoolSlot(record)) this.backgroundSlots.add(record.id);
+  }
+
+  private releaseBackgroundSlot(record: AgentRecord): boolean {
+    return this.backgroundSlots.delete(record.id);
+  }
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -366,7 +379,7 @@ export class AgentManager {
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
-    if (occupiesPoolSlot(record) && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+    if (occupiesPoolSlot(record) && !options.bypassQueue && this.backgroundSlots.size >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ id, start: () => this.startAgent(id, record, args) });
       return id;
@@ -377,7 +390,9 @@ export class AgentManager {
     try {
       this.startAgent(id, record, args);
     } catch (err) {
+      const released = this.releaseBackgroundSlot(record);
       this.agents.delete(id);
+      if (released) this.drainQueue();
       throw err;
     }
     return id;
@@ -422,7 +437,7 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
-    if (occupiesPoolSlot(record)) this.runningBackground++;
+    this.acquireBackgroundSlot(record);
     this.onStart?.(record);
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
@@ -518,7 +533,7 @@ export class AgentManager {
         }
         record.result = responseText;
         record.session = session;
-        record.completedAt ??= Date.now();
+        completeRecord(record);
 
         detach();
 
@@ -549,7 +564,7 @@ export class AgentManager {
           record.resultConsumed = true;
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
         } else {
-          if (occupiesPoolSlot(record)) this.runningBackground--;
+          this.releaseBackgroundSlot(record);
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
           this.drainQueue();
         }
@@ -561,7 +576,7 @@ export class AgentManager {
           record.status = "error";
         }
         record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt ??= Date.now();
+        completeRecord(record);
 
         detach();
 
@@ -587,7 +602,7 @@ export class AgentManager {
           record.resultConsumed = true;
           this.onComplete?.(record);
         } else {
-          if (occupiesPoolSlot(record)) this.runningBackground--;
+          this.releaseBackgroundSlot(record);
           this.onComplete?.(record);
           this.drainQueue();
         }
@@ -616,7 +631,7 @@ export class AgentManager {
 
   /** Start queued agents up to the concurrency limit. */
   private drainQueue() {
-    while (this.queue.length > 0 && this.runningBackground < this.maxConcurrent) {
+    while (this.queue.length > 0 && this.backgroundSlots.size < this.maxConcurrent) {
       const next = this.queue.shift()!;
       const record = this.agents.get(next.id);
       if (!record || record.status !== "queued") continue;
@@ -625,9 +640,10 @@ export class AgentManager {
       } catch (err) {
         // Late failure (e.g. strict worktree-isolation) — surface on the record
         // so the user/agent can see it via /agents, then keep draining.
+        this.releaseBackgroundSlot(record);
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt = Date.now();
+        completeRecord(record);
         this.onComplete?.(record);
       }
     }
@@ -711,7 +727,7 @@ export class AgentManager {
       record.status = "queued";
 
       const start = () => this.startResume(id, record, prompt, signal, options);
-      if (occupiesPoolSlot(record) && this.runningBackground >= this.maxConcurrent) {
+      if (occupiesPoolSlot(record) && this.backgroundSlots.size >= this.maxConcurrent) {
         // At the concurrency limit — queue it, drains when a slot frees.
         this.queue.push({ id, start });
       } else {
@@ -720,9 +736,9 @@ export class AgentManager {
       return record;
     }
 
-    // Foreground resume: run inline and return the settled record.
+    // Foreground resume: establish the new run boundary before work begins.
     record.status = "running";
-    record.startedAt = Date.now();
+    record.startedAt = Math.max(Date.now(), record.startedAt + 1);
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
@@ -750,11 +766,11 @@ export class AgentManager {
       record.status = failure ? "error" : "completed";
       if (failure) record.error = failure;
       record.result = text;
-      record.completedAt = Date.now();
+      completeRecord(record);
     } catch (err) {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      completeRecord(record);
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -781,8 +797,10 @@ export class AgentManager {
     if (!record.session) return;
 
     record.status = "running";
-    record.startedAt = Date.now();
-    if (occupiesPoolSlot(record)) this.runningBackground++;
+    // A queued resume retains the previous run's timestamp until this exact
+    // start point; frozen/low-resolution clocks still produce a fresh boundary.
+    record.startedAt = Math.max(Date.now(), record.startedAt + 1);
+    this.acquireBackgroundSlot(record);
     this.onStart?.(record);
 
     // Fresh abort controller so /agents stop and steering target THIS run rather
@@ -814,7 +832,7 @@ export class AgentManager {
       }
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
-      if (occupiesPoolSlot(record)) this.runningBackground--;
+      this.releaseBackgroundSlot(record);
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
     };
@@ -845,7 +863,7 @@ export class AgentManager {
           if (failure) record.error = failure;
         }
         record.result = text;
-        record.completedAt ??= Date.now();
+        completeRecord(record);
         settle();
         return text;
       })
@@ -854,7 +872,7 @@ export class AgentManager {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
-        record.completedAt ??= Date.now();
+        completeRecord(record);
         settle();
         return "";
       });
@@ -966,14 +984,14 @@ export class AgentManager {
     if (record.status === "queued") {
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
-      record.completedAt = Date.now();
+      completeRecord(record);
       return true;
     }
 
     if (record.status !== "running") return false;
     record.abortController?.abort();
     record.status = "stopped";
-    record.completedAt = Date.now();
+    completeRecord(record);
     return true;
   }
 
@@ -985,6 +1003,8 @@ export class AgentManager {
     // nothing can observe a session that is half torn down.
     record.session = undefined;
     this.agents.delete(id);
+    const released = this.releaseBackgroundSlot(record);
+    if (released) this.drainQueue();
     // Fire-and-forget is right here and only here: this runs from the 60s cleanup timer
     // and from `clearCompleted()` on session boundaries, with the process staying alive,
     // so handlers get their full window. The quit path awaits instead — see dispose().
@@ -1061,7 +1081,7 @@ export class AgentManager {
       const record = this.agents.get(queued.id);
       if (record) {
         record.status = "stopped";
-        record.completedAt = Date.now();
+        completeRecord(record);
         count++;
       }
     }
@@ -1071,7 +1091,7 @@ export class AgentManager {
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
-        record.completedAt = Date.now();
+        completeRecord(record);
         count++;
       }
     }
@@ -1084,11 +1104,33 @@ export class AgentManager {
     // agents finish they start queued ones, which need awaiting too.
     while (true) {
       this.drainQueue();
-      const pending = [...this.agents.values()]
-        .filter(r => r.status === "running" || r.status === "queued")
-        .map(r => r.promise)
-        .filter(Boolean);
+      const records = [...this.agents.values()];
+      const pending = records
+        .map(record => record.promise)
+        .filter((promise): promise is Promise<string> => promise !== undefined);
+      const active = records.some(record => record.status === "running" || record.status === "queued");
       if (pending.length === 0) break;
+
+      if (!active) {
+        // abortAll() marks records stopped synchronously, but their promises
+        // still own the final result/persistence callback. Wait for that work;
+        // if a child ignores abort, reuse the child-session shutdown ceiling so
+        // a session switch cannot hang forever.
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const timedOut = await Promise.race([
+          Promise.allSettled(pending).then(() => false),
+          new Promise<true>(resolve => {
+            timeout = setTimeout(() => resolve(true), CHILD_SHUTDOWN_TIMEOUT_MS);
+            timeout.unref();
+          }),
+        ]);
+        if (timeout !== undefined) clearTimeout(timeout);
+        if (timedOut) {
+          await Promise.all(records.map(record => shutdownChildSession(record.session)));
+        }
+        break;
+      }
+
       await Promise.allSettled(pending);
     }
   }
@@ -1097,7 +1139,9 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     // Clear queue
     this.queue = [];
-    const sessions = [...this.agents.values()].map(record => record.session);
+    const records = [...this.agents.values()];
+    const sessions = records.map(record => record.session);
+    for (const record of records) this.releaseBackgroundSlot(record);
     this.agents.clear();
     // Awaited, unlike the eviction path: pi awaits this extension's `session_shutdown`
     // handler and the process exits right after it returns, so anything left unawaited

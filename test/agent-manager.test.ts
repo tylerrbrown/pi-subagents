@@ -1663,6 +1663,49 @@ describe("AgentManager — waitForAll", () => {
     }
   });
 
+  it("releases a timed-out detached run exactly once so late settlement cannot over-admit the queue", async () => {
+    vi.useFakeTimers();
+    try {
+      const starts: string[] = [];
+      const resolvers = new Map<string, (value: any) => void>();
+      vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any) => {
+        starts.push(prompt as string);
+        return new Promise(resolve => { resolvers.set(prompt as string, resolve); });
+      });
+
+      manager = new AgentManager(undefined, 1);
+      const a = manager.spawn(mockPi, mockCtx, "X", "A", { description: "A", isBackground: true });
+      const aPromise = manager.getRecord(a)!.promise!;
+      manager.abortAll();
+
+      const waiting = manager.waitForAll();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await waiting;
+      manager.clearCompleted();
+
+      const b = manager.spawn(mockPi, mockCtx, "X", "B", { description: "B", isBackground: true });
+      const c = manager.spawn(mockPi, mockCtx, "X", "C", { description: "C", isBackground: true });
+      expect(manager.getRecord(b)?.status).toBe("running");
+      expect(manager.getRecord(c)?.status).toBe("queued");
+      expect(starts).toEqual(["A", "B"]);
+
+      resolvers.get("A")!({ responseText: "late A", session: mockSession(), aborted: false, steered: false });
+      await aPromise;
+      expect(manager.getRecord(c)?.status).toBe("queued");
+      expect(starts).toEqual(["A", "B"]);
+
+      resolvers.get("B")!({ responseText: "B done", session: mockSession(), aborted: false, steered: false });
+      await manager.getRecord(b)!.promise;
+      expect(manager.getRecord(c)?.status).toBe("running");
+      expect(starts).toEqual(["A", "B", "C"]);
+
+      resolvers.get("C")!({ responseText: "C done", session: mockSession(), aborted: false, steered: false });
+      await manager.getRecord(c)!.promise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("resolves immediately when nothing is pending", async () => {
     manager = new AgentManager();
     await expect(manager.waitForAll()).resolves.toBeUndefined();
@@ -1677,6 +1720,99 @@ describe("AgentManager — waitForAll", () => {
 
     await expect(manager.waitForAll()).resolves.toBeUndefined();
     expect(manager.getRecord(id)?.status).toBe("error");
+  });
+});
+
+describe("AgentManager — monotonic resume run boundaries", () => {
+  let manager: AgentManager;
+  let now: ReturnType<typeof vi.spyOn>;
+
+  afterEach(() => {
+    manager?.dispose();
+    now?.mockRestore();
+  });
+
+  async function spawnSettled(): Promise<string> {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+    });
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "first",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    return id;
+  }
+
+  it("assigns an immediate background resume boundary before work starts under a frozen clock", async () => {
+    now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const completed = vi.fn();
+    manager = new AgentManager(completed);
+    const id = await spawnSettled();
+    const previousStartedAt = manager.getRecord(id)!.startedAt;
+    completed.mockClear();
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "second" });
+
+    const record = await manager.resume(id, "continue", undefined, { isBackground: true });
+    expect(vi.mocked(resumeAgent)).toHaveBeenCalledTimes(1);
+    expect(record!.startedAt).toBe(previousStartedAt + 1);
+    await record!.promise;
+
+    expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
+    expect(completed).toHaveBeenCalledWith(expect.objectContaining({
+      startedAt: previousStartedAt + 1,
+      completedAt: previousStartedAt + 1,
+    }));
+  });
+
+  it("assigns a queued background resume boundary only when the queued work starts", async () => {
+    now = vi.spyOn(Date, "now").mockReturnValue(2_000);
+    manager = new AgentManager(undefined, 1);
+    const id = await spawnSettled();
+    const previousStartedAt = manager.getRecord(id)!.startedAt;
+
+    let releaseBlocker!: (value: any) => void;
+    vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => { releaseBlocker = resolve; }));
+    const blockerId = manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+      description: "blocker",
+      isBackground: true,
+    });
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "queued second" });
+
+    const record = await manager.resume(id, "continue later", undefined, { isBackground: true });
+    expect(record!.status).toBe("queued");
+    expect(record!.startedAt).toBe(previousStartedAt);
+    expect(resumeAgent).not.toHaveBeenCalled();
+
+    releaseBlocker({ responseText: "done", session: mockSession(), aborted: false, steered: false });
+    await manager.getRecord(blockerId)!.promise;
+    await record!.promise;
+
+    expect(record!.startedAt).toBe(previousStartedAt + 1);
+    expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
+  });
+
+  it("assigns a foreground resume boundary before work starts under a frozen clock", async () => {
+    now = vi.spyOn(Date, "now").mockReturnValue(3_000);
+    manager = new AgentManager();
+    const id = await spawnSettled();
+    const previousStartedAt = manager.getRecord(id)!.startedAt;
+    let startedAtDuringWork: number | undefined;
+    vi.mocked(resumeAgent).mockImplementation(async () => {
+      startedAtDuringWork = manager.getRecord(id)!.startedAt;
+      return { text: "foreground second" };
+    });
+
+    const record = await manager.resume(id, "continue inline");
+
+    expect(startedAtDuringWork).toBe(previousStartedAt + 1);
+    expect(record!.startedAt).toBe(previousStartedAt + 1);
+    expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
   });
 });
 
