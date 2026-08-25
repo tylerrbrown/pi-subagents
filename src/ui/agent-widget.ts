@@ -426,7 +426,8 @@ export class AgentWidget {
     for (const a of running) {
       const modeLabel = getPromptModeLabel(a.type);
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-      const elapsed = formatMs(Date.now() - a.startedAt);
+      const now = Date.now();
+      const elapsed = formatMs(now - a.startedAt);
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
@@ -444,7 +445,8 @@ export class AgentWidget {
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
       if (costText) parts.push(costText);
-      parts.push(elapsed);
+      parts.push(`${elapsed} elapsed`);
+      parts.push(`idle ${formatMs(now - (a.lastProgressAt ?? a.startedAt))}`);
       const statsText = parts.join(" · ");
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";

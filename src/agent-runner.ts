@@ -1153,6 +1153,8 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
+    onTurnEnd?: (turnCount: number) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
@@ -1172,8 +1174,16 @@ export async function resumeAgent(
     () => session.abort(),
   );
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  let currentMessageText = "";
+  let turnCount = 0;
+  const unsubEvents = (options.onToolActivity || options.onTextDelta || options.onTurnEnd || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "message_start" && event.message.role === "assistant") currentMessageText = "";
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+          currentMessageText += event.assistantMessageEvent.delta;
+          options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+        }
+        if (event.type === "turn_end") options.onTurnEnd?.(++turnCount);
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {

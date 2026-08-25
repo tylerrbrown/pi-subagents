@@ -102,14 +102,16 @@ The extension renders a persistent widget above the editor showing active agents
 
 ```
 ● Agents
-├─ ⠹ Agent  Refactor auth module · ↻5≤30 · 5 tool uses · 33.8k token (62%) · 12.3s
+├─ ⠹ Agent  Refactor auth module · ↻5≤30 · 5 tool uses · 33.8k token (62%) · 12.3s elapsed · idle 0.4s
 │    ⎿  editing 2 files…
-├─ ⠹ Explore  Find auth files · ↻3 · 3 tool uses · 12.4k token (8%) · 4.1s
+├─ ⠹ Explore  Find auth files · ↻3 · 3 tool uses · 12.4k token (8%) · 4.1s elapsed · idle 1.2s
 │    ⎿  searching…
-├─ ⠹ Agent  Long-running task · ↻42 · 38 tool uses · 91.0k token (84% · ⇊2) · 2m17s
+├─ ⠹ Agent  Long-running task · ↻42 · 38 tool uses · 91.0k token (84% · ⇊2) · 137.0s elapsed · idle 64.0s
 │    ⎿  reading…
 └─ 2 queued
 ```
+
+`elapsed` is total run time. `idle` is time since the latest text delta, tool start/end, or completed turn; it is visibility only, while `runDeadlineMs` owns termination.
 
 The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
@@ -123,8 +125,8 @@ While subagents are running, a Claude Code-style navigable list renders **below*
   esc to interrupt · ← for agents · ↓ to manage
 
   ● main
-  ○ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
-  ○ general-purpose  Sleep then report 2                                11s · ↓ 13.1k tokens
+  ○ general-purpose  Sleep then report 1                     11s · idle 2s · ↓ 13.1k tokens
+  ○ general-purpose  Sleep then report 2                     11s · idle 9s · ↓ 13.1k tokens
                                                                                    ↓ 3 more
 ```
 

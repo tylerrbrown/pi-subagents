@@ -393,9 +393,13 @@ export class FleetList {
     // running line: only the record carries a nested child's spend, and only it
     // outlives the agent.
     const tokens = getLifetimeTotal(record.lifetimeUsage);
-    const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
+    const now = Date.now();
+    const elapsedMs = (record.completedAt ?? now) - record.startedAt; // freezes once finished
+    const idle = record.status === "running"
+      ? ` · idle ${formatFleetElapsed(now - (record.lastProgressAt ?? record.startedAt))}`
+      : "";
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    const stats = `${formatFleetElapsed(elapsedMs)}${idle} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

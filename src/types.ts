@@ -216,6 +216,8 @@ export interface AgentRecord {
   error?: string;
   toolUses: number;
   startedAt: number;
+  /** Latest wall-clock evidence that this run made progress. */
+  lastProgressAt?: number;
   completedAt?: number;
   session?: AgentSession;
   abortController?: AbortController;

@@ -187,6 +187,10 @@ interface ResumeOptions {
   isBackground?: boolean;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
+  /** Called on streaming text deltas from the resumed response. */
+  onTextDelta?: (delta: string, fullText: string) => void;
+  /** Called at the end of each resumed agentic turn. */
+  onTurnEnd?: (turnCount: number) => void;
   /** Called once per assistant message_end with that message's usage delta. */
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
@@ -360,6 +364,7 @@ export class AgentManager {
         }
       }
     }
+    const startedAt = Date.now();
     const record: AgentRecord = {
       id,
       type,
@@ -371,7 +376,8 @@ export class AgentManager {
       alias,
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
-      startedAt: Date.now(),
+      startedAt,
+      lastProgressAt: startedAt,
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
@@ -449,6 +455,7 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    record.lastProgressAt = record.startedAt;
     this.acquireBackgroundSlot(record);
     this.onStart?.(record);
 
@@ -487,17 +494,26 @@ export class AgentManager {
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
+        record.lastProgressAt = Date.now();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onTurnEnd: options.onTurnEnd,
-      onTextDelta: options.onTextDelta,
+      onTurnEnd: (turnCount) => {
+        record.lastProgressAt = Date.now();
+        options.onTurnEnd?.(turnCount);
+      },
+      onTextDelta: (delta, fullText) => {
+        record.lastProgressAt = Date.now();
+        options.onTextDelta?.(delta, fullText);
+      },
       onAssistantUsage: (usage) => {
+        record.lastProgressAt = Date.now();
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
+        record.lastProgressAt = Date.now();
         record.compactionCount++;
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
@@ -760,6 +776,7 @@ export class AgentManager {
     // Foreground resume: establish the new run boundary before work begins.
     record.status = "running";
     record.startedAt = Math.max(Date.now(), record.startedAt + 1);
+    record.lastProgressAt = record.startedAt;
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
@@ -767,15 +784,26 @@ export class AgentManager {
     try {
       const { text, failure, timedOut } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
+          record.lastProgressAt = Date.now();
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
         },
+        onTextDelta: (delta, fullText) => {
+          record.lastProgressAt = Date.now();
+          options?.onTextDelta?.(delta, fullText);
+        },
+        onTurnEnd: (turnCount) => {
+          record.lastProgressAt = Date.now();
+          options?.onTurnEnd?.(turnCount);
+        },
         onAssistantUsage: (usage) => {
+          record.lastProgressAt = Date.now();
           addUsage(record.lifetimeUsage, usage);
           this.onUsage?.(record, usage);
           options?.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
+          record.lastProgressAt = Date.now();
           record.compactionCount++;
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
@@ -830,6 +858,7 @@ export class AgentManager {
     // A queued resume retains the previous run's timestamp until this exact
     // start point; frozen/low-resolution clocks still produce a fresh boundary.
     record.startedAt = Math.max(Date.now(), record.startedAt + 1);
+    record.lastProgressAt = record.startedAt;
     this.acquireBackgroundSlot(record);
     this.onStart?.(record);
 
@@ -869,15 +898,26 @@ export class AgentManager {
 
     const promise = resumeAgent(record.session, prompt, {
       onToolActivity: (activity) => {
+        record.lastProgressAt = Date.now();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
+      onTextDelta: (delta, fullText) => {
+        record.lastProgressAt = Date.now();
+        options.onTextDelta?.(delta, fullText);
+      },
+      onTurnEnd: (turnCount) => {
+        record.lastProgressAt = Date.now();
+        options.onTurnEnd?.(turnCount);
+      },
       onAssistantUsage: (usage) => {
+        record.lastProgressAt = Date.now();
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
+        record.lastProgressAt = Date.now();
         record.compactionCount++;
         this.onCompact?.(record, info);
         options.onCompaction?.(info);

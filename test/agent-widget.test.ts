@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
@@ -128,6 +128,30 @@ describe("AgentWidget", () => {
     const lines = renderLines(manager, "background", () => "background");
     expect(lines).toContain("Agents");
     expect(lines).toContain("background description");
+  });
+
+  it("shows elapsed and idle time for a running agent", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(20_000);
+      const record = makeRecord("idle", { isBackground: true });
+      record.startedAt = 10_000;
+      record.lastProgressAt = 17_000;
+      const widget = new AgentWidget(
+        { listAgents: () => [record] } as any,
+        new Map(),
+        () => "background",
+      );
+      let factory: any;
+      widget.setUICtx({ setStatus: () => {}, setWidget: (_k, c) => { factory = c; } } as any);
+      widget.update();
+      const output = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
+
+      expect(output).toContain("10.0s elapsed");
+      expect(output).toContain("idle 3.0s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // 'background' excludes only agents *known* to be foreground; one with no

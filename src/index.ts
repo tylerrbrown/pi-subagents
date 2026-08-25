@@ -1486,6 +1486,8 @@ export default function (pi: ExtensionAPI) {
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
       onToolActivity: bgCallbacks.onToolActivity,
+      onTextDelta: bgCallbacks.onTextDelta,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
       // drain. Wiring it here (rather than after resume() returns) means a
