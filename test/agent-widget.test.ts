@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
+import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatMs, formatSessionTokens } from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -39,6 +39,18 @@ describe("formatSessionTokens", () => {
     expect(fgPreservingNestedStyles(ansiTheme, "accent", tokenText)).toBe(
       "\u001b[35m1.2k token (\u001b[33m70%\u001b[39m\u001b[35m)\u001b[39m",
     );
+  });
+});
+
+describe("formatMs", () => {
+  it("uses seconds only below one minute", () => {
+    expect(formatMs(1_800)).toBe("1.8s");
+    expect(formatMs(59_950)).toBe("60.0s");
+  });
+
+  it("uses minutes and hours for longer durations", () => {
+    expect(formatMs(110_500)).toBe("1.8m");
+    expect(formatMs(4_320_000)).toBe("1.2h");
   });
 });
 

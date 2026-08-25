@@ -166,6 +166,8 @@ export function formatTurns(turnCount: number, maxTurns?: number | null): string
 
 /** Format milliseconds as human-readable duration. */
 export function formatMs(ms: number): string {
+  if (ms >= 3_600_000) return `${(ms / 3_600_000).toFixed(1)}h`;
+  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
