@@ -836,6 +836,69 @@ function lastLoaderOpts(): Record<string, unknown> {
   return defaultResourceLoaderCtor.mock.calls[0][0];
 }
 
+describe("agent-runner thinking inheritance", () => {
+  it("inherits a low parent thinking level when the caller and agent omit it", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "low" }, "Explore", "go", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "low",
+    }));
+  });
+
+  it("inherits a medium parent thinking level when the caller and agent omit it", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" }, "Explore", "go", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "medium",
+    }));
+  });
+
+  it("lets an explicit caller thinking level override the parent", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "low" }, "Explore", "go", {
+      pi,
+      thinkingLevel: "high",
+    });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "high",
+    }));
+  });
+
+  it("lets agent-file thinking override the parent", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ thinking: "xhigh" }));
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" }, "Explore", "go", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "xhigh",
+    }));
+  });
+
+  it("omits thinkingLevel when parent, caller, and agent all leave it unset", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("thinkingLevel");
+  });
+});
+
 describe("agent-runner session persistence", () => {
   it("persists by default, so a handle can reopen the conversation later", async () => {
     // `rememberAgents` defaults on: the session file is the only thing an
