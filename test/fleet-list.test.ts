@@ -142,6 +142,10 @@ describe("formatFleetElapsed", () => {
     expect(formatFleetElapsed(11_400)).toBe("11s");
     expect(formatFleetElapsed(11_600)).toBe("12s");
   });
+  it("switches long durations to minutes and hours", () => {
+    expect(formatFleetElapsed(90_000)).toBe("1.5m");
+    expect(formatFleetElapsed(4_320_000)).toBe("1.2h");
+  });
   it("floors negatives to 0s", () => {
     expect(formatFleetElapsed(-500)).toBe("0s");
   });
@@ -215,14 +219,29 @@ describe("FleetList navigation", () => {
     // Selection marker keeps accent color; row content uses primary text color.
     expect(selected).toContain("<accent>●</accent>");
     expect(selected).toContain("<text>one</text>");
-    expect(selected).toMatch(/<text>\d+s · ↓ [\d.]+k? tokens<\/text>/);
+    expect(selected).toMatch(/<text>\d+s · idle \d+s · ↓ [\d.]+k? tokens<\/text>/);
     // Agent display name rendered with the text token too (this type has no badge).
     expect(selected).toContain(`<text>${getDisplayName("general-purpose")}</text>`);
     // Inactive rows keep the muted/dim treatment.
     const unselected = h.render().find(l => l.includes("two"))!;
     expect(unselected).toContain("<dim>○</dim>");
-    expect(unselected).toMatch(/<dim>\d+s · ↓ [\d.]+k? tokens<\/dim>/);
+    expect(unselected).toMatch(/<dim>\d+s · idle \d+s · ↓ [\d.]+k? tokens<\/dim>/);
     expect(unselected).not.toContain("<text>");
+  });
+
+  it("shows model, requested effort, and effective thinking in compact posture", () => {
+    const h = harness([makeRecord({
+      description: "Fix typed closeout consumer",
+      invocation: { thinking: "medium" },
+      session: {
+        ...FAKE_SESSION,
+        model: { id: "gpt-5.6-sol" },
+        thinkingLevel: "medium",
+      } as any,
+    })]);
+
+    expect(plain(h.render().find(l => l.includes("gpt-5.6-sol"))!))
+      .toContain("gpt-5.6-sol/med/med");
   });
 
   it("keeps a color badge on the selected row, bolded, without shifting it (#230)", () => {
@@ -509,8 +528,13 @@ describe("FleetList overlay lifecycle", () => {
 describe("FleetList cost display", () => {
   const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 
-  function row(showCost: boolean, cost: number, activity?: Map<string, AgentActivity>): string {
-    const record = makeRecord({ lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost } });
+  function row(
+    showCost: boolean,
+    cost: number,
+    activity?: Map<string, AgentActivity>,
+    recordOver: Partial<AgentRecord> = {},
+  ): string {
+    const record = makeRecord({ lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost }, ...recordOver });
     const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), () => showCost);
     let factory: any;
     fleet.setUICtx({
@@ -528,6 +552,19 @@ describe("FleetList cost display", () => {
     const out = row(true, 0.0042);
     expect(out).toContain("13.1k tokens");
     expect(out).toContain("~$0.0042");
+  });
+
+  it("shows idle age from the live activity tracker", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(20_000);
+      expect(row(false, 0, undefined, {
+        startedAt: 10_000,
+        lastProgressAt: 17_000,
+      })).toContain("idle 3s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows no cost when disabled, and none for an unpriced model", () => {
@@ -548,6 +585,9 @@ describe("FleetList cost display", () => {
       lifetimeUsage: { input: 1, output: 1, cacheWrite: 0, cost: 0.9 },
     } as unknown as AgentActivity]]);
 
-    expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+    for (const out of [row(true, 0.0042, tracked), row(true, 0.0042)]) {
+      expect(out).toContain("13.1k tokens");
+      expect(out).toContain("~$0.0042");
+    }
   });
 });

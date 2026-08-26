@@ -21,7 +21,7 @@ const MAX_WIDGET_LINES = 12;
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /** Statuses that indicate an error/non-success outcome (used for linger behavior and icon rendering). */
-export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped"]);
+export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped", "timeout"]);
 
 /** Tool name → human-readable action for activity descriptions. */
 const TOOL_DISPLAY: Record<string, string> = {
@@ -70,7 +70,7 @@ export interface AgentDetails {
   toolUses: number;
   tokens: string;
   durationMs: number;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error" | "background";
+  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error" | "background";
   /** Human-readable description of what the agent is currently doing. */
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
@@ -370,6 +370,9 @@ export class AgentWidget {
       icon = theme.fg("error", "✗");
       const errMsg = a.error ? `: ${a.error.slice(0, 60)}` : "";
       statusText = theme.fg("error", ` error${errMsg}`);
+    } else if (a.status === "timeout") {
+      icon = theme.fg("error", "✗");
+      statusText = theme.fg("error", " timed out");
     } else {
       // aborted
       icon = theme.fg("error", "✗");
@@ -428,7 +431,8 @@ export class AgentWidget {
     for (const a of running) {
       const modeLabel = getPromptModeLabel(a.type);
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-      const elapsed = formatMs(Date.now() - a.startedAt);
+      const now = Date.now();
+      const elapsed = formatMs(now - a.startedAt);
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
@@ -446,7 +450,8 @@ export class AgentWidget {
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
       if (costText) parts.push(costText);
-      parts.push(elapsed);
+      parts.push(`${elapsed} elapsed`);
+      parts.push(`idle ${formatMs(now - (a.lastProgressAt ?? a.startedAt))}`);
       const statsText = parts.join(" · ");
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";

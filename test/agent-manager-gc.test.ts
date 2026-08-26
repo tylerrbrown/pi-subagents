@@ -54,7 +54,13 @@ describe("AgentManager — record GC", () => {
     manager ??= new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", prompt, { description: prompt, isBackground: true });
     await manager.getRecord(id)!.promise;
-    return { id, record: manager.getRecord(id)! };
+    const record = manager.getRecord(id)!;
+    // Consumed, because this suite is about the memory bound. An UNREAD result
+    // is now held far longer on purpose (a long batch used to lose every
+    // sibling that finished early); that window has its own suite in
+    // gc-retention.test.ts.
+    record.resultConsumed = true;
+    return { id, record };
   }
 
   it("keeps a record that completed inside the retention window", async () => {
@@ -179,6 +185,8 @@ describe("AgentManager — tombstones outliving the GC", () => {
     const record = manager.getRecord(id)!;
     await record.promise;
     record.sessionFile = sessionFile;
+    // See `settled()` above: read results are what the ten-minute sweep is for.
+    record.resultConsumed = true;
     record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
     return { id, record };
   }

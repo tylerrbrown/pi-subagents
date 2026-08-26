@@ -340,6 +340,71 @@ export function getRememberAgents(): boolean { return rememberAgents; }
 /** Set whether subagent sessions are persisted by default. */
 export function setRememberAgents(b: boolean): void { rememberAgents = b; }
 
+/**
+ * Wall-clock ceiling on one agent RUN, in ms. `undefined`/`0` = unlimited,
+ * matching the `defaultMaxTurns` convention.
+ *
+ * The turn budget is not a time budget: a run stalled on an overloaded provider
+ * burns no turns and so was bounded by nothing at all. Floored at a second so a
+ * mistyped `50` can't end every run before its first tool call.
+ */
+export function normalizeRunDeadlineMs(n: number | undefined): number | undefined {
+  if (n == null || n === 0) return undefined;
+  return Math.min(MAX_RUN_DEADLINE_MS, Math.max(MIN_RUN_DEADLINE_MS, n));
+}
+
+const MIN_RUN_DEADLINE_MS = 1_000;
+const MAX_RUN_DEADLINE_MS = 24 * 60 * 60_000;
+
+let defaultRunDeadlineMs: number | undefined;
+
+/** Project default run deadline. undefined = unlimited. */
+export function getDefaultRunDeadlineMs(): number | undefined { return defaultRunDeadlineMs; }
+/** Set the project default run deadline. undefined or 0 = unlimited. */
+export function setDefaultRunDeadlineMs(n: number | undefined): void {
+  defaultRunDeadlineMs = normalizeRunDeadlineMs(n);
+}
+
+/** The deadline a run will actually enforce: caller's value, else the project default. */
+export function resolveEffectiveRunDeadlineMs(explicit?: number): number | undefined {
+  return normalizeRunDeadlineMs(explicit ?? defaultRunDeadlineMs);
+}
+
+/** An armed run deadline: whether it fired, and how to stand it down. */
+export interface RunDeadline {
+  timedOut: () => boolean;
+  expired: Promise<void>;
+  cancel: () => void;
+}
+
+/**
+ * Arm a wall-clock deadline that aborts the run when it elapses.
+ *
+ * `abort` is called at most once and its throw is swallowed: a session torn
+ * down mid-abort is exactly the case where an exception here would leave the
+ * run reported as a clean completion. The fact that the deadline fired is
+ * recorded either way — that is the part the caller acts on.
+ */
+export function armRunDeadline(deadlineMs: number | undefined, abort: () => void): RunDeadline {
+  if (deadlineMs == null) {
+    return { timedOut: () => false, expired: new Promise(() => {}), cancel: () => {} };
+  }
+  let fired = false;
+  let expire!: () => void;
+  const expired = new Promise<void>((resolve) => { expire = resolve; });
+  const timer = setTimeout(() => {
+    fired = true;
+    expire();
+    try { abort(); } catch { /* a half-disposed session must not hide the timeout */ }
+  }, deadlineMs);
+  timer.unref?.();
+  return {
+    timedOut: () => fired,
+    expired,
+    cancel: () => clearTimeout(timer),
+  };
+}
+
 /** Additional turns allowed after the soft limit steer message. */
 let graceTurns = 5;
 
@@ -392,6 +457,8 @@ export interface RunOptions extends AgentCapabilityAdditions {
   agentId?: string;
   model?: Model<any>;
   maxTurns?: number;
+  /** Wall-clock ceiling for this run, in ms. 0/undefined = fall back to the project default. */
+  runDeadlineMs?: number;
   signal?: AbortSignal;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -472,6 +539,8 @@ export interface RunResult {
   session: AgentSession;
   /** True if the agent was hard-aborted (max_turns + grace exceeded). */
   aborted: boolean;
+  /** True if the run's wall-clock deadline elapsed and aborted it. */
+  timedOut: boolean;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
   steered: boolean;
   /**
@@ -1047,6 +1116,12 @@ export async function runAgent(
 
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  // Wall-clock ceiling, independent of the turn budget above: a run stalled on
+  // an overloaded provider burns no turns, so `maxTurns` never fires for it.
+  const deadline = armRunDeadline(
+    resolveEffectiveRunDeadlineMs(options.runDeadlineMs),
+    () => session.abort(),
+  );
 
   // Build the effective prompt: optionally prepend parent context
   let effectivePrompt = prompt;
@@ -1060,16 +1135,32 @@ export async function runAgent(
   // Boundary for the history fallback: only assistant text produced from here
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
+  let timedOut = false;
   try {
-    await session.prompt(effectivePrompt);
+    const promptRun = session.prompt(effectivePrompt).then(() => false);
+    try {
+      timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
+    } catch (error) {
+      if (!deadline.timedOut()) throw error;
+      timedOut = true;
+    }
+    if (timedOut) void promptRun.catch(() => {});
   } finally {
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
+    deadline.cancel();
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
+  return {
+    responseText,
+    session,
+    aborted,
+    timedOut,
+    steered: softLimitReached,
+    failure: finalTurnError(session, startLen),
+  };
 }
 
 /**
@@ -1080,20 +1171,37 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
+    onTurnEnd?: (turnCount: number) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    /** Wall-clock ceiling for this resume, in ms. 0/undefined = project default. */
+    runDeadlineMs?: number;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; timedOut: boolean }> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  // A resume is a run: same wall-clock bound, same reason (#b1).
+  const deadline = armRunDeadline(
+    resolveEffectiveRunDeadlineMs(options.runDeadlineMs),
+    () => session.abort(),
+  );
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  let currentMessageText = "";
+  let turnCount = 0;
+  const unsubEvents = (options.onToolActivity || options.onTextDelta || options.onTurnEnd || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "message_start" && event.message.role === "assistant") currentMessageText = "";
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+          currentMessageText += event.assistantMessageEvent.delta;
+          options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+        }
+        if (event.type === "turn_end") options.onTurnEnd?.(++turnCount);
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
@@ -1112,17 +1220,27 @@ export async function resumeAgent(
       })
     : () => {};
 
+  let timedOut = false;
   try {
-    await session.prompt(prompt);
+    const promptRun = session.prompt(prompt).then(() => false);
+    try {
+      timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
+    } catch (error) {
+      if (!deadline.timedOut()) throw error;
+      timedOut = true;
+    }
+    if (timedOut) void promptRun.catch(() => {});
   } finally {
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
+    deadline.cancel();
   }
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     failure: finalTurnError(session, startLen),
+    timedOut,
   };
 }
 

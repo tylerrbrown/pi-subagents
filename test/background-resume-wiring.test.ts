@@ -284,4 +284,24 @@ describe("Agent tool — background resume wiring", () => {
 
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });
+
+  it("labels a foreground resume timeout and preserves its partial output", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "partial answer", timedOut: true } as any);
+    const res = await tools.get("Agent").execute(
+      "resume-timeout",
+      { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: false },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(resultText(res)).toContain("timed out");
+    expect(resultText(res)).toContain("partial answer");
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
 });

@@ -17,6 +17,32 @@ export interface SubagentsSettings {
    */
   defaultMaxTurns?: number;
   graceTurns?: number;
+  /**
+   * Wall-clock ceiling on one agent RUN, in milliseconds. `0` or omitted =
+   * unlimited, matching `defaultMaxTurns`.
+   *
+   * The turn budget is not a time budget: a run stalled on an overloaded
+   * provider burns no turns, so `defaultMaxTurns` never fires for it and the
+   * run holds its caller for as long as the provider takes. A run that exceeds
+   * this ends in a `timeout` status with its partial output intact — it is not
+   * an abort (the turn budget was never spent) and not a user stop.
+   *
+   * A per-spawn `deadline_ms` on the `Agent` call overrides it in both
+   * directions.
+   */
+  runDeadlineMs?: number;
+  /**
+   * Wall-clock ceiling on one blocking `get_subagent_result(wait: true)`, in
+   * milliseconds. `0` = unlimited (the pre-fix behaviour); omitted = the
+   * five-minute default.
+   *
+   * The odd one out: every other `0`-means-unlimited setting here defaults to
+   * unlimited too, and this one cannot, because an unbounded blocking join is
+   * the defect. A wait that hits the ceiling returns a typed still-running
+   * result; the agent keeps running and stays unconsumed, so its completion
+   * notification is still the way home.
+   */
+  waitCeilingMs?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
@@ -243,6 +269,8 @@ export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
+  setRunDeadlineMs: (n: number | undefined) => void;
+  setWaitCeilingMs: (n: number | undefined) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
@@ -277,6 +305,8 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
+/** 24h. Past this a "deadline" is indistinguishable from none, and reads as a typo. */
+const DEADLINE_MS_CEILING = 24 * 60 * 60_000;
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
@@ -303,6 +333,20 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.graceTurns as number) <= GRACE_TURNS_CEILING
   ) {
     out.graceTurns = r.graceTurns as number;
+  }
+  if (
+    Number.isInteger(r.runDeadlineMs) &&
+    (r.runDeadlineMs as number) >= 0 &&
+    (r.runDeadlineMs as number) <= DEADLINE_MS_CEILING
+  ) {
+    out.runDeadlineMs = r.runDeadlineMs as number;
+  }
+  if (
+    Number.isInteger(r.waitCeilingMs) &&
+    (r.waitCeilingMs as number) >= 0 &&
+    (r.waitCeilingMs as number) <= DEADLINE_MS_CEILING
+  ) {
+    out.waitCeilingMs = r.waitCeilingMs as number;
   }
   if (
     Number.isInteger(r.maxSubagentDepth) &&
@@ -423,6 +467,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
+  if (typeof s.runDeadlineMs === "number") appliers.setRunDeadlineMs(s.runDeadlineMs);
+  if (typeof s.waitCeilingMs === "number") appliers.setWaitCeilingMs(s.waitCeilingMs);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);

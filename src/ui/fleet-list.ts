@@ -48,9 +48,12 @@ type MainEntry = { kind: "main" };
 type AgentEntry = { kind: "agent"; record: AgentRecord };
 type FleetEntry = MainEntry | AgentEntry;
 
-/** `11s` — integer seconds, no decimal/suffix (matches Claude Code, unlike formatMs). */
+/** Compact elapsed age: integer seconds, then one-decimal minutes/hours. */
 export function formatFleetElapsed(ms: number): string {
-  return `${Math.max(0, Math.round(ms / 1000))}s`;
+  const seconds = Math.max(0, ms) / 1000;
+  if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h`;
+  if (seconds >= 60) return `${(seconds / 60).toFixed(1)}m`;
+  return `${Math.round(seconds)}s`;
 }
 
 /** `↓ 13.1k tokens` — down-arrow prefix, compact magnitude, plural "tokens". */
@@ -60,6 +63,19 @@ export function formatFleetTokens(count: number): string {
   else if (count >= 1_000) compact = `${(count / 1_000).toFixed(1)}k`;
   else compact = `${count}`;
   return `↓ ${compact} tokens`;
+}
+
+function compactLevel(level: string | undefined): string {
+  return level === "medium" ? "med" : level ?? "-";
+}
+
+/** `gpt-5.6-sol/med/med` — model/requested effort/effective thinking. */
+export function formatFleetPosture(record: AgentRecord): string {
+  const session = record.session as { model?: { id?: string }; thinkingLevel?: string } | undefined;
+  const thinking = session?.thinkingLevel ?? record.invocation?.thinking;
+  const effort = record.invocation?.thinking ?? thinking;
+  const model = session?.model?.id ?? record.invocation?.modelName;
+  return model ? `${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
 }
 
 /**
@@ -388,14 +404,19 @@ export class FleetList {
       ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
       : { fallbackColor: "muted" });
     const description = selected ? theme.fg("text", record.description) : record.description;
-    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}`;
+    const posture = formatFleetPosture(record);
+    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}${posture ? `  ${theme.fg(selected ? "text" : "dim", posture)}` : ""}  ${description}`;
     // The record, not the activity tracker — see the note in AgentWidget's
     // running line: only the record carries a nested child's spend, and only it
     // outlives the agent.
     const tokens = getLifetimeTotal(record.lifetimeUsage);
-    const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
+    const now = Date.now();
+    const elapsedMs = (record.completedAt ?? now) - record.startedAt; // freezes once finished
+    const idle = record.status === "running"
+      ? ` · idle ${formatFleetElapsed(now - (record.lastProgressAt ?? record.startedAt))}`
+      : "";
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    const stats = `${formatFleetElapsed(elapsedMs)}${idle} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

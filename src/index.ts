@@ -18,7 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getDefaultRunDeadlineMs, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setDefaultRunDeadlineMs, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -36,8 +36,8 @@ import { RELATIVE_PATH_GUIDANCE } from "./prompts.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentCapabilityAdditions, type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { getFailureNote, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { type AgentCapabilityAdditions, type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type StopReason, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -61,6 +61,7 @@ import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
+import { beginBlockingWait, endBlockingWait, getWaitCeilingMs, noteWaitOutcome, PARALLEL_JOIN_REFUSAL, resetBlockingWaits, setWaitCeilingMs, shouldRefuseRepeatJoin, waitWithCeiling } from "./wait-ceiling.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 
 // ---- Shared helpers ----
@@ -151,6 +152,7 @@ function getStatusLabel(status: string, error?: string): string {
     case "aborted": return "Aborted (max turns exceeded)";
     case "steered": return "Wrapped up (turn limit)";
     case "stopped": return "Stopped";
+    case "timeout": return "Timed out (wall-clock deadline)";
     default: return "Done";
   }
 }
@@ -188,6 +190,19 @@ function isPersistedRecord(record: NotificationRecord): record is PersistedAgent
   return "version" in record;
 }
 
+/**
+ * A record's stop provenance, when there is one to read.
+ *
+ * ponytail: the durable ledger snapshot does not carry `stopReason`, so a
+ * `stopped` record restored after a session restart renders the generic note
+ * rather than naming its cause. That is lossy but honest — the alternative is
+ * asserting a cause we no longer know. Widen `PersistedAgentSnapshot` if
+ * provenance needs to survive a restart.
+ */
+function stopReasonOf(record: NotificationRecord): StopReason | undefined {
+  return isPersistedRecord(record) ? undefined : record.stopReason;
+}
+
 function getRecordOutputFile(record: NotificationRecord): string | undefined {
   return isPersistedRecord(record) ? record.output.file : record.outputFile;
 }
@@ -215,7 +230,7 @@ function formatTaskNotification(record: NotificationRecord, showCost = false): s
     record.toolCallId ? `<tool-use-id>${boundedXmlText(record.toolCallId, 300)}</tool-use-id>` : null,
     getRecordOutputFile(record) ? `<output-file>${boundedXmlText(getRecordOutputFile(record)!, 500)}</output-file>` : null,
     `<status>${boundedXmlText(status, 400)}</status>`,
-    `<summary>Agent "${boundedXmlText(record.description, 400)}" ${record.status}${getStatusNote(record.status)}</summary>`,
+    `<summary>Agent "${boundedXmlText(record.description, 400)}" ${record.status}${getStatusNote(record.status, stopReasonOf(record))}</summary>`,
     `<result>${boundedXmlText(resultPreview, 1_200)}</result>`,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
@@ -321,7 +336,7 @@ export default function (pi: ExtensionAPI) {
       if (!d) return undefined;
 
       function renderOne(d: NotificationDetails): string {
-        const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted";
+        const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted" || d.status === "timeout";
         const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
         const statusText = isError ? d.status
           : d.status === "steered" ? "completed (steered)"
@@ -722,9 +737,10 @@ export default function (pi: ExtensionAPI) {
     // A timed-out switch may also detach a non-cooperative child record; ignore
     // its eventual late callback rather than appending it into the next session.
     if (record.parentAgentId || manager.getRecord(record.id) !== record) return;
+    noteWaitOutcome("settled");
 
     // Emit lifecycle event based on terminal status
-    const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
+    const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted" || record.status === "timeout";
     const eventData = buildEventData(record);
     if (isError) {
       pi.events.emit("subagents:failed", eventData);
@@ -857,6 +873,25 @@ export default function (pi: ExtensionAPI) {
    * not an id at all. Only live records: a tombstone has nothing to steer and
    * no result to read. Callers still enforce the nested-ownership rejection.
    */
+  /**
+   * What a result collection gets once the record itself has been swept.
+   * Deliberately says the run is over and where the output came from: an
+   * evicted agent has no live session, so `verbose` and `steer` are off the
+   * table and pretending otherwise would send the model hunting.
+   */
+  const renderTombstone = (entry: AgentTombstone): string => {
+    const head =
+      `Agent: ${entry.id}\n` +
+      `Type: ${getDisplayName(entry.type)} | Status: ${entry.status}` +
+      `${getStatusNote(entry.status, entry.stopReason)} | Tool uses: ${entry.toolUses} | ` +
+      `Duration: ${formatDuration(entry.startedAt, entry.completedAt)}\n` +
+      `Description: ${entry.description}\n` +
+      "(This agent's record was swept from memory; its final result is below. " +
+      "The live session is gone, so verbose output and steering are unavailable.)\n\n";
+    if (entry.status === "error") return head + `Error: ${entry.error ?? "unknown"}`;
+    return head + (entry.result?.trim() || "No output.");
+  };
+
   const resolveAgentRef = (ref: string): AgentRecord | undefined => {
     const byId = manager.getRecord(ref);
     if (byId) return byId;
@@ -939,6 +974,9 @@ export default function (pi: ExtensionAPI) {
       fleet.setUICtx(ctx.ui as any);
     }
     manager.clearCompleted();
+    // A join in flight when the session ended cannot be in flight now; a
+    // stuck counter would refuse every legitimate wait for the rest of the process.
+    if (ownsManagerRegistry) resetBlockingWaits();
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -950,7 +988,7 @@ export default function (pi: ExtensionAPI) {
           spawn: spawnTopLevel,
           abort: (id) => {
             const record = manager.getRecord(id);
-            return !record?.parentAgentId && manager.abort(id);
+            return !record?.parentAgentId && manager.abort(id, "rpc");
           },
         },
       });
@@ -1273,7 +1311,8 @@ export default function (pi: ExtensionAPI) {
         delete (globalThis as any)[MANAGER_KEY];
       }
       scheduler.stop();
-      manager.abortAll();
+      manager.abortAll("shutdown");
+      if (ownsManagerRegistry) resetBlockingWaits();
       fleet.dispose();
       // Awaited and internally bounded so child extension shutdown cannot strand quit.
       await manager.dispose();
@@ -1415,7 +1454,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; runDeadlineMs?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1448,7 +1487,10 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      runDeadlineMs: opts.runDeadlineMs,
       onToolActivity: bgCallbacks.onToolActivity,
+      onTextDelta: bgCallbacks.onTextDelta,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
       // drain. Wiring it here (rather than after resume() returns) means a
@@ -1541,6 +1583,8 @@ export default function (pi: ExtensionAPI) {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setDefaultMaxTurns,
       setGraceTurns,
+      setRunDeadlineMs: setDefaultRunDeadlineMs,
+      setWaitCeilingMs,
       setDefaultJoinMode,
       setBackgroundByDefault,
       setSchedulingEnabled,
@@ -1755,6 +1799,15 @@ Terse command-style prompts produce shallow, generic work.
           minimum: 1,
         }),
       ),
+      deadline_ms: Type.Optional(
+        Type.Number({
+          description:
+            "Wall-clock ceiling for this run, in milliseconds. The run ends in a `timeout` status with its " +
+            "partial output kept. Use it for work that can stall on a provider rather than on turns. " +
+            "Omit for the project default; use 0 to make this run unlimited.",
+          minimum: 0,
+        }),
+      ),
       tools: Type.Optional(Type.Array(Type.String(), {
         description: "Built-in tool names or ext: selectors to add for this run only. The agent's disallowed_tools still wins.",
       })),
@@ -1887,7 +1940,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Anything left ("queued", or a status added later) has no rendering of
       // its own — the turn-limit wording below must not be the catch-all.
-      if (details.status !== "error" && details.status !== "aborted") {
+      if (details.status !== "error" && details.status !== "aborted" && details.status !== "timeout") {
         return new Text(text, 0, 0);
       }
 
@@ -1897,6 +1950,8 @@ Terse command-style prompts produce shallow, generic work.
 
       if (details.status === "error") {
         line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
+      } else if (details.status === "timeout") {
+        line += "\n" + theme.fg("error", "  ⎿  Timed out (wall-clock deadline; partial output may be incomplete)");
       } else {
         line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
       }
@@ -2113,6 +2168,7 @@ Terse command-style prompts produce shallow, generic work.
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
             maxTurns: effectiveMaxTurns,
+            runDeadlineMs: params.deadline_ms,
             toolCallId,
           });
           if (!record) {
@@ -2132,7 +2188,9 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          runDeadlineMs: params.deadline_ms,
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2145,7 +2203,10 @@ Terse command-style prompts produce shallow, generic work.
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
+          return textResult(`Agent failed: ${record.error}${getFailureNote(record.failureKind)}${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
+        }
+        if (record.status === "timeout") {
+          return textResult(`Agent timed out (wall-clock deadline).${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
         }
         return textResult(
           record.result?.trim() || "No output.",
@@ -2178,6 +2239,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          runDeadlineMs: params.deadline_ms as number | undefined,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2309,6 +2371,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          runDeadlineMs: params.deadline_ms as number | undefined,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2345,7 +2408,10 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+        return textResult(`${fallbackNote}Agent failed: ${record.error}${getFailureNote(record.failureKind)}${partialOutputSuffix(record)}`, details);
+      }
+      if (record.status === "timeout") {
+        return textResult(`${fallbackNote}Agent timed out (wall-clock deadline).${partialOutputSuffix(record)}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -2356,7 +2422,7 @@ Terse command-style prompts produce shallow, generic work.
         if (costText) statsParts.push(costText);
       }
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status, record.stopReason)}.\n\n` +
         (record.result?.trim() || "No output."),
         details,
       );
@@ -2425,21 +2491,53 @@ Terse command-style prompts produce shallow, generic work.
       if (liveRecord?.parentAgentId) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
+      // Three tiers, narrowing: the live record, then the durable ledger
+      // snapshot, then the in-memory tombstone of a record the sweep took.
+      // Evicted is not lost — the sweep bounds memory, it does not expire the
+      // answer, and a collection arriving after a long batch is exactly the one
+      // that used to come back empty.
       const record: NotificationRecord | undefined = liveRecord ?? resolvePersistedAgentRef(params.agent_id);
       if (!record) {
+        const remains = manager.getTombstone(params.agent_id);
+        if (remains) return textResult(renderTombstone(remains));
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
       // Wait for completion if requested. Persisted records are terminal
       // snapshots; queued/running waiting semantics remain live-manager owned.
+      //
+      // Two bounds, both of which leave the agent running and unconsumed so its
+      // completion notification still arrives: a wall-clock ceiling on this
+      // wait, and refusal of a repeat join once one has already hit the ceiling.
+      // A blocking join per specialist makes the turn a barrier on the slowest,
+      // hiding every sibling that already finished. Cancellation still stops
+      // only this tool call.
+      // Queued agents have no promise yet (it's created when the queue starts
+      // them), so poll until they leave the queue, then await like a running one.
+      let waitTimedOut = false;
       if (liveRecord && params.wait && (liveRecord.status === "running" || liveRecord.status === "queued")) {
-        while (liveRecord.status === "queued") {
-          await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
-            signal,
-          );
+        if (shouldRefuseRepeatJoin()) return textResult(PARALLEL_JOIN_REFUSAL);
+        if (!beginBlockingWait()) return textResult(PARALLEL_JOIN_REFUSAL);
+        const ceilingMs = getWaitCeilingMs();
+        const startedWaitingAt = Date.now();
+        const remainingMs = () =>
+          ceilingMs == null ? undefined : Math.max(0, ceilingMs - (Date.now() - startedWaitingAt));
+        try {
+          while (liveRecord.status === "queued" && (remainingMs() ?? 1) > 0) {
+            await abortable(
+              new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
+              signal,
+            );
+          }
+          if (liveRecord.status === "queued") {
+            waitTimedOut = true;
+          } else if (liveRecord.promise) {
+            waitTimedOut = (await waitWithCeiling(liveRecord.promise, remainingMs(), signal)) === "timeout";
+          }
+          noteWaitOutcome(waitTimedOut ? "timeout" : "settled");
+        } finally {
+          endBlockingWait();
         }
-        if (liveRecord.promise) await abortable(liveRecord.promise, signal);
       }
 
       const terminal = record.status !== "running" && record.status !== "queued";
@@ -2461,13 +2559,19 @@ Terse command-style prompts produce shallow, generic work.
 
       let output =
         `Agent: ${record.id}\n` +
-        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
+        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status, stopReasonOf(record))} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
+      if (record.status === "running" || record.status === "queued") {
+        output += waitTimedOut
+          ? `Agent is still running — the wait ceiling (${formatMs(getWaitCeilingMs() ?? 0)}) was reached, ` +
+            "so this wait returned instead of holding your turn. The agent was NOT stopped and its result " +
+            "was NOT consumed: you will be notified when it completes. Do other work in the meantime."
+          : "Agent is still running. Use wait: true or check back later.";
       } else if (record.status === "error") {
-        output += `Error: ${record.error}${partialOutputSuffix(record as AgentRecord)}`;
+        output += `Error: ${record.error}` +
+          `${getFailureNote(isPersistedRecord(record) ? undefined : record.failureKind)}` +
+          `${partialOutputSuffix(record as AgentRecord)}`;
       } else {
         output += record.result?.trim() || "No output.";
       }
@@ -2779,6 +2883,9 @@ Definitions are read-only in /agents.`,
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
+      // 0 = unlimited, same convention as defaultMaxTurns above.
+      runDeadlineMs: getDefaultRunDeadlineMs() ?? 0,
+      waitCeilingMs: getWaitCeilingMs() ?? 0,
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
@@ -2814,7 +2921,7 @@ Definitions are read-only in /agents.`,
   const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;
   void _settingsSnapshotIsComplete;
 
-  const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns", "maxSubagentDepth"]);
+  const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns", "maxSubagentDepth", "runDeadlineSec", "waitCeilingSec"]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
     function buildItems(): SettingItem[] {
@@ -2851,6 +2958,21 @@ Definitions are read-only in /agents.`,
           description: "Grace turns after wrap-up steer (Enter to type)",
           currentValue: String(gt),
           values: [String(gt)],
+        },
+        {
+          // Seconds in the UI, milliseconds on the wire: nobody types 300000.
+          id: "runDeadlineSec",
+          label: "Run deadline",
+          description: "Wall-clock ceiling on one agent run, in seconds (0 = unlimited, Enter to type). Ends the run in a `timeout` status with its partial output kept — the turn limit does not bound a run stalled on a provider.",
+          currentValue: String(Math.round((getDefaultRunDeadlineMs() ?? 0) / 1000)),
+          values: [String(Math.round((getDefaultRunDeadlineMs() ?? 0) / 1000))],
+        },
+        {
+          id: "waitCeilingSec",
+          label: "Wait ceiling",
+          description: "Wall-clock ceiling on one blocking get_subagent_result(wait: true), in seconds (0 = unlimited, Enter to type). The agent keeps running and stays unconsumed, so its completion notification still arrives.",
+          currentValue: String(Math.round((getWaitCeilingMs() ?? 0) / 1000)),
+          values: [String(Math.round((getWaitCeilingMs() ?? 0) / 1000))],
         },
         {
           id: "maxSubagentDepth",
@@ -2983,6 +3105,25 @@ Definitions are read-only in /agents.`,
         if (n >= 1) {
           manager.setMaxConcurrent(n);
           notifyApplied(ctx, `Max concurrency set to ${n}`);
+        }
+      } else if (id === "runDeadlineSec") {
+        const n = parseInt(value, 10);
+        if (n === 0) {
+          setDefaultRunDeadlineMs(undefined);
+          notifyApplied(ctx, "Run deadline set to unlimited");
+        } else if (n >= 1) {
+          setDefaultRunDeadlineMs(n * 1000);
+          notifyApplied(ctx, `Run deadline set to ${n}s`);
+        }
+      } else if (id === "waitCeilingSec") {
+        const n = parseInt(value, 10);
+        if (n === 0) {
+          // 0 is the pre-fix behaviour: a blocking join waits forever. Say so.
+          setWaitCeilingMs(0);
+          notifyApplied(ctx, "Wait ceiling set to unlimited — a blocking join can hold the turn indefinitely");
+        } else if (n >= 1) {
+          setWaitCeilingMs(n * 1000);
+          notifyApplied(ctx, `Wait ceiling set to ${n}s`);
         }
       } else if (id === "defaultMaxTurns") {
         const n = parseInt(value, 10);

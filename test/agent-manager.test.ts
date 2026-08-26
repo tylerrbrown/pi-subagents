@@ -665,8 +665,43 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
 
     expect(record.lifetimeUsage).toEqual({ input: 0, output: 0, cacheWrite: 0, cost: 0 });
     expect(record.compactionCount).toBe(0);
+    expect(record.lastProgressAt).toBe(record.startedAt);
 
     manager.abort(id);
+  });
+
+  it("updates lastProgressAt on text, tool, turn, usage, and compaction events", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+      manager = new AgentManager();
+      let callbacks: any;
+      vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, opts: any) => {
+        callbacks = opts;
+        return new Promise(() => {});
+      });
+
+      const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+        description: "test",
+        isBackground: true,
+      });
+      const record = manager.getRecord(id)!;
+      expect(record.lastProgressAt).toBe(1_000);
+
+      for (const [at, fire] of [
+        [2_000, () => callbacks.onTextDelta?.("x", "x")],
+        [3_000, () => callbacks.onToolActivity?.({ type: "start", toolName: "read" })],
+        [4_000, () => callbacks.onTurnEnd?.(2)],
+        [5_000, () => callbacks.onAssistantUsage?.({ input: 1, output: 1, cacheWrite: 0, cost: 0 })],
+        [6_000, () => callbacks.onCompaction?.({ reason: "manual", tokensBefore: 10 })],
+      ] as const) {
+        vi.setSystemTime(at);
+        fire();
+        expect(record.lastProgressAt).toBe(at);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("onAssistantUsage from runAgent accumulates into record.lifetimeUsage", async () => {
@@ -1760,12 +1795,35 @@ describe("AgentManager — monotonic resume run boundaries", () => {
     const record = await manager.resume(id, "continue", undefined, { isBackground: true });
     expect(vi.mocked(resumeAgent)).toHaveBeenCalledTimes(1);
     expect(record!.startedAt).toBe(previousStartedAt + 1);
+    expect(record!.lastProgressAt).toBe(record!.startedAt);
     await record!.promise;
 
     expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
     expect(completed).toHaveBeenCalledWith(expect.objectContaining({
       startedAt: previousStartedAt + 1,
       completedAt: previousStartedAt + 1,
+    }));
+  });
+
+  it("forwards per-run deadlines to foreground and background resumes", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled();
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "background" });
+
+    const background = await manager.resume(id, "continue", undefined, {
+      isBackground: true,
+      runDeadlineMs: 1_234,
+    });
+    expect(resumeAgent).toHaveBeenCalledWith(expect.anything(), "continue", expect.objectContaining({
+      runDeadlineMs: 1_234,
+    }));
+    await background!.promise;
+
+    vi.mocked(resumeAgent).mockClear();
+    await manager.resume(id, "continue again", undefined, { runDeadlineMs: 5_678 });
+    expect(resumeAgent).toHaveBeenCalledWith(expect.anything(), "continue again", expect.objectContaining({
+      runDeadlineMs: 5_678,
     }));
   });
 
@@ -1787,6 +1845,7 @@ describe("AgentManager — monotonic resume run boundaries", () => {
     const record = await manager.resume(id, "continue later", undefined, { isBackground: true });
     expect(record!.status).toBe("queued");
     expect(record!.startedAt).toBe(previousStartedAt);
+    expect(record!.lastProgressAt).toBe(previousStartedAt);
     expect(resumeAgent).not.toHaveBeenCalled();
 
     releaseBlocker({ responseText: "done", session: mockSession(), aborted: false, steered: false });
@@ -1794,6 +1853,7 @@ describe("AgentManager — monotonic resume run boundaries", () => {
     await record!.promise;
 
     expect(record!.startedAt).toBe(previousStartedAt + 1);
+    expect(record!.lastProgressAt).toBe(record!.startedAt);
     expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
   });
 
@@ -1802,6 +1862,7 @@ describe("AgentManager — monotonic resume run boundaries", () => {
     manager = new AgentManager();
     const id = await spawnSettled();
     const previousStartedAt = manager.getRecord(id)!.startedAt;
+    manager.getRecord(id)!.failureKind = "overload";
     let startedAtDuringWork: number | undefined;
     vi.mocked(resumeAgent).mockImplementation(async () => {
       startedAtDuringWork = manager.getRecord(id)!.startedAt;
@@ -1812,7 +1873,9 @@ describe("AgentManager — monotonic resume run boundaries", () => {
 
     expect(startedAtDuringWork).toBe(previousStartedAt + 1);
     expect(record!.startedAt).toBe(previousStartedAt + 1);
+    expect(record!.lastProgressAt).toBe(record!.startedAt);
     expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
+    expect(record!.failureKind).toBeUndefined();
   });
 });
 
@@ -1890,8 +1953,12 @@ describe("AgentManager — background resume", () => {
     const id = await spawnSettled(manager);
 
     const onToolActivity = vi.fn();
+    const onTextDelta = vi.fn();
+    const onTurnEnd = vi.fn();
     const onAssistantUsage = vi.fn();
     vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, opts: any) => {
+      opts.onTextDelta?.("draft", "draft");
+      opts.onTurnEnd?.(1);
       opts.onToolActivity?.({ type: "end", toolName: "grep" });
       opts.onAssistantUsage?.({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
       return { text: "ok" };
@@ -1900,10 +1967,14 @@ describe("AgentManager — background resume", () => {
     const record = await manager.resume(id, "go", undefined, {
       isBackground: true,
       onToolActivity,
+      onTextDelta,
+      onTurnEnd,
       onAssistantUsage,
     });
     await record!.promise;
 
+    expect(onTextDelta).toHaveBeenCalledWith("draft", "draft");
+    expect(onTurnEnd).toHaveBeenCalledWith(1);
     expect(onToolActivity).toHaveBeenCalledWith({ type: "end", toolName: "grep" });
     expect(onAssistantUsage).toHaveBeenCalledWith({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
     // Internal record bookkeeping still runs alongside the forwarded callbacks.

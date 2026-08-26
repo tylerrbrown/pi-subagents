@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatMs, formatSessionTokens } from "../src/ui/agent-widget.js";
@@ -142,8 +142,42 @@ describe("AgentWidget", () => {
     expect(lines).toContain("background description");
   });
 
+  it("shows elapsed and idle time for a running agent", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(20_000);
+      const record = makeRecord("idle", { isBackground: true });
+      record.startedAt = 10_000;
+      record.lastProgressAt = 17_000;
+      const widget = new AgentWidget(
+        { listAgents: () => [record] } as any,
+        new Map(),
+        () => "background",
+      );
+      let factory: any;
+      widget.setUICtx({ setStatus: () => {}, setWidget: (_k, c) => { factory = c; } } as any);
+      widget.update();
+      const output = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
+
+      expect(output).toContain("10.0s elapsed");
+      expect(output).toContain("idle 3.0s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // 'background' excludes only agents *known* to be foreground; one with no
   // isBackground flag (e.g. a cross-extension RPC spawn) is kept, not hidden.
+  it("renders a timed-out agent as an error, not a completion", () => {
+    const record = makeRecord("timeout", { isBackground: true }) as any;
+    record.status = "timeout";
+    record.completedAt = Date.now();
+    const manager = { listAgents: () => [record] };
+    const output = renderLines(manager, "timeout", () => "background");
+    expect(output).toContain("✗");
+    expect(output).toContain("timed out");
+  });
+
   it("keeps agents with no isBackground flag in 'background' mode", () => {
     const manager = { listAgents: () => [makeRecord("unflagged", {})] };
     expect(renderLines(manager, "unflagged", () => "background")).toContain("unflagged description");

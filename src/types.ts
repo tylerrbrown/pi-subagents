@@ -11,6 +11,32 @@ export type { ThinkingLevel };
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
 
+/**
+ * Terminal (and in-flight) states of one agent run.
+ *
+ * `timeout` is its own state rather than a flavour of `aborted` or `stopped`:
+ * the turn budget was never spent and nobody intervened — a wall clock ran out,
+ * which is the only one of the three an operator can fix by raising a number.
+ */
+export type AgentStatus =
+  | "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error";
+
+/** How a failed run failed, for the parent's benefit. */
+export type RunFailureKind = "overload" | "other";
+
+/** What ended a run that did not finish on its own. */
+export type StopReason =
+  /** A human pressed stop in the conversation viewer or FleetView. */
+  | "user"
+  /** Another extension asked for it over the cross-extension RPC. */
+  | "rpc"
+  /** `session_shutdown` — pi is going down and nothing is left to consume results. */
+  | "shutdown"
+  /** Its spawning agent settled; a hidden child must not outlive its only reader. */
+  | "parent"
+  /** The run's wall-clock deadline elapsed. */
+  | "timeout";
+
 /** Capabilities added to one agent run without changing its saved definition. */
 export interface AgentCapabilityAdditions {
   tools?: string[];
@@ -135,6 +161,19 @@ export interface AgentTombstone {
   /** Always set — a record with no session file is never tombstoned. */
   sessionFile: string;
   completedAt: number;
+  /** Terminal status the record died with, so a late collection can be honest about it. */
+  status: AgentStatus;
+  /** Who or what ended it, when that wasn't a clean completion. */
+  stopReason?: StopReason;
+  /**
+   * The run's final output. Kept so a result collected after eviction returns
+   * the work instead of `Agent not found` — the failure that made every sibling
+   * of a two-hour barrier unretrievable.
+   */
+  result?: string;
+  error?: string;
+  toolUses: number;
+  startedAt: number;
 }
 
 /**
@@ -163,11 +202,22 @@ export interface AgentRecord {
    */
   alias?: string;
   description: string;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  status: AgentStatus;
+  /**
+   * Why a non-completing run ended. `stopped` alone conflated a human pressing
+   * stop, a cross-extension RPC abort, a settling parent aborting its children,
+   * and `session_shutdown` — and rendered all four as "STOPPED BY THE USER",
+   * so a shutdown could masquerade as human intervention.
+   */
+  stopReason?: StopReason;
+  /** Set when `status === "error"`: whether the provider was overloaded or the run itself failed. */
+  failureKind?: RunFailureKind;
   result?: string;
   error?: string;
   toolUses: number;
   startedAt: number;
+  /** Latest wall-clock evidence that this run made progress. */
+  lastProgressAt?: number;
   completedAt?: number;
   session?: AgentSession;
   abortController?: AbortController;

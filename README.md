@@ -102,14 +102,16 @@ The extension renders a persistent widget above the editor showing active agents
 
 ```
 ● Agents
-├─ ⠹ Agent  Refactor auth module · ↻5≤30 · 5 tool uses · 33.8k token (62%) · 12.3s
+├─ ⠹ Agent  Refactor auth module · ↻5≤30 · 5 tool uses · 33.8k token (62%) · 12.3s elapsed · idle 0.4s
 │    ⎿  editing 2 files…
-├─ ⠹ Explore  Find auth files · ↻3 · 3 tool uses · 12.4k token (8%) · 4.1s
+├─ ⠹ Explore  Find auth files · ↻3 · 3 tool uses · 12.4k token (8%) · 4.1s elapsed · idle 1.2s
 │    ⎿  searching…
-├─ ⠹ Agent  Long-running task · ↻42 · 38 tool uses · 91.0k token (84% · ⇊2) · 2m17s
+├─ ⠹ Agent  Long-running task · ↻42 · 38 tool uses · 91.0k token (84% · ⇊2) · 137.0s elapsed · idle 64.0s
 │    ⎿  reading…
 └─ 2 queued
 ```
+
+`elapsed` is total run time. `idle` is time since the latest text delta, tool start/end, or completed turn; it is visibility only, while `runDeadlineMs` owns termination.
 
 The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
@@ -123,12 +125,12 @@ While subagents are running, a Claude Code-style navigable list renders **below*
   esc to interrupt · ← for agents · ↓ to manage
 
   ● main
-  ○ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
-  ○ general-purpose  Sleep then report 2                                11s · ↓ 13.1k tokens
+  ○ general-purpose  gpt-5.6-sol/med/med  Sleep then report 1  11s · idle 2s · ↓ 13.1k tokens
+  ○ general-purpose  grok-4.6/high/high   Sleep then report 2  11s · idle 9s · ↓ 13.1k tokens
                                                                                    ↓ 3 more
 ```
 
-The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+The compact posture is `model/requested effort/effective thinking`; differing final fields expose a clamped request. The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
 
 ### Agent mentions
 
@@ -393,6 +395,7 @@ Launch a sub-agent.
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `deadline_ms` | number | no | Wall-clock ceiling for this run, in ms. Ends the run in a `timeout` status with its partial output kept. Omit for the project default (`runDeadlineMs`) |
 | `tools` | string[] | no | Pi built-ins or `ext:<extension>/<tool>` selectors added for this fresh run only |
 | `skills` | string[] | no | Named skills added for this fresh run only |
 | `extensions` | string[] | no | Installed extension identifiers added for this fresh run only; paths are rejected |
@@ -454,7 +457,58 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 | `completed` | Finished naturally | `✓` green |
 | `steered` | Hit limit, wrapped up in time | `✓` yellow |
 | `aborted` | Grace period exceeded | `✗` red |
-| `stopped` | User-initiated abort | `■` dim |
+| `timeout` | Wall-clock deadline elapsed | `✗` red |
+| `stopped` | Aborted — see stop provenance below | `■` dim |
+
+## Wall-Clock Deadlines
+
+The turn budget is not a time budget. A run stalled on an overloaded provider
+burns no turns, so `max_turns` never fires for it and the run holds its caller
+for as long as the provider takes.
+
+`runDeadlineMs` (project default, `/agents → Settings → Run deadline`, in
+seconds there) and the per-call `deadline_ms` bound a run in wall-clock time. A
+run that exceeds it ends in `timeout` with its partial output intact: not
+`aborted` (the turn budget was never spent) and not `stopped` (nobody
+intervened). `0` or omitted = unlimited.
+
+`waitCeilingMs` (`/agents → Settings → Wait ceiling`) bounds one blocking
+`get_subagent_result(wait: true)`, default **5 minutes**. A wait that hits the
+ceiling returns a typed still-running result; the agent keeps running and its
+result stays unconsumed, so its completion notification still arrives. `0` =
+unlimited (the old unbounded behavior).
+
+**One ceiling hit spends the turn's wait budget.** Joining a batch a blocking
+wait at a time makes the turn return only when the slowest agent finishes,
+hiding every sibling that already completed. Pi executes a turn's tool calls
+one after another, so a five-specialist batch is five *sequential* joins and
+the barrier is five ceilings deep. Once a blocking wait returns at the ceiling,
+the next one is refused with a message naming the notification path; blocking
+waits resume as soon as an agent actually settles. A concurrent second wait is
+refused the same way, and non-blocking status checks (`wait` omitted) are
+always allowed.
+
+## Stop Provenance
+
+`stopped` records *who* stopped the run, and the note the parent sees says so:
+
+| `stopReason` | Note |
+|--------------|------|
+| `user` | `STOPPED BY THE USER` — the viewer/FleetView stop key |
+| `rpc` | `stopped by another extension` — a cross-extension RPC abort |
+| `shutdown` | `stopped because the session shut down` |
+| `parent` | `stopped because its parent agent finished` |
+
+All four used to render as `STOPPED BY THE USER`, so a session going down was
+indistinguishable from a human intervening.
+
+## Result Retention
+
+Completed records are swept from memory 10 minutes after they finish — but only
+once their result has been read. An **unread** result is held for an hour, and
+an evicted record's tombstone still carries its final output, so
+`get_subagent_result` serves it instead of `Agent not found`. A long batch used
+to lose every sibling that finished early.
 
 ## Concurrency
 
@@ -565,7 +619,9 @@ mkdir -p ~/.pi/agent
 cat > ~/.pi/agent/subagents.json <<'EOF'
 {
   "maxConcurrent": 16,
-  "graceTurns": 10
+  "graceTurns": 10,
+  "runDeadlineMs": 900000,
+  "waitCeilingMs": 300000
 }
 EOF
 ```

@@ -14,7 +14,8 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase, isReservedHandle } from "./mention.js";
-import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import { classifyRunFailure } from "./status-note.js";
+import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, StopReason, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
 
@@ -124,6 +125,8 @@ interface SpawnOptions extends AgentCapabilityAdditions {
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
   maxTurns?: number;
+  /** Wall-clock ceiling for this run, in ms. Omitted = project default. */
+  runDeadlineMs?: number;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -182,8 +185,14 @@ interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /** Wall-clock ceiling for this resumed run, in ms. Omitted = project default. */
+  runDeadlineMs?: number;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
+  /** Called on streaming text deltas from the resumed response. */
+  onTextDelta?: (delta: string, fullText: string) => void;
+  /** Called at the end of each resumed agentic turn. */
+  onTurnEnd?: (turnCount: number) => void;
   /** Called once per assistant message_end with that message's usage delta. */
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
@@ -234,6 +243,15 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
   // Always, even on timeout: disposal is what this function ultimately exists to do.
   try { session?.dispose?.(); } catch { /* ignore */ }
 }
+
+/** How long a record whose result has been read is kept, purely to bound memory. */
+const CONSUMED_RETENTION_MS = 10 * 60_000;
+
+/**
+ * How long a completed-but-uncollected result is kept. Sized to outlast a long
+ * review batch, not to be permanent — an abandoned result is still evicted.
+ */
+const UNCONSUMED_RETENTION_MS = 60 * 60_000;
 
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
@@ -348,6 +366,7 @@ export class AgentManager {
         }
       }
     }
+    const startedAt = Date.now();
     const record: AgentRecord = {
       id,
       type,
@@ -359,7 +378,8 @@ export class AgentManager {
       alias,
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
-      startedAt: Date.now(),
+      startedAt,
+      lastProgressAt: startedAt,
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
@@ -437,6 +457,7 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    record.lastProgressAt = record.startedAt;
     this.acquireBackgroundSlot(record);
     this.onStart?.(record);
 
@@ -454,6 +475,7 @@ export class AgentManager {
       agentId: id,
       model: options.model,
       maxTurns: options.maxTurns,
+      runDeadlineMs: options.runDeadlineMs,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
@@ -474,17 +496,26 @@ export class AgentManager {
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
+        record.lastProgressAt = Date.now();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onTurnEnd: options.onTurnEnd,
-      onTextDelta: options.onTextDelta,
+      onTurnEnd: (turnCount) => {
+        record.lastProgressAt = Date.now();
+        options.onTurnEnd?.(turnCount);
+      },
+      onTextDelta: (delta, fullText) => {
+        record.lastProgressAt = Date.now();
+        options.onTextDelta?.(delta, fullText);
+      },
       onAssistantUsage: (usage) => {
+        record.lastProgressAt = Date.now();
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
+        record.lastProgressAt = Date.now();
         record.compactionCount++;
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
@@ -516,23 +547,35 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(({ responseText, session, aborted, steered, failure }) => {
+      .then(async ({ responseText, session, aborted, timedOut, steered, failure }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
-          // Precedence: a hard abort keeps "aborted"; then a failed final turn
-          // (provider error that pi resolved instead of rejecting, #144) is an
-          // honest "error" — not a completion with an empty or stale result.
-          if (aborted) {
+          // Precedence: the wall clock outranks the turn budget — a deadline
+          // abort can let graceTurns elapse on its way out, and "ran out of
+          // time" is both the true cause and the actionable one. Then a hard
+          // abort keeps "aborted"; then a failed final turn (provider error
+          // that pi resolved instead of rejecting, #144) is an honest "error"
+          // — not a completion with an empty or stale result.
+          if (timedOut) {
+            record.status = "timeout";
+            record.stopReason = "timeout";
+          } else if (aborted) {
             record.status = "aborted";
           } else if (failure) {
             record.status = "error";
             record.error = failure;
+            record.failureKind = classifyRunFailure(failure);
           } else {
             record.status = steered ? "steered" : "completed";
           }
         }
         record.result = responseText;
-        record.session = session;
+        if (timedOut) {
+          await shutdownChildSession(session);
+          record.session = undefined;
+        } else {
+          record.session = session;
+        }
         completeRecord(record);
 
         detach();
@@ -576,6 +619,7 @@ export class AgentManager {
           record.status = "error";
         }
         record.error = err instanceof Error ? err.message : String(err);
+        record.failureKind = classifyRunFailure(record.error);
         completeRecord(record);
 
         detach();
@@ -625,7 +669,7 @@ export class AgentManager {
    */
   private abortOwnedChildren(parentId: string): void {
     for (const [id, record] of this.agents) {
-      if (record.parentAgentId === parentId) this.abort(id);
+      if (record.parentAgentId === parentId) this.abort(id, "parent");
     }
   }
 
@@ -723,6 +767,7 @@ export class AgentManager {
       record.resultConsumed = false;
       record.result = undefined;
       record.error = undefined;
+      record.failureKind = undefined;
       record.completedAt = undefined;
       record.status = "queued";
 
@@ -739,37 +784,64 @@ export class AgentManager {
     // Foreground resume: establish the new run boundary before work begins.
     record.status = "running";
     record.startedAt = Math.max(Date.now(), record.startedAt + 1);
+    record.lastProgressAt = record.startedAt;
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.failureKind = undefined;
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, timedOut } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
+          record.lastProgressAt = Date.now();
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
         },
+        onTextDelta: (delta, fullText) => {
+          record.lastProgressAt = Date.now();
+          options?.onTextDelta?.(delta, fullText);
+        },
+        onTurnEnd: (turnCount) => {
+          record.lastProgressAt = Date.now();
+          options?.onTurnEnd?.(turnCount);
+        },
         onAssistantUsage: (usage) => {
+          record.lastProgressAt = Date.now();
           addUsage(record.lifetimeUsage, usage);
           this.onUsage?.(record, usage);
           options?.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
+          record.lastProgressAt = Date.now();
           record.compactionCount++;
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
         signal,
+        runDeadlineMs: options?.runDeadlineMs,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      if (timedOut) {
+        record.status = "timeout";
+        record.stopReason = "timeout";
+      } else {
+        record.status = failure ? "error" : "completed";
+        if (failure) {
+          record.error = failure;
+          record.failureKind = classifyRunFailure(failure);
+        }
+      }
       record.result = text;
+      if (timedOut) {
+        await shutdownChildSession(record.session);
+        record.session = undefined;
+      }
       completeRecord(record);
     } catch (err) {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
+      record.failureKind = classifyRunFailure(record.error);
       completeRecord(record);
     }
 
@@ -800,6 +872,7 @@ export class AgentManager {
     // A queued resume retains the previous run's timestamp until this exact
     // start point; frozen/low-resolution clocks still produce a fresh boundary.
     record.startedAt = Math.max(Date.now(), record.startedAt + 1);
+    record.lastProgressAt = record.startedAt;
     this.acquireBackgroundSlot(record);
     this.onStart?.(record);
 
@@ -837,32 +910,58 @@ export class AgentManager {
       this.drainQueue();
     };
 
-    const promise = resumeAgent(record.session, prompt, {
+    const session = record.session;
+    const promise = resumeAgent(session, prompt, {
       onToolActivity: (activity) => {
+        record.lastProgressAt = Date.now();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
+      onTextDelta: (delta, fullText) => {
+        record.lastProgressAt = Date.now();
+        options.onTextDelta?.(delta, fullText);
+      },
+      onTurnEnd: (turnCount) => {
+        record.lastProgressAt = Date.now();
+        options.onTurnEnd?.(turnCount);
+      },
       onAssistantUsage: (usage) => {
+        record.lastProgressAt = Date.now();
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
+        record.lastProgressAt = Date.now();
         record.compactionCount++;
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
       },
       signal: abortController.signal,
+      runDeadlineMs: options.runDeadlineMs,
     })
-      .then(({ text, failure }) => {
+      .then(async ({ text, failure, timedOut }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
-          // Same contract as the spawn path (#144): a failed final turn is an
-          // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
+          // Same precedence as the spawn path: wall clock first, then a failed
+          // final turn (#144) — an error, not a completion, though the resumed
+          // text stays available.
+          if (timedOut) {
+            record.status = "timeout";
+            record.stopReason = "timeout";
+          } else {
+            record.status = failure ? "error" : "completed";
+            if (failure) {
+              record.error = failure;
+              record.failureKind = classifyRunFailure(failure);
+            }
+          }
         }
         record.result = text;
+        if (timedOut) {
+          await shutdownChildSession(session);
+          record.session = undefined;
+        }
         completeRecord(record);
         settle();
         return text;
@@ -871,6 +970,7 @@ export class AgentManager {
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
+          record.failureKind = classifyRunFailure(record.error);
         }
         completeRecord(record);
         settle();
@@ -965,6 +1065,25 @@ export class AgentManager {
     this.tombstones.delete(handle);
   }
 
+  /**
+   * The remains of an evicted agent, by id, handle, or alias. What
+   * `get_subagent_result` falls back to so a collection arriving after the
+   * sweep returns the run's output instead of `Agent not found`.
+   */
+  getTombstone(ref: string): AgentTombstone | undefined {
+    const raw = ref.trim();
+    if (!raw) return undefined;
+    const byName = this.tombstones.get(raw);
+    if (byName) return byName;
+    const lower = raw.toLowerCase();
+    for (const entry of this.tombstones.values()) {
+      if (entry.id === raw || entry.handle.toLowerCase() === lower || entry.alias?.toLowerCase() === lower) {
+        return entry;
+      }
+    }
+    return undefined;
+  }
+
   /** Evicted agents whose conversation can still be reopened, newest first. */
   listTombstones(): AgentTombstone[] {
     return [...this.tombstones.values()].sort((a, b) => b.completedAt - a.completedAt);
@@ -976,7 +1095,15 @@ export class AgentManager {
     );
   }
 
-  abort(id: string): boolean {
+  /**
+   * Stop an agent, recording WHO stopped it.
+   *
+   * Defaults to `"user"` because the two UI stop buttons (conversation viewer,
+   * FleetView) are the only callers that pass nothing, and they are a human.
+   * Every non-human path names itself — otherwise a shutdown or an extension
+   * abort reads as "STOPPED BY THE USER" and the status lies about the cause.
+   */
+  abort(id: string, reason: StopReason = "user"): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
 
@@ -984,6 +1111,7 @@ export class AgentManager {
     if (record.status === "queued") {
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
+      record.stopReason = reason;
       completeRecord(record);
       return true;
     }
@@ -991,6 +1119,7 @@ export class AgentManager {
     if (record.status !== "running") return false;
     record.abortController?.abort();
     record.status = "stopped";
+    record.stopReason = reason;
     completeRecord(record);
     return true;
   }
@@ -1018,6 +1147,11 @@ export class AgentManager {
    * transcript, so the mention would have nothing to continue from.
    */
   private tombstone(record: AgentRecord): void {
+    // ponytail: a record with no session file still leaves nothing behind, so a
+    // non-persisted agent's result dies with its record (bounded now by the
+    // 60-minute unconsumed retention above). Widening this would change what
+    // `@handle` resolves to, which is a different contract — see the mention
+    // tests. Revisit if `rememberAgents: false` projects start losing results.
     if (!record.handle || !record.sessionFile) return;
     this.tombstones.set(record.handle, {
       handle: record.handle,
@@ -1027,6 +1161,14 @@ export class AgentManager {
       description: record.description,
       sessionFile: record.sessionFile,
       completedAt: record.completedAt ?? Date.now(),
+      // Carried so a LATE collection still returns the work. Eviction is a
+      // memory bound, not an expiry of the answer.
+      status: record.status,
+      stopReason: record.stopReason,
+      result: record.result,
+      error: record.error,
+      toolUses: record.toolUses,
+      startedAt: record.startedAt,
     });
     // Bound the memory a long session can accumulate. Oldest first, since the
     // agent someone still wants to reach is the one they used most recently.
@@ -1036,10 +1178,27 @@ export class AgentManager {
     }
   }
 
+  /**
+   * Eviction ages. The short one bounds memory for results the LLM has already
+   * read; the long one exists because the short one was the whole reason a long
+   * batch lost its early finishers.
+   *
+   * A blocking join on a slow specialist can hold the Lead's turn for hours. A
+   * sibling that finished in five minutes was evicted at ten and answered
+   * `Agent not found` when the turn finally came back — so the model re-ran or
+   * re-resumed work that was already done. An unread result is the one thing
+   * this timer must not throw away on that scale.
+   */
   private cleanup() {
-    const cutoff = Date.now() - 10 * 60_000;
+    const now = Date.now();
+    const consumedCutoff = now - CONSUMED_RETENTION_MS;
+    const unconsumedCutoff = now - UNCONSUMED_RETENTION_MS;
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
+      // `resultConsumed` is only ever set true by a read (or by the foreground
+      // path, which returned the result inline), so falsy means "nobody has
+      // seen this yet" for every spawn path.
+      const cutoff = record.resultConsumed ? consumedCutoff : unconsumedCutoff;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -1073,14 +1232,19 @@ export class AgentManager {
     );
   }
 
-  /** Abort all running and queued agents immediately. */
-  abortAll(): number {
+  /**
+   * Abort all running and queued agents immediately. Its one production caller
+   * is `session_shutdown`, so that is the default attribution — a session going
+   * down must not be reported as a human pressing stop.
+   */
+  abortAll(reason: StopReason = "shutdown"): number {
     let count = 0;
     // Clear queued agents first
     for (const queued of this.queue) {
       const record = this.agents.get(queued.id);
       if (record) {
         record.status = "stopped";
+        record.stopReason = reason;
         completeRecord(record);
         count++;
       }
@@ -1091,6 +1255,7 @@ export class AgentManager {
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
+        record.stopReason = reason;
         completeRecord(record);
         count++;
       }
