@@ -90,6 +90,10 @@ function rightAlign(left, right, width) {
     const gap = Math.max(1, width - visibleWidth(clippedLeft) - rightWidth);
     return truncateToWidth(clippedLeft + " ".repeat(gap) + right, width);
 }
+export function appendMetrics(left, right, width) {
+    const joined = `${left}  ${right}`;
+    return visibleWidth(joined) <= width ? joined : rightAlign(left, right, width);
+}
 export function formatCost(cost) {
     if (!(cost > 0))
         return ""; // also catches NaN
@@ -114,8 +118,7 @@ export function formatCost(cost) {
  *   "12.3k token (⇊2)"          — compactions only (e.g. right after compact)
  *   "12.3k token (45% · ⇊2)"    — both
  */
-export function formatSessionTokens(tokens, percent, theme, compactions = 0) {
-    const tokenStr = formatTokens(tokens);
+function formatSessionTokenAnnotations(percent, theme, compactions = 0) {
     const annot = [];
     if (percent !== null) {
         const color = percent >= 85 ? "error" : percent >= 70 ? "warning" : "dim";
@@ -124,9 +127,11 @@ export function formatSessionTokens(tokens, percent, theme, compactions = 0) {
     if (compactions > 0) {
         annot.push(theme.fg("dim", `⇊${compactions}`));
     }
-    if (annot.length === 0)
-        return tokenStr;
-    return `${tokenStr} (${annot.join(" · ")})`;
+    return annot.length === 0 ? "" : `(${annot.join(" · ")})`;
+}
+export function formatSessionTokens(tokens, percent, theme, compactions = 0) {
+    const annotation = formatSessionTokenAnnotations(percent, theme, compactions);
+    return formatTokens(tokens) + (annotation ? ` ${annotation}` : "");
 }
 /** Format turn count with optional max limit: "↻5≤30" or "↻5". */
 export function formatTurns(turnCount, maxTurns) {
@@ -140,27 +145,56 @@ export function formatMs(ms) {
         return `${(ms / 60_000).toFixed(1)}m`;
     return `${(ms / 1000).toFixed(1)}s`;
 }
-export function formatAgentMetrics(record, activity, theme, showCost, now = Date.now()) {
-    const parts = [];
+const METRIC_KEYS = [
+    "turns",
+    "tools",
+    "tokenCount",
+    "tokenContext",
+    "cost",
+    "elapsedDuration",
+    "idleDuration",
+];
+export function getAgentMetricParts(record, activity, theme, showCost, now = Date.now()) {
     const toolUses = activity?.toolUses ?? record.toolUses;
-    if (activity)
-        parts.push(formatTurns(activity.turnCount, activity.maxTurns));
-    if (toolUses > 0)
-        parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
     const tokens = getLifetimeTotal(record.lifetimeUsage);
-    if (tokens > 0) {
-        parts.push(formatSessionTokens(tokens, getSessionContextPercent(activity?.session ?? record.session), theme, record.compactionCount));
-    }
-    if (showCost) {
-        const cost = formatCost(getLifetimeCost(record.lifetimeUsage));
-        if (cost)
-            parts.push(cost);
-    }
-    parts.push(`${formatMs((record.completedAt ?? now) - record.startedAt)} elapsed`);
-    if (record.status === "running") {
-        parts.push(`idle ${formatMs(now - (record.lastProgressAt ?? record.startedAt))}`);
-    }
-    return parts.join(" · ");
+    return {
+        turns: activity ? formatTurns(activity.turnCount, activity.maxTurns) : "",
+        tools: toolUses > 0 ? `${toolUses} tool use${toolUses === 1 ? "" : "s"}` : "",
+        tokenCount: tokens > 0 ? formatTokens(tokens) : "",
+        tokenContext: tokens > 0
+            ? formatSessionTokenAnnotations(getSessionContextPercent(activity?.session ?? record.session), theme, record.compactionCount)
+            : "",
+        cost: showCost ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "",
+        elapsedDuration: formatMs((record.completedAt ?? now) - record.startedAt),
+        idleDuration: record.status === "running"
+            ? formatMs(now - (record.lastProgressAt ?? record.startedAt))
+            : "",
+    };
+}
+export function getAgentMetricWidths(parts) {
+    return Object.fromEntries(METRIC_KEYS.map(key => [
+        key,
+        Math.max(0, ...parts.map(value => visibleWidth(value[key]))),
+    ]));
+}
+export function formatAgentMetrics(parts, widths) {
+    const left = (key) => padColumn(parts[key], widths[key]);
+    const right = (key) => " ".repeat(Math.max(0, widths[key] - visibleWidth(parts[key]))) + parts[key];
+    const columns = [
+        widths.turns > 0 ? left("turns") : "",
+        widths.tools > 0 ? left("tools") : "",
+        widths.tokenCount > 0
+            ? right("tokenCount") + (widths.tokenContext > 0 ? ` ${left("tokenContext")}` : "")
+            : "",
+        widths.cost > 0 ? right("cost") : "",
+        widths.elapsedDuration > 0 ? `${right("elapsedDuration")} elapsed` : "",
+        widths.idleDuration > 0
+            ? parts.idleDuration
+                ? `idle ${right("idleDuration")}`
+                : " ".repeat("idle ".length + widths.idleDuration)
+            : "",
+    ];
+    return columns.filter(Boolean).join(" · ");
 }
 /** Format duration from start/completed timestamps. */
 export function formatDuration(startedAt, completedAt) {
@@ -336,7 +370,7 @@ export class AgentWidget {
         this.finishedTurnAge.delete(agentId);
     }
     /** Render a finished agent line. */
-    renderFinishedLine(a, theme, widths, width) {
+    renderFinishedLine(a, theme, widths, width, metrics) {
         let icon;
         let statusText;
         if (a.status === "completed") {
@@ -365,14 +399,13 @@ export class AgentWidget {
             icon = theme.fg("error", "✗");
             statusText = theme.fg("warning", " aborted");
         }
-        const metrics = formatAgentMetrics(a, this.agentActivity.get(a.id), theme, this.showCost());
         const name = renderAgentRecordName(a, theme, { fallbackColor: "dim" }, widths.name);
         const description = theme.fg("dim", padColumn(a.description, widths.description));
         const posture = theme.fg("dim", padColumn(formatAgentPosture(a), widths.posture));
         const left = `${theme.fg("dim", "├─")} ${icon} ${name}  ${description}  ${posture}`;
         const metricWidth = Math.max(0, widths.metrics - visibleWidth(statusText));
         const right = fgPreservingNestedStyles(theme, "dim", padColumn(metrics, metricWidth)) + statusText;
-        return rightAlign(left, right, width);
+        return appendMetrics(left, right, width);
     }
     /**
      * Render the widget content. Called from the registered widget's render() callback,
@@ -407,9 +440,14 @@ export class AgentWidget {
             columnRecords = [...visibleRunning, ...visibleFinished];
         }
         const renderedAt = Date.now();
-        const metrics = new Map(columnRecords.map(record => [
+        const metricParts = new Map(columnRecords.map(record => [
             record.id,
-            formatAgentMetrics(record, this.agentActivity.get(record.id), theme, this.showCost(), renderedAt),
+            getAgentMetricParts(record, this.agentActivity.get(record.id), theme, this.showCost(), renderedAt),
+        ]));
+        const metricColumns = getAgentMetricWidths([...metricParts.values()]);
+        const metrics = new Map([...metricParts].map(([id, parts]) => [
+            id,
+            formatAgentMetrics(parts, metricColumns),
         ]));
         const nameWidth = Math.max(0, ...columnRecords.map(agentRecordNameWidth));
         const postureWidth = Math.max(0, ...columnRecords.map(a => visibleWidth(formatAgentPosture(a))));
@@ -438,7 +476,7 @@ export class AgentWidget {
         };
         const finishedLines = [];
         for (const a of finished) {
-            finishedLines.push(this.renderFinishedLine(a, theme, widths, w));
+            finishedLines.push(this.renderFinishedLine(a, theme, widths, w, metrics.get(a.id) ?? ""));
         }
         const runningLines = []; // each entry is [header, activity]
         for (const a of running) {
@@ -451,7 +489,7 @@ export class AgentWidget {
             const left = theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${name}  ${description}  ${posture}`;
             const right = fgPreservingNestedStyles(theme, "dim", padColumn(statsText, widths.metrics));
             runningLines.push([
-                rightAlign(left, right, w),
+                appendMetrics(left, right, w),
                 truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
             ]);
         }

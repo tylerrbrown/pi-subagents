@@ -18,9 +18,12 @@ import type { AgentRecord } from "../types.js";
 import {
   type AgentActivity,
   agentRecordNameWidth,
+  appendMetrics,
   fgPreservingNestedStyles,
   formatAgentMetrics,
   formatAgentPosture,
+  getAgentMetricParts,
+  getAgentMetricWidths,
   padColumn,
   renderAgentRecordName,
   type Theme,
@@ -381,15 +384,20 @@ export class FleetList {
 
     const visibleAgents = agents.slice(start, start + visible);
     const renderedAt = Date.now();
-    const metrics = new Map(visibleAgents.map(agent => [
+    const metricParts = new Map(visibleAgents.map(agent => [
       agent.record.id,
-      formatAgentMetrics(
+      getAgentMetricParts(
         agent.record,
         this.agentActivity.get(agent.record.id),
         theme,
         this.showCost(),
         renderedAt,
       ),
+    ]));
+    const metricColumns = getAgentMetricWidths([...metricParts.values()]);
+    const metrics = new Map([...metricParts].map(([id, parts]) => [
+      id,
+      formatAgentMetrics(parts, metricColumns),
     ]));
     const nameWidth = Math.min(18, Math.max(0, ...visibleAgents.map(a => agentRecordNameWidth(a.record))));
     const postureWidth = Math.min(32, Math.max(0, ...visibleAgents.map(a => visibleWidth(formatAgentPosture(a.record)))));
@@ -458,6 +466,6 @@ export class FleetList {
       selected ? "text" : "dim",
       padColumn(metrics, widths.metrics),
     );
-    return rightAlign(left, stats, width);
+    return appendMetrics(left, stats, width);
   }
 }

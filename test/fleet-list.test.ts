@@ -258,16 +258,30 @@ describe("FleetList navigation", () => {
       handle: "builder",
       description: "Build Pi Informer adapter",
       toolUses: 13,
+      lifetimeUsage: { input: 20_800, output: 0, cacheWrite: 0 },
+      lastProgressAt: Date.now() - 9_000,
       invocation: { thinking: "medium" },
-      session: { ...FAKE_SESSION, model: { id: "gpt-5.6-sol" }, thinkingLevel: "medium" } as any,
+      session: {
+        ...FAKE_SESSION,
+        model: { id: "gpt-5.6-sol" },
+        thinkingLevel: "medium",
+        getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: 2 } }),
+      } as any,
     });
     const second = makeRecord({
       id: "a2",
       handle: "builder-2",
       description: "Build Work Informer enforcement",
       toolUses: 144,
+      lifetimeUsage: { input: 9_600, output: 0, cacheWrite: 0 },
+      lastProgressAt: Date.now() - 10_000,
       invocation: { thinking: "high" },
-      session: { ...FAKE_SESSION, model: { id: "grok-4.6" }, thinkingLevel: "high" } as any,
+      session: {
+        ...FAKE_SESSION,
+        model: { id: "grok-4.6" },
+        thinkingLevel: "high",
+        getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: 88 } }),
+      } as any,
     });
     const activity = new Map<string, AgentActivity>([
       ["a1", { activeTools: new Map(), toolUses: 13, responseText: "", turnCount: 9 }],
@@ -281,6 +295,10 @@ describe("FleetList navigation", () => {
     expect(b).toMatch(/builder-2\s+Build Work Informer enforcement\s+grok-4\.6\/high\/high\s+↻66/);
     expect(a.indexOf("gpt-5.6-sol")).toBe(b.indexOf("grok-4.6"));
     expect(a.indexOf("↻9")).toBe(b.indexOf("↻66"));
+    expect(a.indexOf("token")).toBe(b.indexOf("token"));
+    expect(a.indexOf("elapsed")).toBe(b.indexOf("elapsed"));
+    expect(a.indexOf("idle")).toBe(b.indexOf("idle"));
+    expect(a.indexOf("↻9") - a.indexOf("gpt-5.6-sol")).toBeLessThan(30);
 
     const narrow = harness([first, second], activity, ansiTheme).render(120).map(plain);
     const narrowBuilder = narrow.find(line => line.includes("builder-2"))!;

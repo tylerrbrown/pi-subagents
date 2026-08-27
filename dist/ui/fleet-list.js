@@ -12,7 +12,7 @@
  */
 import { Editor, isKeyRelease, Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge } from "../agent-color.js";
-import { agentRecordNameWidth, fgPreservingNestedStyles, formatAgentMetrics, formatAgentPosture, padColumn, renderAgentRecordName, } from "./agent-widget.js";
+import { agentRecordNameWidth, appendMetrics, fgPreservingNestedStyles, formatAgentMetrics, formatAgentPosture, getAgentMetricParts, getAgentMetricWidths, padColumn, renderAgentRecordName, } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 /** Widget key for the below-editor fleet list. */
 const FLEET_KEY = "fleet";
@@ -341,9 +341,14 @@ export class FleetList {
         const hiddenBelow = agents.length - (start + visible);
         const visibleAgents = agents.slice(start, start + visible);
         const renderedAt = Date.now();
-        const metrics = new Map(visibleAgents.map(agent => [
+        const metricParts = new Map(visibleAgents.map(agent => [
             agent.record.id,
-            formatAgentMetrics(agent.record, this.agentActivity.get(agent.record.id), theme, this.showCost(), renderedAt),
+            getAgentMetricParts(agent.record, this.agentActivity.get(agent.record.id), theme, this.showCost(), renderedAt),
+        ]));
+        const metricColumns = getAgentMetricWidths([...metricParts.values()]);
+        const metrics = new Map([...metricParts].map(([id, parts]) => [
+            id,
+            formatAgentMetrics(parts, metricColumns),
         ]));
         const nameWidth = Math.min(18, Math.max(0, ...visibleAgents.map(a => agentRecordNameWidth(a.record))));
         const postureWidth = Math.min(32, Math.max(0, ...visibleAgents.map(a => visibleWidth(formatAgentPosture(a.record)))));
@@ -380,6 +385,6 @@ export class FleetList {
         const posture = theme.fg(selected ? "text" : "dim", padColumn(formatAgentPosture(record), widths.posture));
         const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}  ${posture}`;
         const stats = fgPreservingNestedStyles(theme, selected ? "text" : "dim", padColumn(metrics, widths.metrics));
-        return rightAlign(left, stats, width);
+        return appendMetrics(left, stats, width);
     }
 }

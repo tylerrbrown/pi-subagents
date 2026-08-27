@@ -176,16 +176,28 @@ describe("AgentWidget", () => {
       handle: "builder",
       description: "Build Pi Informer adapter",
       toolUses: 13,
+      lifetimeUsage: { input: 20_800, output: 0, cacheWrite: 0 },
+      lastProgressAt: Date.now() - 9_000,
       invocation: { thinking: "medium" },
-      session: { model: { id: "gpt-5.6-sol" }, thinkingLevel: "medium" },
+      session: {
+        model: { id: "gpt-5.6-sol" },
+        thinkingLevel: "medium",
+        getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: 2 } }),
+      },
     });
     const second = makeRecord("a2", { isBackground: true }) as any;
     Object.assign(second, {
       handle: "builder-2",
       description: "Build Work Informer enforcement",
       toolUses: 144,
+      lifetimeUsage: { input: 9_600, output: 0, cacheWrite: 0 },
+      lastProgressAt: Date.now() - 10_000,
       invocation: { thinking: "high" },
-      session: { model: { id: "grok-4.6" }, thinkingLevel: "high" },
+      session: {
+        model: { id: "grok-4.6" },
+        thinkingLevel: "high",
+        getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: 88 } }),
+      },
     });
     const activity = new Map<string, AgentActivity>([
       ["a1", { activeTools: new Map(), toolUses: 13, responseText: "", turnCount: 9 }],
@@ -199,6 +211,10 @@ describe("AgentWidget", () => {
     expect(b).toMatch(/builder-2\s+Build Work Informer enforcement\s+grok-4\.6\/high\/high\s+↻66/);
     expect(a.indexOf("gpt-5.6-sol")).toBe(b.indexOf("grok-4.6"));
     expect(a.indexOf("↻9")).toBe(b.indexOf("↻66"));
+    expect(a.indexOf("token")).toBe(b.indexOf("token"));
+    expect(a.indexOf("elapsed")).toBe(b.indexOf("elapsed"));
+    expect(a.indexOf("idle")).toBe(b.indexOf("idle"));
+    expect(a.indexOf("↻9") - a.indexOf("gpt-5.6-sol")).toBeLessThan(30);
     expect(a).toContain("idle ");
     expect(b).toContain("idle ");
     const compact = renderLines({ listAgents: () => [first, second] }, "a1", () => "all", activity, 40);
@@ -219,6 +235,20 @@ describe("AgentWidget", () => {
     const visible = output.split("\n").find(line => line.includes("visible 0"))!;
     expect(visible).toContain("gpt-5.6-sol/med/med");
     expect(visible).toContain("idle ");
+  });
+
+  it("does not label a finished row idle beside a running row", () => {
+    const running = makeRecord("running", { isBackground: true }) as any;
+    const finished = makeRecord("finished", { isBackground: true }) as any;
+    finished.status = "completed";
+    finished.completedAt = Date.now();
+    const output = renderLines(
+      { listAgents: () => [running, finished] },
+      "running",
+      () => "all",
+    ).split("\n");
+    expect(output.find(line => line.includes("running description"))).toContain("idle ");
+    expect(output.find(line => line.includes("finished description"))).not.toContain("idle");
   });
 
   it("renders a timed-out agent as an error, not a completion", () => {
