@@ -17,6 +17,10 @@ const ENTER = "\r";
 const DOWN_RELEASE = "\x1b[1;1:3B";
 
 const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => `*${s}*` };
+const ansiTheme = {
+  fg: (_color: string, text: string) => `\u001b[31m${text}\u001b[39m`,
+  bold: (text: string) => text,
+};
 
 /** An agent that renders as a badge — no default agent configures a color. */
 const BADGED_TYPE = "colored-reviewer";
@@ -88,7 +92,11 @@ interface Harness {
   widgetTui: { requestRender(): void; focusedComponent?: unknown };
 }
 
-function harness(agents: AgentRecord[]): Harness {
+function harness(
+  agents: AgentRecord[],
+  activity = new Map<string, AgentActivity>(),
+  renderTheme = theme,
+): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   let widgetFactory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
   let editorText = "";
@@ -116,7 +124,7 @@ function harness(agents: AgentRecord[]): Harness {
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map());
+  const fleet = new FleetList(manager, activity);
   fleet.setUICtx(ui);
   fleet.update();
 
@@ -126,7 +134,7 @@ function harness(agents: AgentRecord[]): Harness {
     manager,
     overlayComponent: () => overlayComponent,
     press: (data) => inputHandler?.(data),
-    render: (width = 120) => (widgetFactory ? widgetFactory(fakeTui, theme).render(width) : []),
+    render: (width = 120) => (widgetFactory ? widgetFactory(fakeTui, renderTheme).render(width) : []),
     setEditorText: (t) => { editorText = t; },
     overlayOpened: () => opened,
     overlayClosed: () => closed,
@@ -219,13 +227,13 @@ describe("FleetList navigation", () => {
     // Selection marker keeps accent color; row content uses primary text color.
     expect(selected).toContain("<accent>●</accent>");
     expect(selected).toContain("<text>one</text>");
-    expect(selected).toMatch(/<text>\d+s · idle \d+s · ↓ [\d.]+k? tokens<\/text>/);
+    expect(selected).toMatch(/<text>[\d.]+k? token · [\d.]+s elapsed · idle [\d.]+s/);
     // Agent display name rendered with the text token too (this type has no badge).
     expect(selected).toContain(`<text>${getDisplayName("general-purpose")}</text>`);
     // Inactive rows keep the muted/dim treatment.
     const unselected = h.render().find(l => l.includes("two"))!;
     expect(unselected).toContain("<dim>○</dim>");
-    expect(unselected).toMatch(/<dim>\d+s · idle \d+s · ↓ [\d.]+k? tokens<\/dim>/);
+    expect(unselected).toMatch(/<dim>[\d.]+k? token · [\d.]+s elapsed · idle [\d.]+s<\/dim>/);
     expect(unselected).not.toContain("<text>");
   });
 
@@ -238,10 +246,53 @@ describe("FleetList navigation", () => {
         model: { id: "gpt-5.6-sol" },
         thinkingLevel: "medium",
       } as any,
-    })]);
+    })], new Map(), ansiTheme);
 
     expect(plain(h.render().find(l => l.includes("gpt-5.6-sol"))!))
       .toContain("gpt-5.6-sol/med/med");
+  });
+
+  it("aligns name, description, posture, and metrics columns", () => {
+    const first = makeRecord({
+      id: "a1",
+      handle: "builder",
+      description: "Build Pi Informer adapter",
+      toolUses: 13,
+      invocation: { thinking: "medium" },
+      session: { ...FAKE_SESSION, model: { id: "gpt-5.6-sol" }, thinkingLevel: "medium" } as any,
+    });
+    const second = makeRecord({
+      id: "a2",
+      handle: "builder-2",
+      description: "Build Work Informer enforcement",
+      toolUses: 144,
+      invocation: { thinking: "high" },
+      session: { ...FAKE_SESSION, model: { id: "grok-4.6" }, thinkingLevel: "high" } as any,
+    });
+    const activity = new Map<string, AgentActivity>([
+      ["a1", { activeTools: new Map(), toolUses: 13, responseText: "", turnCount: 9 }],
+      ["a2", { activeTools: new Map(), toolUses: 144, responseText: "", turnCount: 66 }],
+    ]);
+    const rows = harness([first, second], activity, ansiTheme).render(160).map(plain);
+    const a = rows.find(line => line.includes("Build Pi Informer"))!;
+    const b = rows.find(line => line.includes("Build Work Informer"))!;
+
+    expect(a).toMatch(/builder\s+Build Pi Informer adapter\s+gpt-5\.6-sol\/med\/med\s+↻9/);
+    expect(b).toMatch(/builder-2\s+Build Work Informer enforcement\s+grok-4\.6\/high\/high\s+↻66/);
+    expect(a.indexOf("gpt-5.6-sol")).toBe(b.indexOf("grok-4.6"));
+    expect(a.indexOf("↻9")).toBe(b.indexOf("↻66"));
+
+    const narrow = harness([first, second], activity, ansiTheme).render(120).map(plain);
+    const narrowBuilder = narrow.find(line => line.includes("builder-2"))!;
+    expect(narrowBuilder).toContain("↻66");
+    expect(narrowBuilder).toContain("idle ");
+
+    second.handle = `builder-${"x".repeat(56)}`;
+    const longName = harness([first, second], activity, ansiTheme).render(120).map(plain);
+    const longNameRow = longName.find(line => line.includes("↻66"))!;
+    expect(longNameRow).toContain("idle ");
+    const compact = harness([first, second], activity, ansiTheme).render(40).map(plain);
+    expect(compact.some(line => line.includes("idle "))).toBe(true);
   });
 
   it("keeps a color badge on the selected row, bolded, without shifting it (#230)", () => {
@@ -390,7 +441,7 @@ describe("FleetList vs other focused components (#123)", () => {
 });
 
 describe("FleetList rendering", () => {
-  it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
+  it("renders main + agent rows with markers, name, description and metrics", () => {
     const h = harness([makeRecord({ description: "Sleep then report 1" })]);
     const lines = h.render(120);
     // hint + blank + main + one agent
@@ -399,8 +450,8 @@ describe("FleetList rendering", () => {
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("○");
     expect(agentLine).toContain(getDisplayName("general-purpose"));
-    expect(agentLine).toContain("↓ 13.1k tokens");
-    expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
+    expect(agentLine).toContain("13.1k token");
+    expect(agentLine).toMatch(/13\.1k token · [\d.]+s elapsed/);
   });
 
   it("orders agents earliest-launched first (top)", () => {
@@ -550,8 +601,19 @@ describe("FleetList cost display", () => {
 
   it("appends the cost after the token count when enabled", () => {
     const out = row(true, 0.0042);
-    expect(out).toContain("13.1k tokens");
+    expect(out).toContain("13.1k token");
     expect(out).toContain("~$0.0042");
+  });
+
+  it("keeps context percentage from the record when no activity entry exists", () => {
+    const session = {
+      ...FAKE_SESSION,
+      getSessionStats: () => ({
+        tokens: { input: 0, output: 0, cacheWrite: 0 },
+        contextUsage: { percent: 88 },
+      }),
+    } as any;
+    expect(row(false, 0, undefined, { session })).toContain("88%");
   });
 
   it("shows idle age from the live activity tracker", () => {
@@ -561,7 +623,7 @@ describe("FleetList cost display", () => {
       expect(row(false, 0, undefined, {
         startedAt: 10_000,
         lastProgressAt: 17_000,
-      })).toContain("idle 3s");
+      })).toContain("idle 3.0s");
     } finally {
       vi.useRealTimers();
     }
@@ -586,7 +648,7 @@ describe("FleetList cost display", () => {
     } as unknown as AgentActivity]]);
 
     for (const out of [row(true, 0.0042, tracked), row(true, 0.0042)]) {
-      expect(out).toContain("13.1k tokens");
+      expect(out).toContain("13.1k token");
       expect(out).toContain("~$0.0042");
     }
   });

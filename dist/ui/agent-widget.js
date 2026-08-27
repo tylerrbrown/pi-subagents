@@ -4,8 +4,8 @@
  * Displays a tree of agents with animated spinners, live stats, and activity descriptions.
  * Uses the callback form of setWidget for themed rendering.
  */
-import { truncateToWidth } from "@earendil-works/pi-tui";
-import { renderAgentName } from "../agent-color.js";
+import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { hasAgentBadge, renderAgentNameLabel } from "../agent-color.js";
 import { getConfig } from "../agent-types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 // ---- Constants ----
@@ -53,6 +53,43 @@ export function formatTokens(count) {
  * same reason a real cost too small for four decimals reads `<$0.0001` — it was
  * measured, and rounding it to `~$0.0000` would say the opposite.
  */
+export function agentRecordName(record) {
+    return record.alias ?? record.handle ?? getDisplayName(record.type);
+}
+export function agentRecordNameWidth(record) {
+    return visibleWidth(agentRecordName(record)) + (hasAgentBadge(record.type) ? 2 : 0);
+}
+export function renderAgentRecordName(record, theme, style = {}, width) {
+    const badgePadding = hasAgentBadge(record.type) ? 2 : 0;
+    const name = width === undefined
+        ? agentRecordName(record)
+        : padColumn(agentRecordName(record), Math.max(0, width - badgePadding));
+    return renderAgentNameLabel(name, getConfig(record.type).color, theme, style);
+}
+function compactLevel(level) {
+    return level === "medium" ? "med" : level ?? "-";
+}
+/** `gpt-5.6-sol/med/med` — model/requested effort/effective thinking. */
+export function formatAgentPosture(record) {
+    const session = record.session;
+    const thinking = session?.thinkingLevel ?? record.invocation?.thinking;
+    const effort = record.invocation?.thinking ?? thinking;
+    const model = session?.model?.id ?? record.invocation?.modelName;
+    return model ? `${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
+}
+export function padColumn(text, width) {
+    const clipped = truncateToWidth(text, width);
+    return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
+}
+function rightAlign(left, right, width) {
+    const rightWidth = visibleWidth(right);
+    if (rightWidth >= width)
+        return sliceByColumn(right, rightWidth - width, width, true);
+    const leftWidth = Math.max(0, width - rightWidth - 1);
+    const clippedLeft = truncateToWidth(left, leftWidth);
+    const gap = Math.max(1, width - visibleWidth(clippedLeft) - rightWidth);
+    return truncateToWidth(clippedLeft + " ".repeat(gap) + right, width);
+}
 export function formatCost(cost) {
     if (!(cost > 0))
         return ""; // also catches NaN
@@ -102,6 +139,28 @@ export function formatMs(ms) {
     if (ms >= 60_000)
         return `${(ms / 60_000).toFixed(1)}m`;
     return `${(ms / 1000).toFixed(1)}s`;
+}
+export function formatAgentMetrics(record, activity, theme, showCost, now = Date.now()) {
+    const parts = [];
+    const toolUses = activity?.toolUses ?? record.toolUses;
+    if (activity)
+        parts.push(formatTurns(activity.turnCount, activity.maxTurns));
+    if (toolUses > 0)
+        parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
+    const tokens = getLifetimeTotal(record.lifetimeUsage);
+    if (tokens > 0) {
+        parts.push(formatSessionTokens(tokens, getSessionContextPercent(activity?.session ?? record.session), theme, record.compactionCount));
+    }
+    if (showCost) {
+        const cost = formatCost(getLifetimeCost(record.lifetimeUsage));
+        if (cost)
+            parts.push(cost);
+    }
+    parts.push(`${formatMs((record.completedAt ?? now) - record.startedAt)} elapsed`);
+    if (record.status === "running") {
+        parts.push(`idle ${formatMs(now - (record.lastProgressAt ?? record.startedAt))}`);
+    }
+    return parts.join(" · ");
 }
 /** Format duration from start/completed timestamps. */
 export function formatDuration(startedAt, completedAt) {
@@ -277,9 +336,7 @@ export class AgentWidget {
         this.finishedTurnAge.delete(agentId);
     }
     /** Render a finished agent line. */
-    renderFinishedLine(a, theme) {
-        const modeLabel = getPromptModeLabel(a.type);
-        const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
+    renderFinishedLine(a, theme, widths, width) {
         let icon;
         let statusText;
         if (a.status === "completed") {
@@ -308,21 +365,14 @@ export class AgentWidget {
             icon = theme.fg("error", "✗");
             statusText = theme.fg("warning", " aborted");
         }
-        const parts = [];
-        const activity = this.agentActivity.get(a.id);
-        if (activity)
-            parts.push(formatTurns(activity.turnCount, activity.maxTurns));
-        if (a.toolUses > 0)
-            parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
-        // From the record, not the activity tracker: that entry is deleted the
-        // moment an agent finishes, and "what did it cost" is a question asked
-        // about finished agents.
-        const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
-        if (costText)
-            parts.push(costText);
-        parts.push(duration);
-        const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-        return `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+        const metrics = formatAgentMetrics(a, this.agentActivity.get(a.id), theme, this.showCost());
+        const name = renderAgentRecordName(a, theme, { fallbackColor: "dim" }, widths.name);
+        const description = theme.fg("dim", padColumn(a.description, widths.description));
+        const posture = theme.fg("dim", padColumn(formatAgentPosture(a), widths.posture));
+        const left = `${theme.fg("dim", "├─")} ${icon} ${name}  ${description}  ${posture}`;
+        const metricWidth = Math.max(0, widths.metrics - visibleWidth(statusText));
+        const right = fgPreservingNestedStyles(theme, "dim", padColumn(metrics, metricWidth)) + statusText;
+        return rightAlign(left, right, width);
     }
     /**
      * Render the widget content. Called from the registered widget's render() callback,
@@ -346,41 +396,62 @@ export class AgentWidget {
         const frame = SPINNER[this.widgetFrame % SPINNER.length];
         // Build sections separately for overflow-aware assembly.
         // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
+        const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 line
+        const totalBody = finished.length + running.length * 2 + (queued.length > 0 ? 1 : 0);
+        let columnRecords = [...running, ...finished];
+        if (totalBody > maxBody) {
+            let budget = maxBody - 1 - (queued.length > 0 ? 1 : 0); // overflow + queue rows
+            const visibleRunning = running.slice(0, Math.max(0, Math.floor(budget / 2)));
+            budget -= visibleRunning.length * 2;
+            const visibleFinished = finished.slice(0, Math.max(0, budget));
+            columnRecords = [...visibleRunning, ...visibleFinished];
+        }
+        const renderedAt = Date.now();
+        const metrics = new Map(columnRecords.map(record => [
+            record.id,
+            formatAgentMetrics(record, this.agentActivity.get(record.id), theme, this.showCost(), renderedAt),
+        ]));
+        const nameWidth = Math.max(0, ...columnRecords.map(agentRecordNameWidth));
+        const postureWidth = Math.max(0, ...columnRecords.map(a => visibleWidth(formatAgentPosture(a))));
+        const finishedStatusWidth = (record) => {
+            let status = "";
+            if (record.status === "steered")
+                status = " (turn limit)";
+            else if (record.status === "stopped")
+                status = " stopped";
+            else if (record.status === "timeout")
+                status = " timed out";
+            else if (record.status === "error")
+                status = ` error${record.error ? `: ${record.error.slice(0, 60)}` : ""}`;
+            else if (record.status === "aborted")
+                status = " aborted";
+            return visibleWidth(status);
+        };
+        const metricWidth = Math.max(0, ...columnRecords.map(record => visibleWidth(metrics.get(record.id) ?? "") + finishedStatusWidth(record)));
+        const renderedNameWidth = Math.min(18, nameWidth);
+        const renderedPostureWidth = Math.min(32, postureWidth);
+        const widths = {
+            name: renderedNameWidth,
+            description: Math.max(0, Math.min(40, Math.max(0, ...columnRecords.map(a => visibleWidth(a.description))), w - 11 - renderedNameWidth - renderedPostureWidth - metricWidth)),
+            posture: renderedPostureWidth,
+            metrics: metricWidth,
+        };
         const finishedLines = [];
         for (const a of finished) {
-            finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
+            finishedLines.push(this.renderFinishedLine(a, theme, widths, w));
         }
         const runningLines = []; // each entry is [header, activity]
         for (const a of running) {
-            const modeLabel = getPromptModeLabel(a.type);
-            const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-            const now = Date.now();
-            const elapsed = formatMs(now - a.startedAt);
             const bg = this.agentActivity.get(a.id);
-            const toolUses = bg?.toolUses ?? a.toolUses;
-            // Spend comes from the record, never from the activity tracker: the record
-            // is the one that survives the agent finishing, and the one nested-tools
-            // folds a hidden child's spend into. Reading the tracker while an agent
-            // runs and the record once it stops made the figure jump at completion.
-            const tokens = getLifetimeTotal(a.lifetimeUsage);
-            const contextPercent = getSessionContextPercent(bg?.session);
-            const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
-            const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
-            const parts = [];
-            if (bg)
-                parts.push(formatTurns(bg.turnCount, bg.maxTurns));
-            if (toolUses > 0)
-                parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
-            if (tokenText)
-                parts.push(tokenText);
-            if (costText)
-                parts.push(costText);
-            parts.push(`${elapsed} elapsed`);
-            parts.push(`idle ${formatMs(now - (a.lastProgressAt ?? a.startedAt))}`);
-            const statsText = parts.join(" · ");
+            const statsText = metrics.get(a.id) ?? "";
             const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
+            const name = renderAgentRecordName(a, theme, { bold: true }, widths.name);
+            const description = theme.fg("muted", padColumn(a.description, widths.description));
+            const posture = theme.fg("dim", padColumn(formatAgentPosture(a), widths.posture));
+            const left = theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${name}  ${description}  ${posture}`;
+            const right = fgPreservingNestedStyles(theme, "dim", padColumn(statsText, widths.metrics));
             runningLines.push([
-                truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+                rightAlign(left, right, w),
                 truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
             ]);
         }
@@ -388,8 +459,6 @@ export class AgentWidget {
             ? truncate(theme.fg("dim", "├─") + ` ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
             : undefined;
         // Assemble with overflow cap (heading + overflow indicator = 2 reserved lines).
-        const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 line
-        const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
         const lines = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
         if (totalBody <= maxBody) {
             // Everything fits — add all lines and fix up connectors for the last item.

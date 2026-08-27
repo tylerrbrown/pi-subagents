@@ -102,11 +102,11 @@ The extension renders a persistent widget above the editor showing active agents
 
 ```
 ● Agents
-├─ ⠹ Agent  Refactor auth module · ↻5≤30 · 5 tool uses · 33.8k token (62%) · 12.3s elapsed · idle 0.4s
+├─ ⠹ builder    Refactor auth module  gpt-5.6-sol/med/med  ↻5≤30 · 5 tool uses · 33.8k token (62%) · 12.3s elapsed · idle 0.4s
 │    ⎿  editing 2 files…
-├─ ⠹ Explore  Find auth files · ↻3 · 3 tool uses · 12.4k token (8%) · 4.1s elapsed · idle 1.2s
+├─ ⠹ explore    Find auth files       grok-4.6/high/high   ↻3 · 3 tool uses · 12.4k token (8%) · 4.1s elapsed · idle 1.2s
 │    ⎿  searching…
-├─ ⠹ Agent  Long-running task · ↻42 · 38 tool uses · 91.0k token (84% · ⇊2) · 137.0s elapsed · idle 64.0s
+├─ ⠹ builder-2  Long-running task     grok-4.6/high/high   ↻42 · 38 tool uses · 91.0k token (84% · ⇊2) · 2.3m elapsed · idle 1.1m
 │    ⎿  reading…
 └─ 2 queued
 ```
@@ -125,12 +125,12 @@ While subagents are running, a Claude Code-style navigable list renders **below*
   esc to interrupt · ← for agents · ↓ to manage
 
   ● main
-  ○ general-purpose  gpt-5.6-sol/med/med  Sleep then report 1  11s · idle 2s · ↓ 13.1k tokens
-  ○ general-purpose  grok-4.6/high/high   Sleep then report 2  11s · idle 9s · ↓ 13.1k tokens
-                                                                                   ↓ 3 more
+  ○ builder    Sleep then report 1  gpt-5.6-sol/med/med  ↻9  · 13 tool uses · 13.1k token · 11s elapsed · idle 2s
+  ○ builder-2  Sleep then report 2  grok-4.6/high/high   ↻15 · 42 tool uses · 88.7k token · 11s elapsed · idle 9s
+                                                                                                      ↓ 3 more
 ```
 
-The compact posture is `model/requested effort/effective thinking`; differing final fields expose a clamped request. The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+Rows use aligned `name → description → model/requested effort/effective thinking → metrics` columns; differing posture fields expose a clamped request. The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
 
 ### Agent mentions
 

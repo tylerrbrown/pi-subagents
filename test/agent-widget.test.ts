@@ -94,12 +94,14 @@ describe("AgentWidget", () => {
   }
 
   /** Render the widget for a manager and return the produced lines ("" if nothing rendered). */
-  function renderLines(manager: unknown, activityId: string, mode?: () => WidgetMode): string {
-    const widget = new AgentWidget(
-      manager as any,
-      new Map([[activityId, makeActivity()]]),
-      mode,
-    );
+  function renderLines(
+    manager: unknown,
+    activityId: string,
+    mode?: () => WidgetMode,
+    activity = new Map([[activityId, makeActivity()]]),
+    columns = 120,
+  ): string {
+    const widget = new AgentWidget(manager as any, activity, mode);
     let factory: any;
     widget.setUICtx({
       setStatus: () => {},
@@ -107,7 +109,7 @@ describe("AgentWidget", () => {
     });
     widget.update();
     if (!factory) return "";
-    return factory({ terminal: { columns: 120 }, requestRender: () => {} }, theme)
+    return factory({ terminal: { columns }, requestRender: () => {} }, theme)
       .render()
       .join("\n");
   }
@@ -168,12 +170,63 @@ describe("AgentWidget", () => {
 
   // 'background' excludes only agents *known* to be foreground; one with no
   // isBackground flag (e.g. a cross-extension RPC spawn) is kept, not hidden.
+  it("aligns name, description, posture, and metrics columns", () => {
+    const first = makeRecord("a1", { isBackground: true }) as any;
+    Object.assign(first, {
+      handle: "builder",
+      description: "Build Pi Informer adapter",
+      toolUses: 13,
+      invocation: { thinking: "medium" },
+      session: { model: { id: "gpt-5.6-sol" }, thinkingLevel: "medium" },
+    });
+    const second = makeRecord("a2", { isBackground: true }) as any;
+    Object.assign(second, {
+      handle: "builder-2",
+      description: "Build Work Informer enforcement",
+      toolUses: 144,
+      invocation: { thinking: "high" },
+      session: { model: { id: "grok-4.6" }, thinkingLevel: "high" },
+    });
+    const activity = new Map<string, AgentActivity>([
+      ["a1", { activeTools: new Map(), toolUses: 13, responseText: "", turnCount: 9 }],
+      ["a2", { activeTools: new Map(), toolUses: 144, responseText: "", turnCount: 66 }],
+    ]);
+    const output = renderLines({ listAgents: () => [first, second] }, "a1", () => "all", activity, 160).split("\n");
+    const a = output.find(line => line.includes("Build Pi Informer"))!;
+    const b = output.find(line => line.includes("Build Work Informer"))!;
+
+    expect(a).toMatch(/builder\s+Build Pi Informer adapter\s+gpt-5\.6-sol\/med\/med\s+↻9/);
+    expect(b).toMatch(/builder-2\s+Build Work Informer enforcement\s+grok-4\.6\/high\/high\s+↻66/);
+    expect(a.indexOf("gpt-5.6-sol")).toBe(b.indexOf("grok-4.6"));
+    expect(a.indexOf("↻9")).toBe(b.indexOf("↻66"));
+    expect(a).toContain("idle ");
+    expect(b).toContain("idle ");
+    const compact = renderLines({ listAgents: () => [first, second] }, "a1", () => "all", activity, 40);
+    expect(compact).toContain("idle ");
+  });
+
+  it("hidden overflow rows do not widen visible columns", () => {
+    const records = Array.from({ length: 6 }, (_, index) => {
+      const record = makeRecord(`a${index}`, { isBackground: true }) as any;
+      record.handle = index === 5 ? "hidden-agent-with-a-very-long-name" : `builder-${index}`;
+      record.description = index === 5 ? "hidden description that should not affect visible rows" : `visible ${index}`;
+      record.invocation = { thinking: "medium" };
+      record.session = { model: { id: index === 5 ? "hidden-model-with-a-very-long-name" : "gpt-5.6-sol" }, thinkingLevel: "medium" };
+      return record;
+    });
+    const activity = new Map(records.map(record => [record.id, makeActivity()]));
+    const output = renderLines({ listAgents: () => records }, "a0", () => "all", activity);
+    const visible = output.split("\n").find(line => line.includes("visible 0"))!;
+    expect(visible).toContain("gpt-5.6-sol/med/med");
+    expect(visible).toContain("idle ");
+  });
+
   it("renders a timed-out agent as an error, not a completion", () => {
     const record = makeRecord("timeout", { isBackground: true }) as any;
     record.status = "timeout";
     record.completedAt = Date.now();
     const manager = { listAgents: () => [record] };
-    const output = renderLines(manager, "timeout", () => "background");
+    const output = renderLines(manager, "timeout", () => "background", undefined, 40);
     expect(output).toContain("✗");
     expect(output).toContain("timed out");
   });

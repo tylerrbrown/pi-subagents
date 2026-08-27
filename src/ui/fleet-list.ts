@@ -11,12 +11,20 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { hasAgentBadge, renderAgentName } from "../agent-color.js";
+import { Editor, isKeyRelease, Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { hasAgentBadge } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import {
+  type AgentActivity,
+  agentRecordNameWidth,
+  fgPreservingNestedStyles,
+  formatAgentMetrics,
+  formatAgentPosture,
+  padColumn,
+  renderAgentRecordName,
+  type Theme,
+} from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -65,18 +73,7 @@ export function formatFleetTokens(count: number): string {
   return `↓ ${compact} tokens`;
 }
 
-function compactLevel(level: string | undefined): string {
-  return level === "medium" ? "med" : level ?? "-";
-}
-
-/** `gpt-5.6-sol/med/med` — model/requested effort/effective thinking. */
-export function formatFleetPosture(record: AgentRecord): string {
-  const session = record.session as { model?: { id?: string }; thinkingLevel?: string } | undefined;
-  const thinking = session?.thinkingLevel ?? record.invocation?.thinking;
-  const effort = record.invocation?.thinking ?? thinking;
-  const model = session?.model?.id ?? record.invocation?.modelName;
-  return model ? `${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
-}
+export const formatFleetPosture = formatAgentPosture;
 
 /**
  * Place `right` flush to `width`, truncating `left` first so the stats survive.
@@ -85,6 +82,7 @@ export function formatFleetPosture(record: AgentRecord): string {
  */
 function rightAlign(left: string, right: string, width: number): string {
   const rightW = visibleWidth(right);
+  if (rightW >= width) return sliceByColumn(right, rightW - width, width, true);
   const maxLeft = Math.max(0, width - rightW - 1);
   const leftClamped = truncateToWidth(left, maxLeft);
   const gap = Math.max(1, width - visibleWidth(leftClamped) - rightW);
@@ -381,9 +379,44 @@ export class FleetList {
     const start = selAgent < visible ? 0 : selAgent - visible + 1;
     const hiddenBelow = agents.length - (start + visible);
 
+    const visibleAgents = agents.slice(start, start + visible);
+    const renderedAt = Date.now();
+    const metrics = new Map(visibleAgents.map(agent => [
+      agent.record.id,
+      formatAgentMetrics(
+        agent.record,
+        this.agentActivity.get(agent.record.id),
+        theme,
+        this.showCost(),
+        renderedAt,
+      ),
+    ]));
+    const nameWidth = Math.min(18, Math.max(0, ...visibleAgents.map(a => agentRecordNameWidth(a.record))));
+    const postureWidth = Math.min(32, Math.max(0, ...visibleAgents.map(a => visibleWidth(formatAgentPosture(a.record)))));
+    const metricWidth = Math.max(0, ...[...metrics.values()].map(visibleWidth));
+    const widths = {
+      name: nameWidth,
+      description: Math.max(0, Math.min(
+        40,
+        Math.max(0, ...visibleAgents.map(a => visibleWidth(a.record.description))),
+        width - 10 - nameWidth - postureWidth - metricWidth,
+      )),
+      posture: postureWidth,
+      metrics: metricWidth,
+    };
+
     if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), width));
     for (let a = start; a < start + visible; a++) {
-      lines.push(this.renderAgentRow(a + 1, sel, agents[a].record, width, theme));
+      const record = agents[a].record;
+      lines.push(this.renderAgentRow(
+        a + 1,
+        sel,
+        record,
+        width,
+        theme,
+        widths,
+        metrics.get(record.id) ?? "",
+      ));
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
 
@@ -394,30 +427,37 @@ export class FleetList {
     return rosterIndex === sel ? theme.fg("accent", "●") : theme.fg("dim", "○");
   }
 
-  private renderAgentRow(rosterIndex: number, sel: number, record: AgentRecord, width: number, theme: Theme): string {
+  private renderAgentRow(
+    rosterIndex: number,
+    sel: number,
+    record: AgentRecord,
+    width: number,
+    theme: Theme,
+    widths: { name: number; description: number; posture: number; metrics: number },
+    metrics: string,
+  ): string {
     // The selected row renders in the theme's primary text color so it reads as
     // one selection (#230). A configured badge survives — Claude Code's FleetView
     // keeps the agent color on the selected row too and only bolds it — which also
     // keeps the row's width fixed as the selection moves.
     const selected = rosterIndex === sel;
-    const name = renderAgentName(record.type, theme, selected
+    const name = renderAgentRecordName(record, theme, selected
       ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
-      : { fallbackColor: "muted" });
-    const description = selected ? theme.fg("text", record.description) : record.description;
-    const posture = formatFleetPosture(record);
-    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}${posture ? `  ${theme.fg(selected ? "text" : "dim", posture)}` : ""}  ${description}`;
-    // The record, not the activity tracker — see the note in AgentWidget's
-    // running line: only the record carries a nested child's spend, and only it
-    // outlives the agent.
-    const tokens = getLifetimeTotal(record.lifetimeUsage);
-    const now = Date.now();
-    const elapsedMs = (record.completedAt ?? now) - record.startedAt; // freezes once finished
-    const idle = record.status === "running"
-      ? ` · idle ${formatFleetElapsed(now - (record.lastProgressAt ?? record.startedAt))}`
-      : "";
-    const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)}${idle} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
-    const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
-    return rightAlign(left, right, width);
+      : { fallbackColor: "muted" }, widths.name);
+    const description = theme.fg(
+      selected ? "text" : "muted",
+      padColumn(record.description, widths.description),
+    );
+    const posture = theme.fg(
+      selected ? "text" : "dim",
+      padColumn(formatAgentPosture(record), widths.posture),
+    );
+    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}  ${posture}`;
+    const stats = fgPreservingNestedStyles(
+      theme,
+      selected ? "text" : "dim",
+      padColumn(metrics, widths.metrics),
+    );
+    return rightAlign(left, stats, width);
   }
 }
