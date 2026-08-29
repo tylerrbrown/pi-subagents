@@ -54,7 +54,7 @@ export function formatTokens(count) {
  * measured, and rounding it to `~$0.0000` would say the opposite.
  */
 export function agentRecordName(record) {
-    return record.alias ?? record.handle ?? getDisplayName(record.type);
+    return record.handle ?? getDisplayName(record.type);
 }
 export function agentRecordNameWidth(record) {
     return visibleWidth(agentRecordName(record)) + (hasAgentBadge(record.type) ? 2 : 0);

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatMs, formatSessionTokens } from "../src/ui/agent-widget.js";
+import { type AgentActivity, AgentWidget, agentRecordName, fgPreservingNestedStyles, formatCost, formatMs, formatSessionTokens } from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -280,6 +280,16 @@ describe("AgentWidget", () => {
 // footer under-reports and — worse — the queue vanishes from the UI entirely.
 // That happens exactly when the concurrency limit is saturated, i.e. when the
 // queue is the thing the user most needs to see.
+describe("agentRecordName", () => {
+  it("shows the type-derived handle instead of a custom instance alias", () => {
+    expect(agentRecordName({
+      type: "security",
+      handle: "security",
+      alias: "octopus-protocol",
+    } as any)).toBe("security");
+  });
+});
+
 describe("formatCost", () => {
   it("keeps the precision that distinguishes one run from another", () => {
     // Rounding to cents would print the same figure for a run that cost four

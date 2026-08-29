@@ -119,7 +119,7 @@ export function formatTokens(count: number): string {
  * measured, and rounding it to `~$0.0000` would say the opposite.
  */
 export function agentRecordName(record: AgentRecord): string {
-  return record.alias ?? record.handle ?? getDisplayName(record.type);
+  return record.handle ?? getDisplayName(record.type);
 }
 
 export function agentRecordNameWidth(record: AgentRecord): number {
