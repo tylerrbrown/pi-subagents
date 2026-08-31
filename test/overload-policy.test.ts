@@ -8,9 +8,14 @@
  *
  *  - classify overload distinctly from an ordinary run failure, so the parent
  *    can tell "the provider is busy, retry later" from "this agent is broken";
- *  - do NOT fall back to another provider. Per user-preferences.md § MIN AI
- *    provider default, no automatic AWS/Bedrock reroute while Tyler has
- *    Anthropic/OpenAI/Grok credits — the reroute is his call, not the fork's.
+ *  - do NOT fall back to another provider ON FAILURE. Per user-preferences.md
+ *    § MIN AI provider default, no automatic AWS/Bedrock reroute on overload
+ *    while Tyler has Anthropic/OpenAI/Grok credits — the reroute is his call,
+ *    not the fork's. (This is distinct from S02 provider routing, where an
+ *    UNqualified model name may resolve to AWS as an explicit last resort and
+ *    every AWS launch is warned before it runs. That is deliberate, opt-in
+ *    routing keyed off the model input — not a silent reaction to a failure —
+ *    so the guard below scopes to the failure-handling path only.)
  *  - the wall-clock deadline (b1) and the wait ceiling (b2) are what bound the
  *    stall itself; this is the naming, not the bounding.
  */
@@ -63,9 +68,14 @@ describe("getFailureNote", () => {
 });
 
 describe("no automatic provider fallback", () => {
-  it("keeps the fork free of a Bedrock reroute path", async () => {
+  it("keeps the failure-handling path free of a Bedrock reroute", async () => {
+    // Scoped to the run/failure path. Overload classification and the run loop
+    // must never react to a failure by switching providers. Explicit S02
+    // provider routing (model-resolver.ts) and its pre-run AWS warning
+    // (agent-manager.ts) legitimately name AWS providers and are covered by
+    // model-resolver.test.ts / agent-manager.test.ts instead.
     const { readFileSync } = await import("node:fs");
-    for (const file of ["../src/agent-runner.ts", "../src/agent-manager.ts", "../src/status-note.ts", "../src/model-resolver.ts"]) {
+    for (const file of ["../src/agent-runner.ts", "../src/status-note.ts"]) {
       const src = readFileSync(new URL(file, import.meta.url), "utf-8");
       expect(src, file).not.toMatch(/amazon-bedrock|us\.anthropic\./);
     }

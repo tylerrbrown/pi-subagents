@@ -25,6 +25,7 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorkt
  * tool description tells the model to send.
  */
 const DEFAULT_MAX_CONCURRENT = 10;
+const AWS_MODEL_PROVIDERS = new Set(["amazon-bedrock", "bedrock-mantle"]);
 /**
  * How many evicted agents stay addressable by name. Only a bound on memory —
  * a session that spawns hundreds of agents shouldn't retain every one — and
@@ -236,6 +237,13 @@ export class AgentManager {
         };
         this.agents.set(id, record);
         const args = { pi, ctx, type, prompt, options };
+        // Warn on the EFFECTIVE model, not just an explicit override: a spawn that
+        // omits `model` inherits the parent's, so an inherited AWS model must warn
+        // too. Every AWS launch is visibly flagged before it runs.
+        const effectiveModel = options.model ?? ctx.model;
+        if (effectiveModel && AWS_MODEL_PROVIDERS.has(effectiveModel.provider?.toLowerCase())) {
+            ctx.ui?.notify(`Using AWS model ${effectiveModel.provider}/${effectiveModel.id}; this may incur AWS charges.`, "warning");
+        }
         if (occupiesPoolSlot(record) && !options.bypassQueue && this.backgroundSlots.size >= this.maxConcurrent) {
             // Queue it — will be started when a running agent completes
             this.queue.push({ id, start: () => this.startAgent(id, record, args) });

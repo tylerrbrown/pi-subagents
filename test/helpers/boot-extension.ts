@@ -49,7 +49,16 @@ export function ctx(overrides: Record<string, unknown> = {}) {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(), addAutocompleteProvider: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    // Serve the models the default agents pin so a strict `model:` resolves
+    // instead of failing the spawn. `Explore` pins pi-sub-anthropic/claude-haiku-4-5;
+    // an explicit pin that resolves to nothing now errors rather than silently
+    // inheriting, so an empty registry here would refuse every Explore spawn.
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => ({ provider, id, name: id })),
+      getAvailable: vi.fn(() => [
+        { provider: "pi-sub-anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+      ]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
     ...overrides,

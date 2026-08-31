@@ -1,44 +1,27 @@
 /**
  * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
  */
-/**
- * Resolve a model string to a Model instance.
- * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
- * Returns the Model on success, or an error message string on failure.
- */
-export function resolveModel(input, registry) {
-    // Available models (those with auth configured)
-    const all = (registry.getAvailable?.() ?? registry.getAll());
-    const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
-    // 1. Exact match: "provider/modelId" — only if available (has auth)
-    const slashIdx = input.indexOf("/");
-    if (slashIdx !== -1) {
-        const provider = input.slice(0, slashIdx);
-        const modelId = input.slice(slashIdx + 1);
-        if (availableSet.has(input.toLowerCase())) {
-            const found = registry.find(provider, modelId);
-            if (found)
-                return found;
-        }
-    }
-    // 2. Fuzzy match against available models. Normalize separators so cosmetic
-    // punctuation differences still match — e.g. "claude-haiku-4.5" and
-    // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
-    const normalize = (s) => s.toLowerCase().replace(/\./g, "-");
-    const query = normalize(input);
-    // Score each model: prefer exact id match > id contains > name contains > provider+id contains
+const SUBSCRIPTION_PROVIDERS = ["pi-sub-anthropic", "openai-codex", "xai"];
+const AWS_PROVIDERS = ["amazon-bedrock", "bedrock-mantle"];
+/** Normalize cosmetic version separators before fuzzy comparison. */
+function normalizeModelName(value) {
+    return value.toLowerCase().replace(/\./g, "-");
+}
+/** Find the highest-scoring match, using provider order to resolve ties. */
+function findFuzzyMatch(models, query, providerOrder) {
     let bestMatch;
     let bestScore = 0;
-    for (const m of all) {
-        const id = normalize(m.id);
-        const name = normalize(m.name);
-        const full = normalize(`${m.provider}/${m.id}`);
+    let bestProviderOrder = Number.POSITIVE_INFINITY;
+    for (const model of models) {
+        const id = normalizeModelName(model.id);
+        const name = normalizeModelName(model.name);
+        const full = normalizeModelName(`${model.provider}/${model.id}`);
         let score = 0;
         if (id === query || full === query) {
-            score = 100; // exact
+            score = 100;
         }
         else if (id.includes(query) || full.includes(query)) {
-            score = 60 + (query.length / id.length) * 30; // substring, prefer tighter matches
+            score = 60 + (query.length / id.length) * 30;
         }
         else if (name.includes(query)) {
             score = 40 + (query.length / name.length) * 20;
@@ -49,29 +32,56 @@ export function resolveModel(input, registry) {
         // undated registry id like "claude-haiku-4-5".
         query
             .split(/[\s\-/]+/)
-            .every(part => /^\d{8}$/.test(part) || id.includes(part) || name.includes(part) || m.provider.toLowerCase().includes(part))) {
-            score = 20; // all parts present somewhere
+            .every(part => /^\d{8}$/.test(part) || id.includes(part) || name.includes(part) || model.provider.toLowerCase().includes(part))) {
+            score = 20;
         }
-        if (score > bestScore) {
+        const providerIndex = providerOrder.indexOf(model.provider.toLowerCase());
+        if (score > bestScore || (score === bestScore && providerIndex < bestProviderOrder)) {
+            bestMatch = model;
             bestScore = score;
-            bestMatch = m;
+            bestProviderOrder = providerIndex;
         }
     }
-    if (bestMatch && bestScore >= 20) {
-        const found = registry.find(bestMatch.provider, bestMatch.id);
+    return bestScore >= 20 ? bestMatch : undefined;
+}
+/**
+ * Resolve a model string to a Model instance.
+ *
+ * Qualified requests are strict: only the named provider is considered.
+ * Providerless fuzzy requests use subscription providers first, then AWS, and
+ * never select a metered direct API provider implicitly.
+ */
+export function resolveModel(input, registry) {
+    // Available models (those with auth configured)
+    const all = (registry.getAvailable?.() ?? registry.getAll());
+    const slashIdx = input.indexOf("/");
+    const query = normalizeModelName(input);
+    const groups = [];
+    if (slashIdx !== -1) {
+        const provider = input.slice(0, slashIdx).toLowerCase();
+        groups.push({
+            models: all.filter(model => model.provider.toLowerCase() === provider),
+            providerOrder: [provider],
+        });
+    }
+    else {
+        groups.push({
+            models: all.filter(model => SUBSCRIPTION_PROVIDERS.includes(model.provider.toLowerCase())),
+            providerOrder: SUBSCRIPTION_PROVIDERS,
+        });
+        groups.push({
+            models: all.filter(model => AWS_PROVIDERS.includes(model.provider.toLowerCase())),
+            providerOrder: AWS_PROVIDERS,
+        });
+    }
+    for (const group of groups) {
+        const match = findFuzzyMatch(group.models, query, group.providerOrder);
+        if (!match)
+            continue;
+        const found = registry.find(match.provider, match.id);
         if (found)
             return found;
     }
-    // 3. Provider fallback: a "provider/modelId" query that didn't match under the
-    // named provider (exact or fuzzy above) retries against all providers. The
-    // named provider is preferred when present; this only kicks in when it isn't,
-    // so the same model from another provider beats falling back to "inherit".
-    if (slashIdx !== -1) {
-        const bare = resolveModel(input.slice(slashIdx + 1), registry);
-        if (typeof bare !== "string")
-            return bare;
-    }
-    // 4. No match — list available models
     const modelList = all
         .map(m => `  ${m.provider}/${m.id}`)
         .sort()

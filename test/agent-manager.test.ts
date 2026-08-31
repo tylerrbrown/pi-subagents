@@ -35,6 +35,140 @@ const resolvedRun = () =>
     steered: false,
   });
 
+describe("AgentManager — AWS model warnings", () => {
+  let manager: AgentManager;
+
+  afterEach(() => manager?.dispose());
+
+  it("warns once before running an Amazon Bedrock model", async () => {
+    const events: string[] = [];
+    const notify = vi.fn(() => events.push("warning"));
+    const ctx = { cwd: "/tmp", ui: { notify } } as any;
+    vi.mocked(runAgent).mockClear();
+    vi.mocked(runAgent).mockImplementation(async () => {
+      events.push("run");
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false };
+    });
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: { provider: "amazon-bedrock", id: "kimi-k2" } as any,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(events).toEqual(["warning", "run"]);
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith(
+      "Using AWS model amazon-bedrock/kimi-k2; this may incur AWS charges.",
+      "warning",
+    );
+  });
+
+  it("warns for a queued Bedrock Mantle model before it starts", () => {
+    const notify = vi.fn();
+    const ctx = { cwd: "/tmp", ui: { notify } } as any;
+    vi.mocked(runAgent).mockClear();
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager = new AgentManager(undefined, 1);
+
+    manager.spawn(mockPi, ctx, "general-purpose", "blocker", { description: "blocker", isBackground: true });
+    manager.spawn(mockPi, ctx, "general-purpose", "queued", {
+      description: "queued",
+      isBackground: true,
+      model: { provider: "bedrock-mantle", id: "kimi-k2" } as any,
+    });
+
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith(
+      "Using AWS model bedrock-mantle/kimi-k2; this may incur AWS charges.",
+      "warning",
+    );
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not warn for a subscription model", async () => {
+    const notify = vi.fn();
+    const ctx = { cwd: "/tmp", ui: { notify } } as any;
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: { provider: "pi-sub-anthropic", id: "claude-opus-4-6" } as any,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("warns when an AWS model is INHERITED from the parent (no override)", async () => {
+    // No `model` on the spawn — the agent inherits ctx.model. When the parent
+    // itself runs on AWS, every child launch must still be flagged, so the
+    // warning keys off the effective model, not just an explicit override.
+    const notify = vi.fn();
+    const ctx = {
+      cwd: "/tmp",
+      ui: { notify },
+      model: { provider: "amazon-bedrock", id: "kimi-k2" },
+    } as any;
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", { description: "test" });
+    await manager.getRecord(id)!.promise;
+
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith(
+      "Using AWS model amazon-bedrock/kimi-k2; this may incur AWS charges.",
+      "warning",
+    );
+  });
+
+  it("does not warn when an inherited parent model is a subscription", async () => {
+    const notify = vi.fn();
+    const ctx = {
+      cwd: "/tmp",
+      ui: { notify },
+      model: { provider: "pi-sub-anthropic", id: "claude-opus-4-6" },
+    } as any;
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", { description: "test" });
+    await manager.getRecord(id)!.promise;
+
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("warns for a mixed-case AWS provider id", async () => {
+    // A registry that spells the provider "Amazon-Bedrock" (or any other
+    // casing) is still AWS and must still be flagged. The membership check is
+    // case-insensitive, so a cosmetic capitalization can't smuggle an AWS
+    // launch past the charge warning.
+    const notify = vi.fn();
+    const ctx = { cwd: "/tmp", ui: { notify } } as any;
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, ctx, "general-purpose", "test", {
+      description: "test",
+      model: { provider: "Amazon-Bedrock", id: "kimi-k2" } as any,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith(
+      "Using AWS model Amazon-Bedrock/kimi-k2; this may incur AWS charges.",
+      "warning",
+    );
+  });
+});
+
 describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)", () => {
   let manager: AgentManager;
 

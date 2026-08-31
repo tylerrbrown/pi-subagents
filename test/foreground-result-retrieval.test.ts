@@ -58,7 +58,14 @@ function ctx() {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    // Explore pins pi-sub-anthropic/claude-haiku-4-5; a strict pin that resolves
+    // to nothing now fails the spawn, so the registry must serve it.
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => ({ provider, id, name: id })),
+      getAvailable: vi.fn(() => [
+        { provider: "pi-sub-anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+      ]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;

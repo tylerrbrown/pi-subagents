@@ -3,11 +3,11 @@ import { type ModelRegistry, resolveModel } from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
-  { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
-  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
-  { id: "gpt-4o", name: "GPT-4o", provider: "openai" },
-  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "google" },
+  { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "pi-sub-anthropic" },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "pi-sub-anthropic" },
+  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "pi-sub-anthropic" },
+  { id: "gpt-4o", name: "GPT-4o", provider: "openai-codex" },
+  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "xai" },
 ];
 
 function makeRegistry(models = MODELS, available?: typeof MODELS): ModelRegistry {
@@ -24,19 +24,23 @@ function makeRegistry(models = MODELS, available?: typeof MODELS): ModelRegistry
 
 describe("resolveModel", () => {
   describe("exact match (provider/modelId)", () => {
+    const directOpus = { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" };
+    const directGpt = { id: "gpt-4o", name: "GPT-4o", provider: "openai" };
+
     it("resolves exact provider/modelId", () => {
-      const result = resolveModel("anthropic/claude-opus-4-6", makeRegistry());
-      expect(result).toEqual(MODELS[0]);
+      const result = resolveModel("anthropic/claude-opus-4-6", makeRegistry([directOpus]));
+      expect(result).toEqual(directOpus);
     });
 
     it("resolves another exact provider/modelId", () => {
-      const result = resolveModel("openai/gpt-4o", makeRegistry());
-      expect(result).toEqual(MODELS[3]);
+      const result = resolveModel("openai/gpt-4o", makeRegistry([directGpt]));
+      expect(result).toEqual(directGpt);
     });
 
-    it("falls through to fuzzy when exact provider/modelId not found", () => {
-      // "anthropic/haiku" is not an exact match, but fuzzy should find it
-      const result = resolveModel("anthropic/haiku", makeRegistry());
+    it("falls through to fuzzy under the named provider", () => {
+      // "pi-sub-anthropic/haiku" is not an exact match, but fuzzy finds it
+      // without considering models from another provider.
+      const result = resolveModel("pi-sub-anthropic/haiku", makeRegistry());
       expect(result).toEqual(MODELS[2]); // haiku
     });
   });
@@ -89,7 +93,7 @@ describe("resolveModel", () => {
     // id uses dashes and the name carries no version number — the case that
     // failed before separators were normalized (the "4.5" token couldn't be
     // found anywhere, so the dotted query matched nothing).
-    const HAIKU = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" };
+    const HAIKU = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "pi-sub-anthropic" };
     const dashReg = makeRegistry([HAIKU]);
 
     it("matches a dotted query to a dashed id", () => {
@@ -97,7 +101,7 @@ describe("resolveModel", () => {
     });
 
     it("matches a dotted provider/id query to a dashed id", () => {
-      expect(resolveModel("anthropic/claude-haiku-4.5", dashReg)).toEqual(HAIKU);
+      expect(resolveModel("pi-sub-anthropic/claude-haiku-4.5", dashReg)).toEqual(HAIKU);
     });
 
     it("matches a dashed query to a dotted id", () => {
@@ -125,20 +129,49 @@ describe("resolveModel", () => {
     });
   });
 
-  describe("provider fallback (prefer named provider, else any)", () => {
-    const gatewayHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" };
-    const anthropicHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" };
+  describe("provider routing", () => {
+    const directOpus = { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" };
+    const subscriptionOpus = { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "pi-sub-anthropic" };
+    // The same model id carried by three real providers: the subscription, the
+    // metered direct Anthropic API, and AWS. Only the id differs by provider,
+    // which is exactly the duplicate-id case bare-name routing must disambiguate.
+    const subFable = { id: "claude-fable-5", name: "Claude Fable 5", provider: "pi-sub-anthropic" };
+    const directFable = { id: "claude-fable-5", name: "Claude Fable 5", provider: "anthropic" };
+    const bedrockFable = { id: "claude-fable-5", name: "Claude Fable 5", provider: "amazon-bedrock" };
+    const directKimi = { id: "kimi-k2", name: "Kimi K2", provider: "moonshot" };
+    const bedrockKimi = { id: "kimi-k2", name: "Kimi K2", provider: "amazon-bedrock" };
+    const mantleKimi = { id: "kimi-k2", name: "Kimi K2", provider: "bedrock-mantle" };
 
-    it("falls back to another provider when the named one lacks the model", () => {
-      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku]))).toEqual(gatewayHaiku);
+    it("prefers the Anthropic subscription for an unqualified Opus request", () => {
+      expect(resolveModel("opus", makeRegistry([directOpus, bedrockKimi, subscriptionOpus]))).toEqual(subscriptionOpus);
     });
 
-    it("prefers the named provider when it has the model", () => {
-      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku, anthropicHaiku]))).toEqual(anthropicHaiku);
+    it("selects the pi-sub duplicate for a bare Fable request over direct and AWS", () => {
+      // claude-fable-5 exists on pi-sub-anthropic, direct anthropic, AND bedrock.
+      // A bare name must land on the subscription, never the metered direct API
+      // and never AWS while a subscription copy is present.
+      expect(resolveModel("fable", makeRegistry([directFable, bedrockFable, subFable]))).toEqual(subFable);
     });
 
-    it("still errors when no provider has the model", () => {
-      expect(typeof resolveModel("anthropic/nonexistent-xyz", makeRegistry([gatewayHaiku]))).toBe("string");
+    it("falls back to AWS in order when no subscription model matches", () => {
+      expect(resolveModel("kimi", makeRegistry([directKimi, mantleKimi, bedrockKimi]))).toEqual(bedrockKimi);
+    });
+
+    it("keeps an explicit provider strict even when a subscription has the same model", () => {
+      expect(resolveModel("anthropic/opus", makeRegistry([subscriptionOpus]))).toContain('Model not found: "anthropic/opus"');
+      expect(resolveModel("anthropic/opus", makeRegistry([subscriptionOpus, directOpus]))).toEqual(directOpus);
+    });
+
+    it("allows an explicitly requested direct provider", () => {
+      // Qualifying the metered provider is an explicit opt-in, so it wins over
+      // the subscription duplicate rather than being rerouted.
+      expect(resolveModel("anthropic/fable", makeRegistry([subFable, directFable]))).toEqual(directFable);
+    });
+
+    it("rejects an unqualified model available only from a direct provider", () => {
+      // Direct anthropic is metered and not in the subscription/AWS routing sets,
+      // so a bare name must not implicitly meter it.
+      expect(resolveModel("fable", makeRegistry([directFable]))).toContain('Model not found: "fable"');
     });
   });
 
@@ -160,8 +193,8 @@ describe("resolveModel", () => {
       expect(result).toEqual(MODELS[0]);
     });
 
-    it("matches 'google pro' across provider and id", () => {
-      const result = resolveModel("google pro", makeRegistry());
+    it("matches 'xai pro' across provider and id", () => {
+      const result = resolveModel("xai pro", makeRegistry());
       expect(result).toEqual(MODELS[4]);
     });
   });
@@ -190,8 +223,8 @@ describe("resolveModel", () => {
 
     it("error lists available models", () => {
       const result = resolveModel("xyz", makeRegistry());
-      expect(result).toContain("anthropic/claude-opus-4-6");
-      expect(result).toContain("openai/gpt-4o");
+      expect(result).toContain("pi-sub-anthropic/claude-opus-4-6");
+      expect(result).toContain("openai-codex/gpt-4o");
     });
 
     it("empty string matches a model (multi-part vacuous truth)", () => {
@@ -213,7 +246,7 @@ describe("resolveModel", () => {
 
     it("exact match fails when model is not in getAvailable (no auth)", () => {
       const available = [MODELS[0]]; // only opus available
-      const result = resolveModel("anthropic/claude-sonnet-4-6", makeRegistry(MODELS, available));
+      const result = resolveModel("pi-sub-anthropic/claude-sonnet-4-6", makeRegistry(MODELS, available));
       expect(typeof result).toBe("string");
       expect(result).toContain("Model not found");
     });
@@ -227,9 +260,9 @@ describe("resolveModel", () => {
 
   describe("ambiguous matches", () => {
     const SIMILAR_MODELS = [
-      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
-      { id: "claude-sonnet-4-5-20241022", name: "Claude Sonnet 4.5", provider: "anthropic" },
-      { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
+      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "pi-sub-anthropic" },
+      { id: "claude-sonnet-4-5-20241022", name: "Claude Sonnet 4.5", provider: "pi-sub-anthropic" },
+      { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "pi-sub-anthropic" },
     ];
 
     it("'sonnet' prefers tighter id match (shorter id)", () => {

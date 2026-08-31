@@ -227,14 +227,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: false,
       });
+      // Any explicit model input — caller param OR agent frontmatter — must
+      // resolve. A pin that can't run fails loudly rather than silently dropping
+      // to the parent model; only an agent with no model override inherits.
       let model = ctx.model;
       if (invocation.modelInput) {
         const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
-        } else {
-          model = resolvedModel;
-        }
+        if (typeof resolvedModel === "string") return textResult(resolvedModel, true);
+        model = resolvedModel;
       }
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn

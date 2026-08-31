@@ -1853,17 +1853,15 @@ Terse command-style prompts produce shallow, generic work.
                 defaultRunInBackground: getBackgroundByDefault(),
             });
             // Resolve model from agent config first; tool-call params only fill gaps.
+            // Any explicit model input — caller param OR agent frontmatter — must
+            // resolve. A pin that can't run is a loud failure, not a silent drop to
+            // the parent model; only an agent with no model override inherits.
             let model = ctx.model;
             if (resolvedConfig.modelInput) {
                 const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-                if (typeof resolved === "string") {
-                    if (resolvedConfig.modelFromParams)
-                        return textResult(resolved);
-                    // config-specified: silent fallback to parent
-                }
-                else {
-                    model = resolved;
-                }
+                if (typeof resolved === "string")
+                    return textResult(resolved);
+                model = resolved;
             }
             // Scope validation: the effective resolved model is checked against the
             // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
@@ -2476,13 +2474,13 @@ Terse command-style prompts produce shallow, generic work.
         if (!registry)
             return label;
         const resolved = resolveModel(cfg.model, registry);
-        // Configured but unresolvable: the runtime silently falls back to the parent
-        // model, so flag it (and the fallback) rather than hiding the config.
+        // Configured but unresolvable: a spawn with this pin now fails loudly rather
+        // than silently inheriting, so flag it as unrunnable instead of a fallback.
         if (typeof resolved === "string")
-            return `${label} (unavailable, fallback: inherit)`;
+            return `${label} (unavailable, spawn fails)`;
         // Surface what it actually resolved to when that differs from the config —
-        // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
-        // differences are normalized away so an effectively-identical match stays quiet.
+        // e.g. a looser version pin. Cosmetic separator/date differences are
+        // normalized away so an effectively-identical match stays quiet.
         const resolvedFull = `${resolved.provider}/${resolved.id}`;
         const norm = (s) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
         if (norm(cfg.model) === norm(resolvedFull))
