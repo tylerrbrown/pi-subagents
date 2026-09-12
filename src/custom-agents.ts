@@ -1,11 +1,12 @@
 /**
- * custom-agents.ts — Load user-defined agents from <cwd>/.claude/agents/.
+ * custom-agents.ts — Load user-defined agents within the nearest Git worktree.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
+import { projectReadScopes } from "./project-scope.js";
 import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
 
 /**
@@ -24,7 +25,8 @@ import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./t
 const RESERVED_IN_TYPE = ":";
 
 /**
- * Scan <cwd>/.claude/agents for custom agent .md files.
+ * Scan .claude/agents from the nearest Git root to cwd (cwd only outside Git).
+ * Closer directories override inherited definitions with the same type name.
  * Any name is allowed — names matching defaults (e.g. "Explore") override them.
  *
  * An agent's type comes from its frontmatter `name:`, falling back to the
@@ -35,7 +37,9 @@ const RESERVED_IN_TYPE = ":";
  */
 export function loadCustomAgents(cwd: string, strict = false): Map<string, AgentConfig> {
   const agents = new Map<string, AgentConfig>();
-  loadFromDir(join(cwd, ".claude", "agents"), agents, "project", strict);
+  for (const scope of projectReadScopes(cwd)) {
+    loadFromDir(join(scope, ".claude", "agents"), agents, "project", strict);
+  }
 
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();

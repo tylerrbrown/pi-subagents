@@ -1,10 +1,12 @@
 // Persistence for pi-subagents operational settings.
 // - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, never written here
-// - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
+// - Project reads: nearest Git root through cwd; closer values override global/ancestors
+// - Project writes: <cwd>/.pi/subagents.json — written by /agents → Settings
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import { projectReadScopes } from "./project-scope.js";
 const VALID_JOIN_MODES = new Set(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES = new Set(["full", "compact", "custom"]);
 const VALID_WIDGET_MODES = new Set(["all", "background", "off"]);
@@ -140,9 +142,13 @@ function readSettingsFile(path) {
         return {};
     }
 }
-/** Load merged settings: global provides defaults, project overrides. */
+/** Load global defaults, then bounded project scopes from root to cwd. */
 export function loadSettings(cwd = process.cwd()) {
-    return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+    const settings = readSettingsFile(globalPath());
+    for (const scope of projectReadScopes(cwd)) {
+        Object.assign(settings, readSettingsFile(projectPath(scope)));
+    }
+    return settings;
 }
 /**
  * Write project-local settings. Global is never touched from code.
