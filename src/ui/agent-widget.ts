@@ -9,6 +9,7 @@ import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi
 import { type AgentNameStyle, hasAgentBadge, renderAgentNameLabel } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
+import { hasModelMismatch } from "../invocation-truth.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type SessionLike } from "../usage.js";
 
@@ -147,9 +148,12 @@ function compactLevel(level: string | undefined): string {
 export function formatAgentPosture(record: AgentRecord): string {
   const session = record.session as { model?: { id?: string }; thinkingLevel?: string } | undefined;
   const thinking = session?.thinkingLevel ?? record.invocation?.thinking;
-  const effort = record.invocation?.thinking ?? thinking;
-  const model = session?.model?.id ?? record.invocation?.modelName;
-  return model ? `${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
+  const effort = record.invocation?.requestedThinking ?? record.invocation?.thinking ?? thinking;
+  const model = session?.model?.id ?? record.invocation?.modelId?.split("/").slice(1).join("/") ?? record.invocation?.modelName;
+  // Keep the existing aligned columns. A leading marker survives clipping;
+  // the conversation detail gives the full requested model spelling.
+  const mismatch = hasModelMismatch(record.invocation) ? "≠ " : "";
+  return model ? `${mismatch}${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
 }
 
 export function padColumn(text: string, width: number): string {
@@ -332,13 +336,21 @@ export function buildInvocationTags(
 ): { modelName?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
-  if (invocation.thinking) tags.push(`thinking: ${invocation.thinking}`);
+  if (invocation.thinking) {
+    const asked = invocation.requestedThinking && invocation.requestedThinking !== invocation.thinking
+      ? ` (asked ${invocation.requestedThinking})` : "";
+    tags.push(`thinking: ${invocation.thinking}${asked}`);
+  }
   if (invocation.isolated) tags.push("isolated");
   if (invocation.isolation === "worktree") tags.push("worktree");
   if (invocation.inheritContext) tags.push("inherit context");
   if (invocation.runInBackground) tags.push("background");
   if (invocation.maxTurns != null) tags.push(`max turns: ${invocation.maxTurns}`);
-  return { modelName: invocation.modelName, tags };
+  const modelName = invocation.modelName;
+  return {
+    modelName: modelName && hasModelMismatch(invocation) ? `${modelName} (asked ${invocation.requestedModel})` : modelName,
+    tags,
+  };
 }
 
 /** Truncate text to a single line, max `len` chars. */
