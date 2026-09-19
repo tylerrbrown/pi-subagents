@@ -264,7 +264,7 @@ describe("cross-extension RPC", () => {
       expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
+        { model: fakeModel, requestedModel: "openai-codex/gpt-5.5" },
       );
     });
 

@@ -14,6 +14,26 @@ export interface ModelRegistry {
   getAvailable?(): any[];
 }
 
+/** Shared short and canonical labels for predictions and actual sessions. */
+export function describeModel(
+  model: { provider: string; id: string; name?: string },
+): { modelName: string; modelId: string } {
+  return {
+    modelName: (model.name ?? model.id).replace(/^Claude\s+/i, "").toLowerCase(),
+    modelId: `${model.provider}/${model.id}`,
+  };
+}
+
+/** Preserve spelling separately from identity: aliases are not mismatches. */
+export function describeRequestedModel(input: string | undefined, registry: ModelRegistry) {
+  if (!input) return {};
+  const resolved = resolveModel(input, registry);
+  return {
+    requestedModel: input,
+    requestedModelId: typeof resolved === "string" ? undefined : describeModel(resolved).modelId,
+  };
+}
+
 const SUBSCRIPTION_PROVIDERS = ["pi-sub-anthropic", "openai-codex", "xai"];
 const AWS_PROVIDERS = ["amazon-bedrock", "bedrock-mantle"];
 

@@ -105,7 +105,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
           // silently falling back so the caller sees the auth/typo issue.
           throw new Error(resolved);
         }
-        normalizedOptions = { ...normalizedOptions, model: resolved };
+        normalizedOptions = { ...normalizedOptions, model: resolved, requestedModel: normalizedOptions.model };
       }
 
       return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };

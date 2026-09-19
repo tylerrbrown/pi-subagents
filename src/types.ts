@@ -264,7 +264,7 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
-  /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
+  /** Requested params and effective session settings, shared by every UI surface. */
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
@@ -281,9 +281,16 @@ export interface AgentRecord {
 }
 
 export interface AgentInvocation {
-  /** Short display name, e.g. "haiku" — only set when different from parent. */
+  /** Short display name, updated from the actual child session. */
   modelName?: string;
-  thinking?: ThinkingLevel;
+  /** Canonical effective provider/id. */
+  modelId?: string;
+  thinking?: ThinkingLevel | "off";
+  /** Original request, retained even when an alias resolves or Pi clamps it. */
+  requestedModel?: string;
+  /** Resolved request identity, so honored aliases do not disclose a mismatch. */
+  requestedModelId?: string;
+  requestedThinking?: ThinkingLevel | "off";
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
