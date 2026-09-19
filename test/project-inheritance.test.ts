@@ -1,14 +1,16 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+
 const boundary = vi.hoisted(() => ({ hidden: false }));
 vi.mock("node:fs", async (original) => {
   const fs = await original<typeof import("node:fs")>();
   return { ...fs, existsSync: (path: any) => boundary.hidden && /[\\/]\.git$/.test(String(path)) ? false : fs.existsSync(path) };
 });
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildAgentRegistry, resolveSpawnTypeIn, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { loadSettings, saveSettings } from "../src/settings.js";
-import { buildAgentRegistry, resolveSpawnTypeIn, setFallbackSubagent } from "../src/agent-types.js";
 
 // This suite calls real loaders and the dispatch decision point. No runner,
 // session, network client, or subprocess is constructed.

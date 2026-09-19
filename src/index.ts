@@ -912,6 +912,7 @@ export default function (pi: ExtensionAPI) {
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
     spawn: spawnTopLevel,
+    awaitStartup: (id: string) => manager.awaitStartup(id),
     getRecord: (id: string) => {
       const record = manager.getRecord(id);
       return record?.parentAgentId ? undefined : record;
@@ -986,6 +987,7 @@ export default function (pi: ExtensionAPI) {
         getCtx: () => currentCtx,
         manager: {
           spawn: spawnTopLevel,
+          awaitStartup: (id) => manager.awaitStartup(id),
           abort: (id) => {
             const record = manager.getRecord(id);
             return !record?.parentAgentId && manager.abort(id, "rpc");
@@ -1156,12 +1158,13 @@ export default function (pi: ExtensionAPI) {
         // spawnResolved, not spawnTopLevel: the latter strips
         // `resumeSessionFile` and `reclaim` as untrusted. This path is the
         // exception — both come from a tombstone this extension wrote.
-        spawnResolved(pi, ctx, dispatch.type, mention.message, {
+        const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
           description: entry.description,
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
           isBackground: true,
         });
+        await manager.awaitStartup(id);
         // The tombstone deliberately stays. `resolveMention` prefers the live
         // record holding these same names, so it cannot shadow the resume — and
         // if this run dies before establishing its own session, the original
@@ -1211,16 +1214,17 @@ export default function (pi: ExtensionAPI) {
       // until this hook returns. The user gets their prompt back immediately
       // and the agent appears in the widget when it starts.
       void runMentionClone({ ctx, type, message: mention.message, agentTool: registeredAgentTool })
-        .then((result) => {
+        .then(async (result) => {
           if (result.spawned) return;
           // A clone that could not run must not swallow the mention: start the
           // agent the direct way rather than leaving the user with a toast and
           // nothing running.
           try {
-            spawnTopLevel(pi, ctx, type, mention.message, {
+            const id = spawnTopLevel(pi, ctx, type, mention.message, {
               description: describeMention(mention.message),
               isBackground: true,
             });
+            await manager.awaitStartup(id);
             ctx.ui.notify(`Started ${label} directly — ${result.error}`, "warning");
           } catch (err) {
             ctx.ui.notify(
@@ -1238,10 +1242,11 @@ export default function (pi: ExtensionAPI) {
       // manager's onStart/onComplete callbacks own the widget, the fleet list
       // and the completion notification — the same contract the scheduler and
       // cross-extension RPC spawns run under.
-      spawnTopLevel(pi, ctx, type, mention.message, {
+      const id = spawnTopLevel(pi, ctx, type, mention.message, {
         description: describeMention(mention.message),
         isBackground: true,
       });
+      await manager.awaitStartup(id);
       ctx.ui.notify(`Started @${handleBase(type)}`, "info");
     } catch (err) {
       ctx.ui.notify(`Could not start @${handleBase(type)}: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -2260,6 +2265,9 @@ Terse command-style prompts produce shallow, generic work.
           attachTranscript(record, id);
         }
 
+        // The copy is asynchronous; preserve the tool-error contract on failure.
+        await manager.awaitStartup(id);
+
         if (joinMode == null || joinMode === 'async') {
           // Foreground/no join mode or explicit async — not part of any batch
         } else {
@@ -2530,8 +2538,9 @@ Terse command-style prompts produce shallow, generic work.
           }
           if (liveRecord.status === "queued") {
             waitTimedOut = true;
-          } else if (liveRecord.promise) {
-            waitTimedOut = (await waitWithCeiling(liveRecord.promise, remainingMs(), signal)) === "timeout";
+          } else {
+            const completion = manager.awaitStartup(liveRecord.id).then(() => liveRecord.promise);
+            waitTimedOut = (await waitWithCeiling(completion, remainingMs(), signal)) === "timeout";
           }
           noteWaitOutcome(waitTimedOut ? "timeout" : "settled");
         } finally {

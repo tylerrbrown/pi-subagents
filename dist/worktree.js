@@ -4,12 +4,16 @@
  * Creates a temporary git worktree so the agent works on an isolated copy of the repo.
  * On completion, if no changes were made, the worktree is cleaned up.
  * If changes exist, a branch is created and returned in the result.
+ *
+ * Every git call goes through `pi.exec` (async) rather than `execFileSync`: a
+ * worktree copy can take seconds, and a session that spawns several isolated
+ * agents at once would otherwise serialize them all on the TUI's event loop.
  */
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 /**
  * Project-wide switch for worktree isolation (`worktreeIsolation` in
  * subagents.json). Default `true` — unchanged behaviour.
@@ -28,26 +32,62 @@ export function isWorktreeIsolationEnabled() {
     return worktreeIsolationEnabled;
 }
 /**
+ * Run git and return its trimmed stdout, throwing on failure so callers keep
+ * the try/catch control flow `execFileSync` gave them.
+ *
+ * `pi.exec` never rejects — it reports failure in the result — and a command
+ * killed by its timeout comes back as `killed` with an exit code of 0, so both
+ * have to be checked to reproduce `execFileSync`'s "throws on anything but a
+ * clean exit".
+ */
+async function git(pi, cwd, args, timeout) {
+    const result = await pi.exec("git", args, { cwd, timeout });
+    if (result.killed || result.code !== 0) {
+        throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
+    }
+    return result.stdout.trim();
+}
+/** Convert Git's slash-separated repo prefix to a contained host path. */
+function safeRepoSubdir(prefix) {
+    if (!prefix)
+        return "";
+    const hostPrefix = prefix.split("/").join(sep).replace(/[\\/]+$/, "");
+    const normalized = normalize(hostPrefix);
+    if (normalized === "."
+        || isAbsolute(normalized)
+        || normalized === ".."
+        || normalized.startsWith(`..${sep}`)) {
+        return normalized === "." ? "" : undefined;
+    }
+    return normalized;
+}
+/** True only when candidate is root itself or one of its descendants. */
+export function isPathContained(root, candidate) {
+    const rel = relative(resolve(root), resolve(candidate));
+    return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+/**
  * Create a temporary git worktree for an agent.
  * Returns the worktree path, or undefined if not in a git repo.
  */
-export function createWorktree(cwd, agentId) {
+export async function createWorktree(pi, cwd, agentId) {
     // Verify we're in a git repo with at least one commit (HEAD must exist)
     let baseSha;
     let subdir;
     try {
-        execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, stdio: "pipe", timeout: 5000 });
-        baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd, stdio: "pipe", timeout: 5000 })
-            .toString()
-            .trim();
-        // Where cwd sits inside the repo ("" at the root): the agent must work at
-        // the same subdirectory inside the copy, or a monorepo-package cwd would
-        // silently widen to the whole repo. realpath both sides — git emits
-        // resolved paths while cwd may arrive through a symlink (macOS /tmp).
-        const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: "pipe", timeout: 5000 })
-            .toString()
-            .trim();
-        subdir = relative(realpathSync(topLevel), realpathSync(cwd));
+        await git(pi, cwd, ["rev-parse", "--is-inside-work-tree"], 5000);
+        baseSha = await git(pi, cwd, ["rev-parse", "HEAD"], 5000);
+        // Ask Git for the repo-relative cwd directly. Comparing --show-toplevel
+        // with cwd is unsafe on Windows when one spelling is long and the other is
+        // 8.3-short (and has similar alias issues with symlinks). Git computes the
+        // prefix in one namespace; validation below still fails closed if it ever
+        // returns an absolute or traversing value.
+        await git(pi, cwd, ["rev-parse", "--show-toplevel"], 5000);
+        const prefix = await git(pi, cwd, ["rev-parse", "--show-prefix"], 5000);
+        const safeSubdir = safeRepoSubdir(prefix);
+        if (safeSubdir === undefined)
+            throw new Error("Git worktree prefix escapes the repository");
+        subdir = safeSubdir;
     }
     catch {
         return undefined;
@@ -57,15 +97,17 @@ export function createWorktree(cwd, agentId) {
     const worktreePath = join(tmpdir(), `pi-agent-${agentId}-${suffix}`);
     try {
         // Create detached worktree at HEAD
-        execFileSync("git", ["worktree", "add", "--detach", worktreePath, "HEAD"], {
-            cwd,
-            stdio: "pipe",
-            timeout: 30000,
-        });
-        return { path: worktreePath, branch, baseSha, workPath: subdir ? join(worktreePath, subdir) : worktreePath };
+        await git(pi, cwd, ["worktree", "add", "--detach", worktreePath, "HEAD"], 30000);
+        const workPath = subdir ? join(worktreePath, subdir) : worktreePath;
+        if (!isPathContained(worktreePath, workPath)) {
+            throw new Error("Computed worktree working directory escapes the copy");
+        }
+        return { path: worktreePath, branch, baseSha, workPath };
     }
     catch {
-        // If worktree creation fails, return undefined (agent runs in normal cwd)
+        // A killed checkout can leave a directory/registration behind. The manager
+        // fails strict isolation, but we still own and must remove this partial copy.
+        await removeWorktree(pi, cwd, worktreePath);
         return undefined;
     }
 }
@@ -74,38 +116,27 @@ export function createWorktree(cwd, agentId) {
  * - If no changes: remove worktree entirely.
  * - If changes exist: create a branch, commit changes, return branch info.
  */
-export function cleanupWorktree(cwd, worktree, agentDescription) {
+export async function cleanupWorktree(pi, cwd, worktree, agentDescription) {
     if (!existsSync(worktree.path)) {
+        await pruneWorktrees(pi, cwd);
         return { hasChanges: false };
     }
     try {
         // Check for uncommitted changes in the worktree
-        const status = execFileSync("git", ["status", "--porcelain"], {
-            cwd: worktree.path,
-            stdio: "pipe",
-            timeout: 10000,
-        }).toString().trim();
+        const status = await git(pi, worktree.path, ["status", "--porcelain"], 10000);
         if (status) {
             // Changes exist — stage, commit, and create a branch
-            execFileSync("git", ["add", "-A"], { cwd: worktree.path, stdio: "pipe", timeout: 10000 });
-            // Truncate description for commit message (no shell sanitization needed — execFileSync uses argv)
+            await git(pi, worktree.path, ["add", "-A"], 10000);
+            // Truncate description for commit message (no shell sanitization needed — pi.exec uses argv)
             const safeDesc = agentDescription.slice(0, 200);
             const commitMsg = `pi-agent: ${safeDesc}`;
-            execFileSync("git", ["commit", "--no-verify", "-m", commitMsg], {
-                cwd: worktree.path,
-                stdio: "pipe",
-                timeout: 10000,
-            });
+            await git(pi, worktree.path, ["commit", "--no-verify", "-m", commitMsg], 10000);
         }
         else {
-            const currentSha = execFileSync("git", ["rev-parse", "HEAD"], {
-                cwd: worktree.path,
-                stdio: "pipe",
-                timeout: 5000,
-            }).toString().trim();
+            const currentSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
             if (currentSha === worktree.baseSha) {
                 // No changes — remove worktree
-                removeWorktree(cwd, worktree.path);
+                await removeWorktree(pi, cwd, worktree.path);
                 return { hasChanges: false };
             }
         }
@@ -113,65 +144,56 @@ export function cleanupWorktree(cwd, worktree, agentDescription) {
         // If the branch already exists, append a suffix to avoid overwriting previous work.
         let branchName = worktree.branch;
         try {
-            execFileSync("git", ["branch", branchName], {
-                cwd: worktree.path,
-                stdio: "pipe",
-                timeout: 5000,
-            });
+            await git(pi, worktree.path, ["branch", branchName], 5000);
         }
         catch {
             // Branch already exists — use a unique suffix
             branchName = `${worktree.branch}-${Date.now()}`;
-            execFileSync("git", ["branch", branchName], {
-                cwd: worktree.path,
-                stdio: "pipe",
-                timeout: 5000,
-            });
+            await git(pi, worktree.path, ["branch", branchName], 5000);
         }
         // Update branch name in worktree info for the caller
         worktree.branch = branchName;
         // Remove the worktree (branch persists in main repo)
-        removeWorktree(cwd, worktree.path);
+        await removeWorktree(pi, cwd, worktree.path);
         return {
             hasChanges: true,
             branch: worktree.branch,
             path: worktree.path,
         };
     }
-    catch {
-        // Best effort cleanup on error
-        try {
-            removeWorktree(cwd, worktree.path);
-        }
-        catch { /* ignore */ }
-        return { hasChanges: false };
+    catch (err) {
+        // Preservation failed while the copy still exists. Never force-remove the
+        // only potentially dirty output: retain it and make recovery explicit.
+        return {
+            hasChanges: true,
+            path: worktree.path,
+            error: err instanceof Error ? err.message : String(err),
+        };
     }
 }
 /**
  * Force-remove a worktree.
  */
-function removeWorktree(cwd, worktreePath) {
+async function removeWorktree(pi, cwd, worktreePath) {
     try {
-        execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
-            cwd,
-            stdio: "pipe",
-            timeout: 10000,
-        });
+        await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], 10000);
     }
     catch {
-        // If git worktree remove fails, try pruning
+        // Prune only removes stale registrations, not directories. An interrupted
+        // checkout or damaged .git file also needs its owned directory removed.
         try {
-            execFileSync("git", ["worktree", "prune"], { cwd, stdio: "pipe", timeout: 5000 });
+            await rm(worktreePath, { recursive: true, force: true });
         }
-        catch { /* ignore */ }
+        catch { /* best effort when the filesystem refuses removal */ }
+        await pruneWorktrees(pi, cwd);
     }
 }
 /**
  * Prune any orphaned worktrees (crash recovery).
  */
-export function pruneWorktrees(cwd) {
+export async function pruneWorktrees(pi, cwd) {
     try {
-        execFileSync("git", ["worktree", "prune"], { cwd, stdio: "pipe", timeout: 5000 });
+        await git(pi, cwd, ["worktree", "prune"], 5000);
     }
     catch { /* ignore */ }
 }

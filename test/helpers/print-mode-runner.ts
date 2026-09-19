@@ -94,6 +94,8 @@ export type FauxResponder = (
 ) => FauxReply | Promise<FauxReply>;
 
 export interface RunPrintModeOptions {
+  /** Optional packaged entrypoint for build-output smoke tests. Defaults to source. */
+  extensionPath?: string;
   /** The user prompt that kicks off the parent turn. */
   prompt: string;
   /**
@@ -132,6 +134,8 @@ export interface RunPrintModeOptions {
   timeoutMs?: number;
   /** Abort the parent (and forwarded children) externally. */
   signal?: AbortSignal;
+  /** Test-fixture hook after extension binding but before the parent prompt. */
+  beforePrompt?: (session: AgentSession, manager: ManagerHandle | undefined) => void | Promise<void>;
   /**
    * Force live mode against a specific provider/model (overrides PI_E2E_LIVE).
    * When omitted, live mode is on iff `PI_E2E_LIVE` is truthy. In live mode, if
@@ -340,7 +344,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir,
-    additionalExtensionPaths: [EXTENSION_PATH],
+    additionalExtensionPaths: [options.extensionPath ?? EXTENSION_PATH],
     systemPromptOverride: () => options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPromptOverride: () => [],
     noPromptTemplates: true,
@@ -378,6 +382,8 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const manager = (globalThis as Record<symbol, unknown>)[MANAGER_KEY] as
     | ManagerHandle
     | undefined;
+
+  await options.beforePrompt?.(session, manager);
 
   // --- subagent hold condition (the pi-chonky-step monkey-patch) ---
   // Block the parent agent loop while background subagents are still running, so

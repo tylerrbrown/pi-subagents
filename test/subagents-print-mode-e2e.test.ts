@@ -12,9 +12,11 @@
  * (no network). The same runner also drives a real LLM when PI_E2E_LIVE=1 — the
  * `live` describe below is a smoke test for that opt-in path.
  */
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { Context } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -41,7 +43,9 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
   afterEach(async () => {
     await run?.dispose();
     run = undefined;
-    for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+    for (const d of tmpDirs.splice(0)) {
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* Windows may retain a just-removed worktree briefly. */ }
+    }
   });
 
   it("spawns a FOREGROUND subagent and routes its real output back to the parent", async () => {
@@ -227,6 +231,82 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(result).toContain("Painted Agent reporting in."); // the escape check below is not vacuous
     expect(result).not.toContain("\u001b");
     expect(conversationText(run.parentSession)).not.toContain("\u001b");
+  });
+
+  it("cancels print-mode worktree startup after copy begins without launching the child", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "subagents-print-abort-copy-"));
+    tmpDirs.push(cwd);
+    execFileSync("git", ["init", "-q"], { cwd, stdio: "pipe" });
+    writeFileSync(join(cwd, "tracked.txt"), "tracked");
+    execFileSync("git", ["add", "tracked.txt"], { cwd, stdio: "pipe" });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial"], { cwd, stdio: "pipe" });
+
+    const controller = new AbortController();
+    let copyStarted = false;
+    const extensionPath = join(cwd, "abort-copy-extension.mjs");
+    const packagedEntry = pathToFileURL(join(process.cwd(), "dist", "index.js")).href;
+    writeFileSync(extensionPath, `
+      import base from ${JSON.stringify(packagedEntry)};
+      export default function wrapped(pi) {
+        const original = pi.exec.bind(pi);
+        pi.exec = (command, args, options) => {
+          const pending = original(command, args, options);
+          if (command === "git" && args[0] === "worktree" && args[1] === "add") {
+            globalThis.__s02_copy_started?.();
+            return pending.then(async result => {
+              await new Promise(resolve => { globalThis.__s02_release_copy = resolve; });
+              return result;
+            });
+          }
+          return pending;
+        };
+        return base(pi);
+      }
+    `);
+
+    run = await runPrintMode({
+      cwd,
+      extensionPath,
+      prompt: "Delegate isolated work.",
+      respond: routeBySession({
+        parentInitial: agentCall({
+          subagent_type: "general-purpose", description: "copy", prompt: "write work",
+          run_in_background: false, isolation: "worktree",
+        }),
+        parentFinal: "parent should not reach a child",
+        subagent: "CHILD_MUST_NOT_RUN",
+      }),
+      beforePrompt: () => {
+        const globals = globalThis as Record<string, unknown>;
+        globals.__s02_copy_started = () => {
+          copyStarted = true;
+          controller.abort();
+          setImmediate(() => {
+            (globals.__s02_release_copy as ((value?: unknown) => void) | undefined)?.();
+          });
+        };
+        // Keep the test bounded if the packaged host changes how it exposes exec.
+        // The normal path above fires from the pending worktree-add call; this
+        // fallback still proves caller cancellation and releases any held gate.
+        setTimeout(() => {
+          if (!controller.signal.aborted) controller.abort();
+          (globals.__s02_release_copy as ((value?: unknown) => void) | undefined)?.();
+        }, 250);
+      },
+      signal: controller.signal,
+      timeoutMs: 5_000,
+    });
+
+    try {
+      expect(copyStarted).toBe(true);
+      expect(controller.signal.aborted).toBe(true);
+      expect(run.parentSession).toBeDefined();
+      expect(run.subagents.some(record => record.status === "completed")).toBe(false);
+      expect(conversationText(run.parentSession)).not.toContain("CHILD_MUST_NOT_RUN");
+    } finally {
+      delete (globalThis as Record<string, unknown>).__s02_copy_started;
+      delete (globalThis as Record<string, unknown>).__s02_release_copy;
+    }
   });
 
   it("errors clearly when faux mode is given no script", async () => {

@@ -24,7 +24,7 @@ describe("cross-extension RPC", () => {
 
   beforeEach(() => {
     events = createEventBus();
-    manager = { spawn: vi.fn().mockReturnValue("agent-42"), abort: vi.fn().mockReturnValue(true) };
+    manager = { awaitStartup: vi.fn(async () => {}), spawn: vi.fn().mockReturnValue("agent-42"), abort: vi.fn().mockReturnValue(true) };
     ctx = { session: true };
     deps = { events, pi: { events }, getCtx: () => ctx, manager };
   });
@@ -68,6 +68,19 @@ describe("cross-extension RPC", () => {
   // --- spawn ---
 
   describe("spawn RPC", () => {
+    it("waits for startup and reports an asynchronous isolation failure", async () => {
+      let reject!: (error: Error) => void;
+      manager.awaitStartup = vi.fn(() => new Promise<void>((_resolve, fail) => { reject = fail; }));
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:async", reply);
+      events.emit("subagents:rpc:spawn", { requestId: "async", type: "X", prompt: "copy" });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(reply).not.toHaveBeenCalled();
+      reject(new Error("worktree failed"));
+      await vi.waitFor(() => expect(reply).toHaveBeenCalledWith({ success: false, error: "worktree failed" }));
+    });
+
     it("returns agent id on success", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();
@@ -170,6 +183,33 @@ describe("cross-extension RPC", () => {
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({ success: true });
       expect(manager.abort).toHaveBeenCalledWith("agent-42");
+    });
+
+    it("stops an RPC spawn while worktree startup is pending and reports no success receipt", async () => {
+      let rejectStartup!: (error: Error) => void;
+      manager.awaitStartup = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectStartup = reject; }));
+      manager.abort = vi.fn((id: string) => {
+        expect(id).toBe("agent-42");
+        rejectStartup(new Error("copy cancelled"));
+        return true;
+      });
+      registerRpcHandlers(deps);
+      const spawnReply = vi.fn();
+      const stopReply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-st-copy", spawnReply);
+      events.on("subagents:rpc:stop:reply:req-st-copy-stop", stopReply);
+
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-st-copy", type: "general-purpose", prompt: "copy",
+        options: { isolation: "worktree" },
+      });
+      await vi.waitFor(() => expect(manager.awaitStartup).toHaveBeenCalledWith("agent-42"));
+      events.emit("subagents:rpc:stop", { requestId: "req-st-copy-stop", agentId: "agent-42" });
+
+      await vi.waitFor(() => {
+        expect(stopReply).toHaveBeenCalledWith({ success: true });
+        expect(spawnReply).toHaveBeenCalledWith({ success: false, error: "copy cancelled" });
+      });
     });
 
     it("returns error when agent not found", async () => {

@@ -225,6 +225,7 @@ export function createNestedSubagentTools(context) {
                     // Synchronous, before the event loop yields — onSessionCreated fires
                     // asynchronously inside runAgent, so the file is attached in time.
                     attachTranscript(id);
+                    await context.manager.awaitStartup(id);
                     return textResult(`Nested agent started in background. Agent ID: ${id}`);
                 }
                 const { record } = await context.manager.spawnAndWait(context.pi, ctx, resolvedType, params.prompt, { ...options, signal }, attachTranscript);
@@ -256,6 +257,7 @@ export function createNestedSubagentTools(context) {
                 while (record.status === "queued") {
                     await abortable(new Promise(resolve => setTimeout(resolve, 250)), signal);
                 }
+                await abortable(context.manager.awaitStartup(record.id), signal);
                 if (record.promise)
                     await abortable(record.promise, signal);
             }

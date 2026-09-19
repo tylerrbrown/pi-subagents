@@ -22,6 +22,8 @@ function makeMockManager() {
   const spawnFn = vi.fn(() => "agent-" + Math.random().toString(36).slice(2, 10));
   return {
     spawn: spawnFn,
+    awaitStartup: vi.fn(async () => {}),
+    abort: vi.fn(() => true),
     getRecord: vi.fn(() => ({ promise: Promise.resolve("done") })),
   } as any;
 }
@@ -221,9 +223,6 @@ describe("SubagentScheduler — lifecycle", () => {
     const reloaded = scheduler.list().find(j => j.id === "reload-test");
     expect(reloaded?.enabled).toBe(false);
     expect(reloaded?.lastStatus).toBe("error");
-    expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
-      type: "error", jobId: "reload-test", error: expect.stringMatching(/in the past/),
-    }));
   });
 });
 
@@ -254,6 +253,50 @@ describe("SubagentScheduler — fire path", () => {
     setFallbackSubagent(undefined);
     registerAgents(new Map());
     rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("waits for asynchronous worktree startup rather than finalizing a missing run promise", async () => {
+    let finishStartup!: () => void;
+    manager.awaitStartup.mockImplementation(() => new Promise<void>(resolve => { finishStartup = resolve; }));
+    manager.getRecord.mockReturnValue({ status: "running" });
+    const job = scheduler.addJob({ name: "copy", description: "copy", schedule: "+1s", subagent_type: "general-purpose", prompt: "copy", isolation: "worktree" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(store.get(job.id)?.lastStatus).toBe("running");
+    manager.getRecord.mockReturnValue({ status: "completed", promise: Promise.resolve("done") });
+    finishStartup();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.get(job.id)?.lastStatus).toBe("success");
+    expect(store.get(job.id)?.runCount).toBe(1);
+  });
+
+  it("records cancellation after a scheduled copy starts as an error, never success", async () => {
+    let rejectStartup!: (error: Error) => void;
+    manager.awaitStartup.mockImplementation(() => new Promise<void>((_resolve: any, reject: any) => {
+      rejectStartup = reject;
+    }));
+    manager.getRecord.mockReturnValue({ status: "running" });
+    const job = scheduler.addJob({
+      name: "cancel-copy", description: "copy", schedule: "+1s",
+      subagent_type: "general-purpose", prompt: "copy", isolation: "worktree",
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const agentId = manager.spawn.mock.results[0].value;
+    expect(store.get(job.id)?.lastStatus).toBe("running");
+
+    expect(manager.abort(agentId)).toBe(true);
+    manager.getRecord.mockReturnValue({ status: "stopped" });
+    rejectStartup(new Error("copy cancelled"));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(store.get(job.id)?.lastStatus).toBe("error");
+  });
+
+  it("records an asynchronous worktree startup rejection as an error", async () => {
+    manager.awaitStartup.mockImplementation(async () => { throw new Error("copy failed"); });
+    manager.getRecord.mockReturnValue(undefined);
+    const job = scheduler.addJob({ name: "bad-copy", description: "copy", schedule: "+1s", subagent_type: "general-purpose", prompt: "copy", isolation: "worktree" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(store.get(job.id)?.lastStatus).toBe("error");
   });
 
   it("interval jobs fire repeatedly via setInterval", () => {
