@@ -37,7 +37,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getFailureNote, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentCapabilityAdditions, type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type StopReason, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentCapabilityAdditions, type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type StopReason, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -425,6 +425,13 @@ export default function (pi: ExtensionAPI) {
   let showCost = false;
   function isShowCostEnabled(): boolean { return showCost; }
   function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
+  let viewerMarkdown: ViewerMarkdownMode = "assistant";
+  function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
+  function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
+  function chooseViewerMarkdown(mode: ViewerMarkdownMode, ctx?: Pick<ExtensionContext, "ui">): void {
+    setViewerMarkdown(mode);
+    notifyApplied(ctx, `Viewer markdown set to ${mode}`);
+  }
   const pendingUsage = new PendingUsagePool();
 
   // ---- Durable completion notification ledger ----
@@ -1336,7 +1343,8 @@ export default function (pi: ExtensionAPI) {
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled);
+  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
+    (mode) => chooseViewerMarkdown(mode, currentCtx));
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1607,6 +1615,7 @@ export default function (pi: ExtensionAPI) {
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
       setShowCost,
+      setViewerMarkdown,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -2867,7 +2876,7 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost);
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
       },
       {
         overlay: true,
@@ -2933,6 +2942,7 @@ Definitions are read-only in /agents.`,
       fallbackSubagent: getFallbackSubagent(),
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
+      viewerMarkdown: getViewerMarkdown(),
     } satisfies SubagentsSettings;
   }
 
@@ -3086,6 +3096,13 @@ Definitions are read-only in /agents.`,
             "Show an estimated `~$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. Priced by pi from the model's rates — omitted entirely for a model it has no rates for.",
           currentValue: isShowCostEnabled() ? "on" : "off",
           values: ["on", "off"],
+        },
+        {
+          id: "viewerMarkdown",
+          label: "Viewer markdown",
+          description: "assistant = assistant text only (default); all = tool results too (may reshape logs and diffs); off = verbatim. The viewer m key cycles this setting: raw / md / md+.",
+          currentValue: getViewerMarkdown(),
+          values: ["off", "assistant", "all"],
         },
         {
           id: "fleetView",
@@ -3250,6 +3267,8 @@ Definitions are read-only in /agents.`,
         const enabled = value === "on";
         setShowCost(enabled);
         notifyApplied(ctx, `Cost display ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "viewerMarkdown") {
+        chooseViewerMarkdown(value as ViewerMarkdownMode, ctx);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
@@ -3358,13 +3377,13 @@ Definitions are read-only in /agents.`,
   // the right toast. Successful saves show info; persistence failures downgrade
   // to warning so users aren't silently reverted on restart. Event fires regardless
   // of outcome so listeners see the in-memory change.
-  function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
+  function notifyApplied(ctx: Pick<ExtensionContext, "ui"> | undefined, successMsg: string) {
     const { message, level } = saveAndEmitChanged(
       snapshotSettings(),
       successMsg,
       (event, payload) => pi.events.emit(event, payload),
     );
-    ctx.ui.notify(message, level);
+    ctx?.ui.notify(message, level);
   }
 
   pi.registerCommand("agents", {
