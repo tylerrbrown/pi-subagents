@@ -78,6 +78,8 @@ export interface NestedAgentManager {
     prompt: string,
     options: NestedSpawnOptions,
   ): string;
+  /** Same-tick startup await; worktree failures reject here. */
+  awaitStartup(id: string): Promise<void>;
   spawnAndWait(
     pi: ExtensionAPI,
     ctx: ExtensionContext,
@@ -340,6 +342,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           // Synchronous, before the event loop yields — onSessionCreated fires
           // asynchronously inside runAgent, so the file is attached in time.
           attachTranscript(id);
+          await context.manager.awaitStartup(id);
           return textResult(`Nested agent started in background. Agent ID: ${id}`);
         }
 
@@ -379,6 +382,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         while (record.status === "queued") {
           await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }
+        await abortable(context.manager.awaitStartup(record.id), signal);
         if (record.promise) await abortable(record.promise, signal);
       }
       return textResult(formatRecord(record, "fetched"), record.status === "error");

@@ -1,13 +1,16 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
   return { ...actual, runAgent: vi.fn(() => { throw new Error("Unexpected spawn"); }) };
 });
+
 import { runAgent } from "../src/agent-runner.js";
 import { registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+
 let base: string;
 let oldCwd: string;
 let cwd: string;

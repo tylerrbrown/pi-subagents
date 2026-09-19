@@ -1,0 +1,75 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, expect, it, vi } from "vitest";
+import { AgentManager } from "../src/agent-manager.js";
+import { runAgent } from "../src/agent-runner.js";
+import { buildAgentRegistry, resolveSpawnTypeIn, setFallbackSubagent } from "../src/agent-types.js";
+import { loadCustomAgents } from "../src/custom-agents.js";
+import { loadSettings } from "../src/settings.js";
+import { worktreePi } from "./helpers/worktree-pi.js";
+
+vi.mock("../src/agent-runner.js", () => ({ runAgent: vi.fn(), resumeAgent: vi.fn() }));
+let manager: AgentManager | undefined;
+let repo: string | undefined;
+let copy: string | undefined;
+afterEach(async () => {
+  await manager?.dispose();
+  manager = undefined;
+  if (copy) rmSync(copy, { recursive: true, force: true });
+  if (repo) rmSync(repo, { recursive: true, force: true });
+  vi.unstubAllEnvs();
+  setFallbackSubagent(undefined);
+});
+
+it("Agent-managed copies retain 37fb420 root-to-leaf definitions/policy and leave dirty parent work untouched", async () => {
+  repo = mkdtempSync(join(tmpdir(), "pi-wt-inheritance-"));
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+  git("init");
+  git("config", "user.name", "Test");
+  git("config", "user.email", "test@example.invalid");
+  mkdirSync(join(repo, ".claude", "agents"), { recursive: true });
+  mkdirSync(join(repo, ".pi"));
+  mkdirSync(join(repo, "packages", "api"), { recursive: true });
+  writeFileSync(join(repo, ".claude", "agents", "cartographer.md"), "---\ntools: read, grep\n---\nRoot specialist.\n");
+  writeFileSync(join(repo, ".pi", "subagents.json"), JSON.stringify({ fallbackSubagent: "none", graceTurns: 7 }));
+  writeFileSync(join(repo, "packages", "api", "index.txt"), "committed");
+  git("add", "-A");
+  git("commit", "-m", "fixture");
+  writeFileSync(join(repo, "packages", "api", "index.txt"), "staged parent edit");
+  git("add", "packages/api/index.txt");
+  writeFileSync(join(repo, "untracked.txt"), "parent only");
+  const before = git("status", "--porcelain");
+  vi.stubEnv("PI_CODING_AGENT_DIR", join(repo, "isolated-global"));
+  vi.stubEnv("HOME", join(repo, "isolated-home"));
+
+  let inherited = false;
+  vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+    copy = options.cwd!;
+    expect(copy).not.toBe(repo);
+    const leaf = join(copy, "packages", "api");
+    expect(readFileSync(join(leaf, "index.txt"), "utf8")).toBe("committed");
+    expect(existsSync(join(copy, "untracked.txt"))).toBe(false);
+    const agents = loadCustomAgents(leaf);
+    expect(agents.get("cartographer")?.builtinToolNames).toEqual(["read", "grep"]);
+    const policy = loadSettings(leaf);
+    expect(policy.fallbackSubagent).toBe("none");
+    expect(policy.graceTurns).toBe(7);
+    setFallbackSubagent(policy.fallbackSubagent);
+    expect(resolveSpawnTypeIn(buildAgentRegistry(agents), "missing").ok).toBe(false);
+    inherited = true;
+    writeFileSync(join(leaf, "child.txt"), "child only");
+    return { responseText: "inherited", aborted: false, steered: false, session: { dispose: vi.fn() } as never };
+  });
+  manager = new AgentManager();
+  const { record } = await manager.spawnAndWait(worktreePi, { cwd: repo } as ExtensionContext, "cartographer", "inspect", { description: "inheritance", isolation: "worktree" });
+  expect(inherited).toBe(true);
+  expect(record.status).toBe("completed");
+  expect(record.worktreeResult?.hasChanges).toBe(true);
+  expect(git("status", "--porcelain")).toBe(before);
+  expect(git("show", `${record.worktreeResult!.branch}:packages/api/child.txt`)).toBe("child only");
+  expect(git("worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+  expect(existsSync(copy!)).toBe(false);
+});

@@ -20,6 +20,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -119,7 +120,7 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     }
   });
 
-  it("runs the child in the copy and lands its changes on a branch, not the main checkout", async () => {
+  it.each(["source", "dist"])("%s: runs the child in the copy and lands its changes on a branch, not the main checkout", async (entrypoint) => {
     const repo = initGitRepo();
     repos.push(repo);
 
@@ -128,6 +129,7 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
       cwd: repo,
       respond: respondSpawning("worktree"),
       live: false,
+      extensionPath: entrypoint === "dist" ? fileURLToPath(new URL("../dist/index.js", import.meta.url)) : undefined,
     });
 
     // The child's own tools resolved against the copy — the main checkout never

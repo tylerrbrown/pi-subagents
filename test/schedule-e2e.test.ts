@@ -30,6 +30,7 @@ function makeFaithfulManager(initialStatus = "completed") {
   return {
     records,
     initialStatus,
+    awaitStartup: vi.fn(async () => {}),
     spawn: vi.fn(function (this: any) {
       const id = "agent-" + Math.random().toString(36).slice(2, 10);
       let resolve!: () => void;

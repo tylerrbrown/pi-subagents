@@ -13,7 +13,7 @@ vi.mock("../src/agent-runner.js", () => ({
 
 vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
+  cleanupWorktree: vi.fn(async () => ({ hasChanges: false })),
   pruneWorktrees: vi.fn(),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
@@ -939,16 +939,17 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     manager?.dispose();
   });
 
-  it("spawn() throws when createWorktree returns undefined; no orphan record left behind", async () => {
+  it("awaitStartup() rejects when createWorktree returns undefined; no orphan record left behind", async () => {
     const { createWorktree } = await import("../src/worktree.js");
     vi.mocked(createWorktree).mockReturnValueOnce(undefined);
     vi.mocked(runAgent).mockClear();
 
     manager = new AgentManager();
-    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
       isolation: "worktree",
-    })).toThrow(/isolation: "worktree"/);
+    });
+    await expect(manager.awaitStartup(id)).rejects.toThrow(/isolation: "worktree"/);
 
     // Cleaned up — no orphan in listAgents()
     expect(manager.listAgents()).toEqual([]);
@@ -990,10 +991,11 @@ describe("AgentManager — worktreeIsolation: false refuses worktrees", () => {
     vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
 
     manager = new AgentManager();
-    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
       isolation: "worktree",
-    })).toThrow(/isolation: "worktree"/);
+    });
+    await expect(manager.awaitStartup(id)).rejects.toThrow(/isolation: "worktree"/);
   });
 });
 
@@ -1060,16 +1062,17 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
       cwd: "/",
       isolation: "worktree",
     });
+    await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
 
-    expect(createWorktree).toHaveBeenCalledWith("/", id);
+    expect(createWorktree).toHaveBeenCalledWith(mockPi, "/", id);
     // Worktree wins for the working dir — at workPath, so subdirectory scoping
     // survives isolation. Config still anchored to the parent.
     expect(runAgent).toHaveBeenCalledWith(
       mockCtx, "general-purpose", "test",
       expect.objectContaining({ cwd: "/wt/copy/packages/api", configCwd: "/tmp", worktreeBase: "/" }),
     );
-    expect(cleanupWorktree).toHaveBeenCalledWith("/", expect.anything(), "test");
+    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, "/", expect.anything(), "test");
   });
 
   it("plain worktree (no cwd) keeps the historical root working dir even when workPath differs", async () => {
@@ -1088,6 +1091,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
       description: "test",
       isolation: "worktree",
     });
+    await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
 
     const opts = vi.mocked(runAgent).mock.lastCall![3];

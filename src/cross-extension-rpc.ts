@@ -28,6 +28,7 @@ export const PROTOCOL_VERSION = 2;
 /** Minimal AgentManager interface needed by the spawn/stop RPCs. */
 export interface SpawnCapable {
   spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
+  awaitStartup(id: string): Promise<void>;
   abort(id: string): boolean;
 }
 
@@ -80,7 +81,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   });
 
   const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
-    events, "subagents:rpc:spawn", ({ type, prompt, options }) => {
+    events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
 
@@ -108,7 +109,9 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         normalizedOptions = { ...normalizedOptions, model: resolved };
       }
 
-      return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };
+      const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
+      await manager.awaitStartup(id);
+      return { id };
     },
   );
 

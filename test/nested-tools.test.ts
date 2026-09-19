@@ -77,6 +77,7 @@ beforeEach(() => {
   });
   manager = {
     spawn,
+    awaitStartup: vi.fn(async () => {}),
     spawnAndWait,
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),
@@ -256,6 +257,43 @@ describe("child-safe nested Agent tools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Unknown or disabled");
     }
+  });
+
+  it("reports a background nested copy cancellation instead of a success receipt", async () => {
+    let rejectStartup!: (error: Error) => void;
+    manager.awaitStartup = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectStartup = reject; }));
+    const [agent] = tools(["scout"]);
+    const pending = execute(agent, {
+      subagent_type: "scout", description: "copy", prompt: "Find them",
+      run_in_background: true, isolation: "worktree",
+    });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    rejectStartup(new Error("nested copy cancelled"));
+
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("nested copy cancelled");
+    expect(result.content[0].text).not.toContain("started in background");
+  });
+
+  it("passes foreground cancellation through while nested worktree startup is pending", async () => {
+    const controller = new AbortController();
+    spawnAndWait.mockImplementation((_pi: unknown, _ctx: unknown, _type: string, _prompt: string, options: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("nested foreground copy cancelled")), { once: true });
+      }));
+    const [agent] = tools(["scout"]);
+    const pending = agent.execute(
+      "call-nested-copy",
+      { subagent_type: "scout", description: "copy", prompt: "Find them", isolation: "worktree" },
+      controller.signal, undefined, ctx(),
+    );
+    await vi.waitFor(() => expect(spawnAndWait).toHaveBeenCalledOnce());
+    controller.abort();
+
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("nested foreground copy cancelled");
   });
 
   it("supports background launches and ownership-scopes result, resume, and steer", async () => {

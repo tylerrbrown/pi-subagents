@@ -41,7 +41,7 @@ export function registerRpcHandlers(deps) {
     const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
         return { version: PROTOCOL_VERSION };
     });
-    const unsubSpawn = handleRpc(events, "subagents:rpc:spawn", ({ type, prompt, options }) => {
+    const unsubSpawn = handleRpc(events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
         const ctx = getCtx();
         if (!ctx)
             throw new Error("No active session");
@@ -66,7 +66,9 @@ export function registerRpcHandlers(deps) {
             }
             normalizedOptions = { ...normalizedOptions, model: resolved };
         }
-        return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };
+        const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
+        await manager.awaitStartup(id);
+        return { id };
     });
     const unsubStop = handleRpc(events, "subagents:rpc:stop", ({ agentId }) => {
         if (!manager.abort(agentId))
