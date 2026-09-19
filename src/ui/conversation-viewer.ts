@@ -5,11 +5,11 @@
  * Subscribes to session events for real-time streaming updates.
  */
 
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
-import type { AgentRecord } from "../types.js";
+import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
@@ -21,6 +21,201 @@ const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
 
+/**
+ * Cap on a single tool result or bash output before the viewer elides the rest.
+ *
+ * Bounds wrapping and Markdown parsing on every render and scroll key, while
+ * exposing substantially more context than the previous 500-character preview.
+ */
+export const RESULT_MAX_CHARS = 16_000;
+/** Hard ceiling on inspected content blocks, including non-text blocks. */
+export const RESULT_MAX_BLOCKS_INSPECTED = 20_000;
+
+/** Cycle order for the viewer's `m` key. */
+const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
+
+/** Footer labels — short, because the idle footer is already full at 80 columns. */
+const MARKDOWN_MODE_LABELS: Record<ViewerMarkdownMode, string> = {
+  off: "raw",
+  assistant: "md",
+  all: "md+",
+};
+
+/**
+ * Both options keep the renderer from *rewriting* source that only looks like
+ * Markdown: without them `3) a / 7) b / 9) c` comes back renumbered `3. 4. 5.`
+ * and backslash escapes are normalized away. Neither is a safe edit to make to
+ * a tool's output, and both are cheap to switch off.
+ */
+const MARKDOWN_OPTIONS: MarkdownOptions = {
+  preserveOrderedListMarkers: true,
+  preserveBackslashEscapes: true,
+};
+
+/**
+ * Pi's own Markdown theme when this process has one, else a theme built from the
+ * viewer's `Theme`.
+ *
+ * Preferring pi's is what buys syntax-highlighted code fences (it carries a
+ * `highlightCode`), and it keeps this surface consistent with the notification
+ * renderer, which uses the same source. It has to be *probed* rather than
+ * try/caught around the call: `getMarkdownTheme()` returns arrow functions that
+ * read pi's global theme lazily, so an uninitialized theme throws inside
+ * `render()` — long after this returns — and takes the overlay with it. That is
+ * the case in tests and any embedded session that never called `initTheme()`.
+ */
+function resolveMarkdownTheme(th: Theme): MarkdownTheme {
+  try {
+    const piTheme = getMarkdownTheme();
+    piTheme.heading("probe");
+    return piTheme;
+  } catch {
+    return fallbackMarkdownTheme(th);
+  }
+}
+
+/**
+ * `Theme` carries only `fg` and `bold`, so the three remaining styles are
+ * written as raw SGR. Rendering them as plain text instead would silently drop
+ * `*emphasis*`'s markers with nothing in their place, turning a formatting
+ * change into a content change.
+ */
+function fallbackMarkdownTheme(th: Theme): MarkdownTheme {
+  const sgr = (on: number, off: number) => (text: string) => `\x1b[${on}m${text}\x1b[${off}m`;
+  return {
+    heading: text => th.bold(th.fg("accent", text)),
+    link: text => th.fg("accent", text),
+    linkUrl: text => th.fg("muted", text),
+    code: text => th.fg("muted", text),
+    codeBlock: text => th.fg("muted", text),
+    codeBlockBorder: text => th.fg("dim", text),
+    quote: text => th.fg("muted", text),
+    quoteBorder: text => th.fg("dim", text),
+    hr: text => th.fg("dim", text),
+    listBullet: text => th.fg("accent", text),
+    bold: text => th.bold(text),
+    italic: sgr(3, 23),
+    underline: sgr(4, 24),
+    strikethrough: sgr(9, 29),
+  };
+}
+
+/**
+ * Cap `text` at `RESULT_MAX_CHARS`, reporting the elision separately rather than
+ * appending it.
+ *
+ * Separately because the notice is the viewer's chrome, not the tool's output.
+ * Appended into the string it becomes content: a cut landing inside a fenced
+ * code block — likely, on exactly the large `ctx_execute` results this is for —
+ * renders the notice as a line of source inside the fence.
+ */
+function capResult(text: string): { text: string; elided: number } {
+  if (text.length <= RESULT_MAX_CHARS) return { text, elided: 0 };
+  return {
+    text: text.slice(0, RESULT_MAX_CHARS),
+    elided: text.length - RESULT_MAX_CHARS,
+  };
+}
+
+/**
+ * The bounded equivalent of `extractText(content)`, including its newlines.
+ * It reads only through the visible prefix plus one boundary block. When later
+ * blocks remain, the notice reports a truthful lower bound rather than scanning
+ * text that cannot reach the renderer.
+ */
+function capToolResult(content: unknown[]): { text: string; elided: number; lowerBound?: boolean; uninspected?: boolean } {
+  let remaining = RESULT_MAX_CHARS;
+  let sawText = false;
+  const visible: string[] = [];
+
+  for (let index = 0; index < content.length; index++) {
+    if (index >= RESULT_MAX_BLOCKS_INSPECTED) {
+      // Non-text blocks still cost a property read. Stop independently of the
+      // character cap and disclose that the remainder was not inspected.
+      return { text: visible.join(""), elided: 1, uninspected: true };
+    }
+    const block: any = content[index];
+    if (block?.type !== "text") continue;
+    const part = String(block.text ?? "");
+    const separator = sawText ? 1 : 0;
+    sawText = true;
+    if (remaining < separator) {
+      // We only read one block beyond the cap. Its separator alone proves at
+      // least one omitted character, without traversing an unbounded tail.
+      return { text: visible.join(""), elided: 1, lowerBound: true };
+    }
+    if (separator) {
+      visible.push("\n");
+      remaining--;
+    }
+    if (part.length > remaining) {
+      visible.push(part.slice(0, remaining));
+      const elided = part.length - remaining;
+      return {
+        text: visible.join(""),
+        elided,
+        ...(index + 1 < content.length ? { lowerBound: true } : {}),
+      };
+    }
+    visible.push(part);
+    remaining -= part.length;
+    if (remaining === 0 && index + 1 < content.length) {
+      // Do not filter/map/reduce hidden blocks. The next block establishes a
+      // lower bound when text; otherwise disclose that later blocks were not
+      // inspected rather than pretending their character count is exact.
+      const next: any = content[index + 1];
+      if (next?.type === "text") return { text: visible.join(""), elided: 1, lowerBound: true };
+      return { text: visible.join(""), elided: 1, uninspected: true };
+    }
+  }
+  return { text: visible.join(""), elided: 0 };
+}
+
+/**
+ * `999` · `1.5k` · `8.4M` — a magnitude cue, not an exact count, past 1000.
+ *
+ * The bracket is chosen against the *rounded* value, so 999,999 reads `1M`
+ * rather than the `1000.0k` a naive `< 1e6` test produces.
+ */
+function humanCount(n: number): string {
+  if (n < 1_000) return `${n}`;
+  const thousands = n < 999_950;
+  const value = thousands ? n / 1_000 : n / 1_000_000;
+  return `${value.toFixed(1).replace(/\.0$/, "")}${thousands ? "k" : "M"}`;
+}
+
+function lowerBoundHumanCount(n: number): string {
+  if (n < 1_000) return `${n}`;
+  const thousands = n < 1_000_000;
+  const divisor = thousands ? 1_000 : 1_000_000;
+  const value = Math.floor((n / divisor) * 10) / 10;
+  return `${value.toFixed(1).replace(/\.0$/, "")}${thousands ? "k" : "M"}`;
+}
+
+function truncationNote(elided: number, lowerBound = false, uninspected = false): string {
+  if (uninspected) return "... (truncated, additional result blocks not inspected)";
+  const count = lowerBound ? lowerBoundHumanCount(elided) : humanCount(elided);
+  return `... (truncated, ${lowerBound ? "at least " : ""}${count} more character${elided === 1 ? "" : "s"})`;
+}
+
+/** Avoid Markdown's recursive blockquote parser for known stack-exhausting input. */
+function hasUnsafeMarkdownNesting(text: string): boolean {
+  for (let start = 0; start < text.length;) {
+    let cursor = start;
+    let depth = 0;
+    while (cursor - start < 3 && text[cursor] === " ") cursor++;
+    while (text[cursor] === ">") {
+      depth++;
+      cursor++;
+      if (text[cursor] === " " || text[cursor] === "\t") cursor++;
+      if (depth >= 48) return true;
+    }
+    const newline = text.indexOf("\n", cursor);
+    start = newline === -1 ? text.length : newline + 1;
+  }
+  return false;
+}
+
 export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
@@ -30,8 +225,21 @@ export class ConversationViewer implements Component {
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
   private keys: ViewerKeys;
+  /** Whether the raw `m` Markdown-cycle key is unclaimed by configured viewer bindings. */
+  private readonly markdownCycleKeyAvailable: boolean;
   /** Steering composer — present while the user is typing a message to the agent. */
   private composer: Input | undefined;
+  /** Resolved once: pi's Markdown theme is fixed for the life of the process. */
+  private readonly markdownTheme: MarkdownTheme;
+  /** Set by the `m` key. Wins over the setting so `m` works without a persist hook. */
+  private markdownModeOverride: ViewerMarkdownMode | undefined;
+  /**
+   * One `Markdown` per message, so its own text/width cache does the work. A
+   * fresh instance per render would re-parse the whole transcript on every
+   * keystroke — the component caches, but only across calls to the same object.
+   * Weak so a compacted-away message doesn't pin its render.
+   */
+  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
 
   constructor(
     private tui: TUI,
@@ -52,8 +260,26 @@ export class ConversationViewer implements Component {
      * cannot change while it is on screen.
      */
     private showCost = false,
+    /**
+     * The current `viewerMarkdown` setting. Read live rather than captured,
+     * unlike `showCost`: `m` changes it while the overlay is on screen.
+     * Omitted → `assistant`.
+     */
+    private viewerMarkdown?: () => ViewerMarkdownMode,
+    /**
+     * Persist a mode chosen with `m`, so the key and `/agents → Settings` mean
+     * the same thing. Omitted → `m` still cycles, viewer-locally.
+     */
+    private onMarkdownMode?: (mode: ViewerMarkdownMode) => void,
   ) {
+    this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
+    this.markdownCycleKeyAvailable = !keybindings || !(
+      keybindings.matches("m", "tui.select.up")
+      || keybindings.matches("m", "tui.select.down")
+      || keybindings.matches("m", "tui.select.pageUp")
+      || keybindings.matches("m", "tui.select.pageDown")
+    );
     this.unsubscribe = session.subscribe(() => {
       if (this.closed) return;
       this.tui.requestRender();
@@ -98,7 +324,19 @@ export class ConversationViewer implements Component {
       }
       return;
     }
+
     if (this.stopArmed) this.stopArmed = false;
+
+    if (this.markdownCycleKeyAvailable && matchesKey(data, "m")) {
+      // Cycle raw → assistant-only → everything. Disabled when configured
+      // ViewerKeys claim `m`, so bindings like `tui.select.down=m` win.
+      this.stopArmed = false;
+      const next = MARKDOWN_MODES[(MARKDOWN_MODES.indexOf(this.markdownMode()) + 1) % MARKDOWN_MODES.length];
+      this.markdownModeOverride = next;
+      this.onMarkdownMode?.(next);
+      this.tui.requestRender();
+      return;
+    }
 
     const totalLines = this.buildContentLines(this.lastInnerW).length;
     const viewportHeight = this.viewportHeight();
@@ -211,6 +449,10 @@ export class ConversationViewer implements Component {
       if (this.isStoppable()) {
         actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       }
+      // Abbreviated (`raw`/`md`/`md+`) because the idle footer is already full
+      // at 80 columns with steer + stop present, and this group has no
+      // degradation step below "drop the line-count readout".
+      if (this.markdownCycleKeyAvailable) actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
@@ -235,6 +477,64 @@ export class ConversationViewer implements Component {
   /** Stoppable only when a stop handler exists and the agent is still active. */
   private isStoppable(): boolean {
     return !!this.onStop && (this.record.status === "running" || this.record.status === "queued");
+  }
+
+  /** The mode in force: an `m` press, else the setting, else the default. */
+  private markdownMode(): ViewerMarkdownMode {
+    return this.markdownModeOverride ?? this.viewerMarkdown?.() ?? "assistant";
+  }
+
+  /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
+  private rawLines(text: string, width: number, dim: boolean): string[] {
+    const lines = wrapTextWithAnsi(text, width);
+    return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
+  }
+
+  /** Render `text` as Markdown, reusing this message's component instance. */
+  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
+    if (hasUnsafeMarkdownNesting(text)) return this.rawLines(text, width, dim);
+
+    let entry = this.markdownCache.get(msg);
+    if (!entry) {
+      entry = {
+        md: new Markdown(
+          text,
+          0,
+          0,
+          this.markdownTheme,
+          // Keeps result prose visually receded, the way the raw path's
+          // per-line `fg("dim", …)` did. Fenced code is the exception and is
+          // left alone deliberately: pi's theme highlights it with its own
+          // colors, which this would otherwise flatten.
+          dim ? { color: (t: string) => this.theme.fg("dim", t) } : undefined,
+          MARKDOWN_OPTIONS,
+        ),
+        text,
+      };
+      this.markdownCache.set(msg, entry);
+    } else if (entry.text !== text) {
+      // Streaming: the message object is stable, its text grows. A failed
+      // prefix remains unsafe after append-only deltas, so retry only when the
+      // content was replaced or truncated.
+      const shouldRetry = !text.startsWith(entry.text);
+      entry.md.setText(text);
+      entry.text = text;
+      if (shouldRetry) entry.failed = false;
+    }
+    if (entry.failed) return this.rawLines(text, width, dim);
+
+    try {
+      return entry.md.render(width);
+    } catch {
+      // The parser is recursive and this is arbitrary tool output: ~54 nested
+      // blockquotes overflow the stack, and no amount of fuzzing proves that is
+      // the only such input. `render()` is on the TUI's critical path, so a
+      // throw here takes the overlay down for content the literal path shows
+      // fine — degrade to that instead, and remember, since the throw would
+      // otherwise repeat on every render and every scroll key.
+      entry.failed = true;
+      return this.rawLines(text, width, dim);
+    }
   }
 
   /** Steerable only when a steer handler exists and the agent is still active. */
@@ -303,6 +603,7 @@ export class ConversationViewer implements Component {
       return lines;
     }
 
+    const mode = this.markdownMode();
     let needsSeparator = false;
     for (const msg of messages) {
       if (msg.role === "user") {
@@ -327,33 +628,35 @@ export class ConversationViewer implements Component {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
-          for (const line of wrapTextWithAnsi(textParts.join("\n").trim(), width)) {
-            lines.push(line);
-          }
+          const text = textParts.join("\n").trim();
+          lines.push(...(mode === "off"
+            ? this.rawLines(text, width, false)
+            : this.markdownLines(msg, text, width, false)));
         }
         for (const name of toolCalls) {
           lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
         }
       } else if (msg.role === "toolResult") {
-        const text = extractText(msg.content);
-        const truncated = text.length > 500 ? text.slice(0, 500) + "... (truncated)" : text;
-        if (!truncated.trim()) continue;
+        const capped = capToolResult(msg.content);
+        const text = capped.text.trim();
+        if (!text && !capped.elided && !capped.uninspected) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
-        for (const line of wrapTextWithAnsi(truncated.trim(), width)) {
-          lines.push(th.fg("dim", line));
-        }
+        if (text) lines.push(...(mode === "all"
+          ? this.markdownLines(msg, text, width, true)
+          : this.rawLines(text, width, true)));
+        if (capped.elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(capped.elided, capped.lowerBound, capped.uninspected)), width));
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          const out = bash.output.length > 500
-            ? bash.output.slice(0, 500) + "... (truncated)"
-            : bash.output;
-          for (const line of wrapTextWithAnsi(out.trim(), width)) {
-            lines.push(th.fg("dim", line));
-          }
+        if (bash.output) {
+          // Cap before trimming: a multi-megabyte whitespace tail must never be
+          // scanned just to prepare the 16K prefix the renderer can consume.
+          const capped = capResult(bash.output);
+          const text = capped.text.trim();
+          if (text) lines.push(...this.rawLines(text, width, true));
+          if (capped.elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(capped.elided)), width));
         }
       } else {
         continue;

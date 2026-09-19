@@ -14,7 +14,7 @@
 import { Editor, isKeyRelease, Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
-import type { AgentRecord } from "../types.js";
+import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import {
   type AgentActivity,
   agentRecordNameWidth,
@@ -117,6 +117,8 @@ export class FleetList {
      * `showCost` setting.
      */
     private showCost: () => boolean = () => false,
+    private viewerMarkdown?: () => ViewerMarkdownMode,
+    private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
   ) {}
 
   // ---- Lifecycle ----
@@ -335,6 +337,8 @@ export class FleetList {
           keybindings,
           (message: string) => this.manager.steer(record.id, message),
           this.showCost(),
+          this.viewerMarkdown,
+          this.onViewerMarkdown,
         );
       },
       {

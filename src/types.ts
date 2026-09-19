@@ -134,6 +134,9 @@ export type JoinMode = 'async' | 'group' | 'smart';
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
+/** Transcript Markdown scope. Assistant-only is the default; tool results are opt-in. */
+export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
+
 /**
  * How `@handle message` starts an agent that is not already running.
  * - `model`: inject Claude Code's `agent_mention` reminder and let the main
