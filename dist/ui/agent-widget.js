@@ -292,13 +292,13 @@ export class AgentWidget {
     tui;
     /** Last status bar text, used to avoid redundant setStatus calls. */
     lastStatusText;
-    constructor(manager, agentActivity, 
+    constructor(manager, agentActivity,
     /**
      * Read live at render time. Selects which agents the widget shows — see
      * `WidgetMode`. Defaults to `"all"` when a caller supplies no policy; the
      * extension supplies one defaulting to `"background"`.
      */
-    mode = () => "all", 
+    mode = () => "all",
     /**
      * Read live at render time, like `mode`. Whether running agents show an
      * estimated cost beside their token count. Defaults to off — the extension

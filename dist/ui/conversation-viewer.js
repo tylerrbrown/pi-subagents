@@ -243,25 +243,25 @@ export class ConversationViewer {
      * Weak so a compacted-away message doesn't pin its render.
      */
     markdownCache = new WeakMap();
-    constructor(tui, session, record, activity, theme, done, 
+    constructor(tui, session, record, activity, theme, done,
     /** Abort the agent shown here. Omitted → no stop affordance (e.g. read-only history). */
-    onStop, 
+    onStop,
     /** User keybindings from `ctx.ui.custom()`. Omitted → hardcoded defaults. */
-    keybindings, 
+    keybindings,
     /** Send a steering message to the agent. Omitted → no compose affordance. */
-    onSteer, 
+    onSteer,
     /**
      * Whether the header shows an estimated cost after the token count. Read
      * once, at construction: the overlay is opened from a menu, so the setting
      * cannot change while it is on screen.
      */
-    showCost = false, 
+    showCost = false,
     /**
      * The current `viewerMarkdown` setting. Read live rather than captured,
      * unlike `showCost`: `m` changes it while the overlay is on screen.
      * Omitted → `assistant`.
      */
-    viewerMarkdown, 
+    viewerMarkdown,
     /**
      * Persist a mode chosen with `m`, so the key and `/agents → Settings` mean
      * the same thing. Omitted → `m` still cycles, viewer-locally.
@@ -488,7 +488,7 @@ export class ConversationViewer {
         let entry = this.markdownCache.get(msg);
         if (!entry) {
             entry = {
-                md: new Markdown(text, 0, 0, this.markdownTheme, 
+                md: new Markdown(text, 0, 0, this.markdownTheme,
                 // Keeps result prose visually receded, the way the raw path's
                 // per-line `fg("dim", …)` did. Fenced code is the exception and is
                 // left alone deliberately: pi's theme highlights it with its own

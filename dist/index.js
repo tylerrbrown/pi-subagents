@@ -954,7 +954,7 @@ export default function (pi) {
         // — print mode has no such method, and RPC mode's is a no-op.
         if (ctx.mode === "tui" && !mentionProviderRegistered) {
             mentionProviderRegistered = true;
-            ctx.ui.addAutocompleteProvider(current => createMentionProvider(current, 
+            ctx.ui.addAutocompleteProvider(current => createMentionProvider(current,
             // Plain text, not renderAgentName: the same label FleetView and the
             // widget show, but the autocomplete description cannot carry ANSI.
             () => mentionRoster(manager, mentionTypes(), type => getConfig(type).displayName), isAgentMentionsEnabled));

@@ -76,7 +76,7 @@ export class FleetList {
     /** Set while a conversation overlay is open; calling it closes the overlay. */
     viewerClose;
     viewingAgentId;
-    constructor(manager, agentActivity, 
+    constructor(manager, agentActivity,
     /**
      * Read live at render time. Whether each row shows an estimated cost after
      * its token count. Defaults to off — the extension supplies the user's

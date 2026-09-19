@@ -250,15 +250,15 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
       export default function wrapped(pi) {
         const original = pi.exec.bind(pi);
         pi.exec = (command, args, options) => {
-          const pending = original(command, args, options);
           if (command === "git" && args[0] === "worktree" && args[1] === "add") {
+            const release = new Promise(resolve => { globalThis.__s02_release_copy = resolve; });
             globalThis.__s02_copy_started?.();
-            return pending.then(async result => {
-              await new Promise(resolve => { globalThis.__s02_release_copy = resolve; });
+            return original(command, args, options).then(async result => {
+              await release;
               return result;
             });
           }
-          return pending;
+          return original(command, args, options);
         };
         return base(pi);
       }
