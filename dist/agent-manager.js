@@ -10,7 +10,10 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { resumeAgent, runAgent } from "./agent-runner.js";
+import { getAgentConfig } from "./agent-types.js";
+import { syncEffectiveInvocation } from "./invocation-truth.js";
 import { assignHandle, handleBase, isReservedHandle } from "./mention.js";
+import { describeModel, describeRequestedModel, resolveModel } from "./model-resolver.js";
 import { classifyRunFailure } from "./status-note.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -218,6 +221,31 @@ export class AgentManager {
             }
         }
         const startedAt = Date.now();
+        const config = getAgentConfig(type);
+        const resolvedConfigModel = !options.model && config?.model && ctx.modelRegistry
+            ? resolveModel(config.model, ctx.modelRegistry)
+            : undefined;
+        // An agent-file pin outranks the parent model when the session is created.
+        // Resolve that pin for queued/pre-session display; if it cannot be resolved,
+        // omit the prediction rather than briefly reporting a mismatch that may not
+        // exist once Pi establishes the actual session.
+        const predictedModel = options.model
+            ?? (typeof resolvedConfigModel === "string" ? undefined : resolvedConfigModel)
+            ?? (config?.model ? undefined : ctx.model);
+        const requestedModel = options.requestedModel
+            ?? (options.model ? describeModel(options.model).modelId : config?.model)
+            ?? (ctx.model ? describeModel(ctx.model).modelId : undefined);
+        const thinking = options.thinkingLevel ?? config?.thinking ?? ctx.thinkingLevel;
+        const invocation = {
+            ...(predictedModel ? describeModel(predictedModel) : {}),
+            thinking,
+            requestedThinking: thinking,
+            ...(requestedModel && ctx.modelRegistry
+                ? describeRequestedModel(requestedModel, ctx.modelRegistry)
+                : { requestedModel, requestedModelId: requestedModel }),
+            ...options.invocation,
+        };
+        invocation.requestedThinking ??= thinking;
         const record = {
             id,
             type,
@@ -240,7 +268,7 @@ export class AgentManager {
             // only filter excludes only explicit `false`, so undefined agents — which
             // have no inline surface — stay visible instead of vanishing.
             isBackground: options.isBackground,
-            invocation: options.invocation,
+            invocation,
             depth: options.depth ?? 1,
             parentAgentId: options.parentAgentId,
             maxSubagentDepth: options.maxSubagentDepth,
@@ -451,6 +479,7 @@ export class AgentManager {
                     // stubbed session must degrade to "not resumable" rather than throw
                     // and take the whole spawn down with it.
                     record.sessionFile = session.sessionManager?.getSessionFile?.();
+                    syncEffectiveInvocation(record, session);
                     // Flush any steers that arrived before the session was ready
                     if (record.pendingSteers?.length) {
                         for (const msg of record.pendingSteers) {
@@ -462,6 +491,7 @@ export class AgentManager {
                 },
             })
                 .then(async ({ responseText, session, aborted, timedOut, steered, failure }) => {
+                syncEffectiveInvocation(record, session);
                 record.result = responseText;
                 if (timedOut) {
                     await shutdownChildSession(session);
@@ -546,6 +576,8 @@ export class AgentManager {
                 return responseText;
             })
                 .catch(async (err) => {
+                if (record.session)
+                    syncEffectiveInvocation(record, record.session);
                 // Final flush of streaming output file on error
                 if (record.outputCleanup) {
                     try {
@@ -658,6 +690,11 @@ export class AgentManager {
         const record = this.agents.get(id);
         if (!record?.session)
             return undefined;
+        // Refuse active records before synchronizing posture or resetting either run
+        // mode: direct manager callers must leave the live run untouched.
+        if (record.status === "running" || record.status === "queued")
+            return undefined;
+        syncEffectiveInvocation(record, record.session);
         // Background resume: settle asynchronously and notify on completion exactly
         // like a background spawn, returning immediately with the record still
         // "running" — or "queued" when at the concurrency limit. Previously
@@ -665,17 +702,6 @@ export class AgentManager {
         // returned before its background branch, and resume() only ever awaited
         // inline), so a resumed agent always blocked the caller until it finished.
         if (options?.isBackground) {
-            // Never re-enter a run that is still in flight. Detaching means the caller
-            // gets control back while the record stays "running", so nothing stops the
-            // model from resuming the same agent again. Starting a second run would
-            // overwrite record.abortController — orphaning the live run beyond the
-            // reach of `/agents` stop and abortAll() — double-count the pool slot, and
-            // then reject from session.prompt() with "Agent is already processing",
-            // whose settle path would abort the LIVE run's children and report a
-            // failure for a run that is still going. Refuse instead, leaving the
-            // record untouched; the caller decides whether to wait or steer.
-            if (record.status === "running" || record.status === "queued")
-                return undefined;
             record.isBackground = true;
             record.resultConsumed = false;
             record.result = undefined;
@@ -732,6 +758,7 @@ export class AgentManager {
                 signal,
                 runDeadlineMs: options?.runDeadlineMs,
             });
+            syncEffectiveInvocation(record, record.session);
             // Same contract as the spawn path (#144): a failed final turn is an
             // error, not a completion — but the resumed text stays available.
             if (timedOut) {
@@ -753,6 +780,10 @@ export class AgentManager {
             completeRecord(record);
         }
         catch (err) {
+            // resumeAgent can reject after Pi has already changed the live session's
+            // posture; persist that final truth before the record settles.
+            if (record.session)
+                syncEffectiveInvocation(record, record.session);
             record.status = "error";
             record.error = err instanceof Error ? err.message : String(err);
             record.failureKind = classifyRunFailure(record.error);
@@ -773,6 +804,7 @@ export class AgentManager {
     startResume(id, record, prompt, parentSignal, options) {
         if (!record.session)
             return;
+        syncEffectiveInvocation(record, record.session);
         record.status = "running";
         // A queued resume retains the previous run's timestamp until this exact
         // start point; frozen/low-resolution clocks still produce a fresh boundary.
@@ -852,6 +884,7 @@ export class AgentManager {
             runDeadlineMs: options.runDeadlineMs,
         })
             .then(async ({ text, failure, timedOut }) => {
+            syncEffectiveInvocation(record, session);
             // Don't overwrite status if externally stopped via abort().
             if (record.status !== "stopped") {
                 // Same precedence as the spawn path: wall clock first, then a failed
@@ -879,6 +912,7 @@ export class AgentManager {
             return text;
         })
             .catch((err) => {
+            syncEffectiveInvocation(record, session);
             if (record.status !== "stopped") {
                 record.status = "error";
                 record.error = err instanceof Error ? err.message : String(err);

@@ -26,7 +26,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode, validateCapabilityAdditions } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { resolveModel } from "./model-resolver.js";
+import { describeModel, describeRequestedModel, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { foldNotificationLedger, isPersistedAgentSnapshot, MAX_CAPTURE_CHARS, SUBAGENT_NOTIFICATION_VERSION, SUBAGENT_RECORD_VERSION } from "./notification-ledger.js";
@@ -370,6 +370,13 @@ export default function (pi) {
     let showCost = false;
     function isShowCostEnabled() { return showCost; }
     function setShowCost(b) { showCost = b; widget.update(); fleet.update(); }
+    let viewerMarkdown = "assistant";
+    function getViewerMarkdown() { return viewerMarkdown; }
+    function setViewerMarkdown(mode) { viewerMarkdown = mode; }
+    function chooseViewerMarkdown(mode, ctx) {
+        setViewerMarkdown(mode);
+        notifyApplied(ctx, `Viewer markdown set to ${mode}`);
+    }
     const pendingUsage = new PendingUsagePool();
     // ---- Durable completion notification ledger ----
     const NUDGE_HOLD_MS = 200;
@@ -947,7 +954,7 @@ export default function (pi) {
         // — print mode has no such method, and RPC mode's is a no-op.
         if (ctx.mode === "tui" && !mentionProviderRegistered) {
             mentionProviderRegistered = true;
-            ctx.ui.addAutocompleteProvider(current => createMentionProvider(current,
+            ctx.ui.addAutocompleteProvider(current => createMentionProvider(current, 
             // Plain text, not renderAgentName: the same label FleetView and the
             // widget show, but the autocomplete description cannot carry ANSI.
             () => mentionRoster(manager, mentionTypes(), type => getConfig(type).displayName), isAgentMentionsEnabled));
@@ -1253,7 +1260,7 @@ export default function (pi) {
     const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled);
     function setWidgetMode(m) { widgetMode = m; widget.update(); }
     // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-    const fleet = new FleetList(manager, agentActivity, isShowCostEnabled);
+    const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, currentCtx));
     let fleetViewEnabled = true;
     function isFleetViewEnabled() { return fleetViewEnabled; }
     function setFleetViewEnabled(b) { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1498,6 +1505,7 @@ export default function (pi) {
         setFallbackSubagent: setFallbackSubagent,
         setReportUsage,
         setShowCost,
+        setViewerMarkdown,
     }, (event, payload) => pi.events.emit(event, payload));
     // ---- Agent tool ----
     // Schedule param + its guideline are gated on `schedulingEnabled` (read once
@@ -1912,15 +1920,13 @@ Terse command-style prompts produce shallow, generic work.
                 rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
                 writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
             };
-            const parentModelId = ctx.model?.id;
-            const effectiveModelId = model?.id;
-            const modelName = effectiveModelId && effectiveModelId !== parentModelId
-                ? (model?.name ?? effectiveModelId).replace(/^Claude\s+/i, "").toLowerCase()
-                : undefined;
+            const modelDescription = model ? describeModel(model) : {};
             const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
             const agentInvocation = {
-                modelName,
-                thinking,
+                ...modelDescription,
+                ...describeRequestedModel(params.model ?? resolvedConfig.modelInput, ctx.modelRegistry),
+                thinking: thinking ?? ctx.thinkingLevel,
+                requestedThinking: (params.thinking ?? thinking ?? ctx.thinkingLevel),
                 // Explicit value only — the default fallback would just add noise.
                 // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
                 maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
@@ -1931,7 +1937,7 @@ Terse command-style prompts produce shallow, generic work.
             };
             // Tool-result render shows the mode label too; viewer's header already does.
             const modeLabel = getPromptModeLabel(subagentType);
-            const { tags: invocationTags } = buildInvocationTags(agentInvocation);
+            const { modelName, tags: invocationTags } = buildInvocationTags(agentInvocation);
             const agentTags = modeLabel ? [modeLabel, ...invocationTags] : invocationTags;
             const detailBase = {
                 displayName,
@@ -1939,6 +1945,20 @@ Terse command-style prompts produce shallow, generic work.
                 subagentType,
                 modelName,
                 tags: agentTags.length > 0 ? agentTags : undefined,
+            };
+            // Once a record exists its actual session outranks the call's prediction.
+            const detailBaseFor = (record) => {
+                if (!record?.invocation)
+                    return detailBase;
+                const { modelName, tags } = buildInvocationTags(record.invocation);
+                const mode = getPromptModeLabel(record.type);
+                return {
+                    displayName: getDisplayName(record.type),
+                    description: record.description,
+                    subagentType: record.type,
+                    modelName,
+                    tags: mode ? [mode, ...tags] : tags,
+                };
             };
             // ---- Schedule: register a job, don't spawn now ----
             if (params.schedule) {
@@ -1993,24 +2013,32 @@ Terse command-style prompts produce shallow, generic work.
                 if (!existing || existing.parentAgentId) {
                     return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
                 }
+                // A detached resume hands control back while the record stays
+                // "running", so nothing stops the model from resuming the same agent
+                // again mid-run. Reject before retaining this call's requested posture:
+                // a call that never executes must leave the visible record untouched.
+                // Foreground resumes must be rejected as well: manager.resume resets the
+                // live record and would otherwise send a second prompt to its session.
+                if (existing.status === "running" || existing.status === "queued") {
+                    return textResult(`Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
+                        `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`);
+                }
                 if (!existing.session) {
                     return textResult(`Agent "${params.resume}" has no active session to resume.`);
                 }
+                // A resume cannot change session settings, but retain what an accepted
+                // call asked so any effective/requested difference remains visible.
+                existing.invocation ??= {};
+                if (params.model)
+                    Object.assign(existing.invocation, describeRequestedModel(params.model, ctx.modelRegistry));
+                if (params.thinking)
+                    existing.invocation.requestedThinking = params.thinking;
                 // Background resume: detached run that notifies on completion, mirroring
                 // a background spawn. Previously run_in_background was silently ignored
                 // on resume (this branch returned before the background branch below),
                 // so a resumed agent always blocked the main loop until it finished.
                 if (runInBackground) {
                     const id = existing.id;
-                    // A detached resume hands control back while the record stays
-                    // "running", so nothing stops the model from resuming the same agent
-                    // again mid-run. manager.resume() refuses that (it would orphan the
-                    // live run's abort controller); say why here, where the model can act
-                    // on it, instead of letting it read as a generic failure.
-                    if (existing.status === "running" || existing.status === "queued") {
-                        return textResult(`Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-                            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`);
-                    }
                     const record = await startBackgroundResume(ctx, existing, params.prompt, {
                         outputTranscript,
                         maxTurns: effectiveMaxTurns,
@@ -2027,7 +2055,7 @@ Terse command-style prompts produce shallow, generic work.
                         (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
                         (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
                         `\nYou will be notified when this agent completes.\n` +
-                        `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`, { ...detailBase, subagentType: existing.type, displayName: existing.type, toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background", agentId: id });
+                        `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`, { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background", agentId: id });
                 }
                 const record = await manager.resume(params.resume, params.prompt, signal, {
                     runDeadlineMs: params.deadline_ms,
@@ -2044,12 +2072,12 @@ Terse command-style prompts produce shallow, generic work.
                 // A failed resume surfaces the error, plus any partial output THIS
                 // resume produced (never the previous turn's answer, #144).
                 if (record.status === "error") {
-                    return textResult(`Agent failed: ${record.error}${getFailureNote(record.failureKind)}${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
+                    return textResult(`Agent failed: ${record.error}${getFailureNote(record.failureKind)}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
                 }
                 if (record.status === "timeout") {
-                    return textResult(`Agent timed out (wall-clock deadline).${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
+                    return textResult(`Agent timed out (wall-clock deadline).${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
                 }
-                return textResult(record.result?.trim() || "No output.", buildDetails(detailBase, record));
+                return textResult(record.result?.trim() || "No output.", buildDetails(detailBaseFor(record), record));
             }
             // Background execution
             if (runInBackground) {
@@ -2129,7 +2157,7 @@ Terse command-style prompts produce shallow, generic work.
                     (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
                     `\nYou will be notified when this agent completes.\n` +
                     `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
-                    `Do not duplicate this agent's work.`, { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background", agentId: id });
+                    `Do not duplicate this agent's work.`, { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background", agentId: id });
             }
             // Foreground (synchronous) execution — stream progress via onUpdate
             let spinnerFrame = 0;
@@ -2141,7 +2169,7 @@ Terse command-style prompts produce shallow, generic work.
                 // assistant message — so nothing is spent while this reads zero.
                 const fgRecord = fgId ? manager.getRecord(fgId) : undefined;
                 const details = {
-                    ...detailBase,
+                    ...detailBaseFor(fgRecord),
                     toolUses: fgState.toolUses,
                     tokens: fgRecord ? formatLifetimeTokens(fgRecord) : "",
                     cost: fgRecord ? getLifetimeCost(fgRecord.lifetimeUsage) : 0,
@@ -2227,7 +2255,7 @@ Terse command-style prompts produce shallow, generic work.
             // Get final token count — from the record, like the cost below it, so the
             // two describe the same work when the agent delegated to nested children.
             const tokenText = formatLifetimeTokens(record);
-            const details = buildDetails(detailBase, record, fgState, { tokens: tokenText });
+            const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
             if (record.status === "error") {
                 // Error headline + any partial output the run produced before failing.
                 return textResult(`${fallbackNote}Agent failed: ${record.error}${getFailureNote(record.failureKind)}${partialOutputSuffix(record)}`, details);
@@ -2641,7 +2669,7 @@ Terse command-style prompts produce shallow, generic work.
                 if (manager.abort(record.id)) {
                     ctx.ui.notify(`Stopped "${record.description}".`, "info");
                 }
-            }, keybindings, (message) => manager.steer(record.id, message), showCost);
+            }, keybindings, (message) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
         }, {
             overlay: true,
             overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
@@ -2700,6 +2728,7 @@ Definitions are read-only in /agents.`, "info");
             fallbackSubagent: getFallbackSubagent(),
             reportUsage: isReportUsageEnabled(),
             showCost: isShowCostEnabled(),
+            viewerMarkdown: getViewerMarkdown(),
         };
     }
     const _settingsSnapshotIsComplete = true;
@@ -2838,6 +2867,13 @@ Definitions are read-only in /agents.`, "info");
                     description: "Show an estimated `~$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. Priced by pi from the model's rates — omitted entirely for a model it has no rates for.",
                     currentValue: isShowCostEnabled() ? "on" : "off",
                     values: ["on", "off"],
+                },
+                {
+                    id: "viewerMarkdown",
+                    label: "Viewer markdown",
+                    description: "assistant = assistant text only (default); all = tool results too (may reshape logs and diffs); off = verbatim. The viewer m key cycles this setting: raw / md / md+.",
+                    currentValue: getViewerMarkdown(),
+                    values: ["off", "assistant", "all"],
                 },
                 {
                     id: "fleetView",
@@ -3006,6 +3042,9 @@ Definitions are read-only in /agents.`, "info");
                 setShowCost(enabled);
                 notifyApplied(ctx, `Cost display ${enabled ? "enabled" : "disabled"}`);
             }
+            else if (id === "viewerMarkdown") {
+                chooseViewerMarkdown(value, ctx);
+            }
             else if (id === "fleetView") {
                 const enabled = value === "on";
                 setFleetViewEnabled(enabled);
@@ -3101,7 +3140,7 @@ Definitions are read-only in /agents.`, "info");
     // of outcome so listeners see the in-memory change.
     function notifyApplied(ctx, successMsg) {
         const { message, level } = saveAndEmitChanged(snapshotSettings(), successMsg, (event, payload) => pi.events.emit(event, payload));
-        ctx.ui.notify(message, level);
+        ctx?.ui.notify(message, level);
     }
     pi.registerCommand("agents", {
         description: "Manage agents",

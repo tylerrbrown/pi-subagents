@@ -61,6 +61,8 @@ export class FleetList {
     manager;
     agentActivity;
     showCost;
+    viewerMarkdown;
+    onViewerMarkdown;
     ui;
     tui;
     inputUnsub;
@@ -74,16 +76,18 @@ export class FleetList {
     /** Set while a conversation overlay is open; calling it closes the overlay. */
     viewerClose;
     viewingAgentId;
-    constructor(manager, agentActivity,
+    constructor(manager, agentActivity, 
     /**
      * Read live at render time. Whether each row shows an estimated cost after
      * its token count. Defaults to off — the extension supplies the user's
      * `showCost` setting.
      */
-    showCost = () => false) {
+    showCost = () => false, viewerMarkdown, onViewerMarkdown) {
         this.manager = manager;
         this.agentActivity = agentActivity;
         this.showCost = showCost;
+        this.viewerMarkdown = viewerMarkdown;
+        this.onViewerMarkdown = onViewerMarkdown;
     }
     // ---- Lifecycle ----
     setEnabled(enabled) {
@@ -298,7 +302,7 @@ export class FleetList {
             return new ConversationViewer(tui, session, record, activity, theme, done, () => {
                 if (this.manager.abort(record.id))
                     this.ui?.notify(`Stopped "${record.description}".`, "info");
-            }, keybindings, (message) => this.manager.steer(record.id, message), this.showCost());
+            }, keybindings, (message) => this.manager.steer(record.id, message), this.showCost(), this.viewerMarkdown, this.onViewerMarkdown);
         }, {
             overlay: true,
             overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },

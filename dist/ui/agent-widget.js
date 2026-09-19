@@ -7,6 +7,7 @@
 import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentNameLabel } from "../agent-color.js";
 import { getConfig } from "../agent-types.js";
+import { hasModelMismatch } from "../invocation-truth.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 // ---- Constants ----
 /** Maximum number of rendered lines before overflow collapse kicks in. */
@@ -73,9 +74,12 @@ function compactLevel(level) {
 export function formatAgentPosture(record) {
     const session = record.session;
     const thinking = session?.thinkingLevel ?? record.invocation?.thinking;
-    const effort = record.invocation?.thinking ?? thinking;
-    const model = session?.model?.id ?? record.invocation?.modelName;
-    return model ? `${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
+    const effort = record.invocation?.requestedThinking ?? record.invocation?.thinking ?? thinking;
+    const model = session?.model?.id ?? record.invocation?.modelId?.split("/").slice(1).join("/") ?? record.invocation?.modelName;
+    // Keep the existing aligned columns. A leading marker survives clipping;
+    // the conversation detail gives the full requested model spelling.
+    const mismatch = hasModelMismatch(record.invocation) ? "≠ " : "";
+    return model ? `${mismatch}${model}/${compactLevel(effort)}/${compactLevel(thinking)}` : "";
 }
 export function padColumn(text, width) {
     const clipped = truncateToWidth(text, width);
@@ -216,8 +220,11 @@ export function buildInvocationTags(invocation) {
     const tags = [];
     if (!invocation)
         return { tags };
-    if (invocation.thinking)
-        tags.push(`thinking: ${invocation.thinking}`);
+    if (invocation.thinking) {
+        const asked = invocation.requestedThinking && invocation.requestedThinking !== invocation.thinking
+            ? ` (asked ${invocation.requestedThinking})` : "";
+        tags.push(`thinking: ${invocation.thinking}${asked}`);
+    }
     if (invocation.isolated)
         tags.push("isolated");
     if (invocation.isolation === "worktree")
@@ -228,7 +235,11 @@ export function buildInvocationTags(invocation) {
         tags.push("background");
     if (invocation.maxTurns != null)
         tags.push(`max turns: ${invocation.maxTurns}`);
-    return { modelName: invocation.modelName, tags };
+    const modelName = invocation.modelName;
+    return {
+        modelName: modelName && hasModelMismatch(invocation) ? `${modelName} (asked ${invocation.requestedModel})` : modelName,
+        tags,
+    };
 }
 /** Truncate text to a single line, max `len` chars. */
 function truncateLine(text, len = 60) {
@@ -281,13 +292,13 @@ export class AgentWidget {
     tui;
     /** Last status bar text, used to avoid redundant setStatus calls. */
     lastStatusText;
-    constructor(manager, agentActivity,
+    constructor(manager, agentActivity, 
     /**
      * Read live at render time. Selects which agents the widget shows — see
      * `WidgetMode`. Defaults to `"all"` when a caller supplies no policy; the
      * extension supplies one defaulting to `"background"`.
      */
-    mode = () => "all",
+    mode = () => "all", 
     /**
      * Read live at render time, like `mode`. Whether running agents show an
      * estimated cost beside their token count. Defaults to off — the extension

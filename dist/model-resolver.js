@@ -1,6 +1,23 @@
 /**
  * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
  */
+/** Shared short and canonical labels for predictions and actual sessions. */
+export function describeModel(model) {
+    return {
+        modelName: (model.name ?? model.id).replace(/^Claude\s+/i, "").toLowerCase(),
+        modelId: `${model.provider}/${model.id}`,
+    };
+}
+/** Preserve spelling separately from identity: aliases are not mismatches. */
+export function describeRequestedModel(input, registry) {
+    if (!input)
+        return {};
+    const resolved = resolveModel(input, registry);
+    return {
+        requestedModel: input,
+        requestedModelId: typeof resolved === "string" ? undefined : describeModel(resolved).modelId,
+    };
+}
 const SUBSCRIPTION_PROVIDERS = ["pi-sub-anthropic", "openai-codex", "xai"];
 const AWS_PROVIDERS = ["amazon-bedrock", "bedrock-mantle"];
 /** Normalize cosmetic version separators before fuzzy comparison. */

@@ -9,6 +9,7 @@ import { NO_FALLBACK } from "./agent-types.js";
 import { projectReadScopes } from "./project-scope.js";
 const VALID_JOIN_MODES = new Set(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES = new Set(["full", "compact", "custom"]);
+const VALID_VIEWER_MARKDOWN_MODES = new Set(["off", "assistant", "all"]);
 const VALID_WIDGET_MODES = new Set(["all", "background", "off"]);
 const VALID_AGENT_MENTION_MODES = new Set(["model", "direct", "off"]);
 // Sanity ceilings — prevent hand-edited configs from asking for values that
@@ -106,6 +107,9 @@ function sanitize(raw) {
     if (typeof r.showCost === "boolean") {
         out.showCost = r.showCost;
     }
+    if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
+        out.viewerMarkdown = r.viewerMarkdown;
+    }
     if (r.fallbackSubagent === false) {
         // The only non-string spelling worth accepting: a boolean would otherwise be
         // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -202,6 +206,8 @@ export function applySettings(s, appliers) {
         appliers.setAgentMentions(s.agentMentions);
     if (typeof s.rememberAgents === "boolean")
         appliers.setRememberAgents(s.rememberAgents);
+    if (s.viewerMarkdown)
+        appliers.setViewerMarkdown(s.viewerMarkdown);
     if (s.widgetMode)
         appliers.setWidgetMode(s.widgetMode);
     if (typeof s.outputTranscript === "boolean")
