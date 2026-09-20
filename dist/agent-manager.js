@@ -154,13 +154,14 @@ export class AgentManager {
     releaseBackgroundSlot(record) {
         return this.backgroundSlots.delete(record.id);
     }
-    constructor(onComplete, maxConcurrent = DEFAULT_MAX_CONCURRENT, onStart, onCompact, onUsage, getReservedTypeNames) {
+    constructor(onComplete, maxConcurrent = DEFAULT_MAX_CONCURRENT, onStart, onCompact, onUsage, getReservedTypeNames, pi) {
         this.getReservedTypeNames = getReservedTypeNames;
         this.onComplete = onComplete;
         this.onStart = onStart;
         this.onCompact = onCompact;
         this.onUsage = onUsage;
         this.maxConcurrent = maxConcurrent;
+        this.pi = pi;
         // Cleanup completed agents after 10 minutes (but keep sessions for resume)
         this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
         this.cleanupInterval.unref();
