@@ -1,4 +1,5 @@
 import type { LifetimeUsage } from "./usage.js";
+import { retainedWorkSnapshots, validateWorkBinding, type WorkBinding, type WorkLaunch } from "./work-lifecycle.js";
 
 export const SUBAGENT_RECORD_VERSION = 1 as const;
 export const SUBAGENT_NOTIFICATION_VERSION = 1 as const;
@@ -35,6 +36,8 @@ export interface PersistedAgentSnapshot {
   compactionCount: number;
   contextPercent: number | null;
   toolCallId?: string;
+  work?: WorkBinding;
+  workLaunch?: WorkLaunch;
   isBackground?: boolean;
   output: { file?: string; sessionFile?: string };
   conversation?: string;
@@ -172,8 +175,23 @@ function normalizeRecord(data: unknown): PersistedAgentRecord | undefined {
     || typeof data.notificationPending !== "boolean"
     || (data.notificationPending && data.isBackground === false)) return undefined;
 
+  let work: WorkBinding | undefined;
+  let workLaunch: WorkLaunch | undefined;
+  try {
+    work = validateWorkBinding(data.work);
+    if (data.workLaunch !== undefined) {
+      workLaunch = retainedWorkSnapshots([{ customType: "subagents:work-record", data: {
+        version: 1, launch: data.workLaunch, status: data.status,
+      } }])[0]?.launch;
+      if (!workLaunch || workLaunch.agentId !== data.id || JSON.stringify(work) !== JSON.stringify(workLaunch.work)) return undefined;
+    }
+    if (work && !workLaunch) return undefined;
+  } catch { return undefined; }
+
   return {
     version: SUBAGENT_RECORD_VERSION,
+    work,
+    workLaunch,
     id: data.id,
     handles: { handle, alias },
     type: data.type,

@@ -827,6 +827,17 @@ export async function runAgent(ctx, type, prompt, options) {
     const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
     const baseSessionName = agentConfig?.name ?? type;
     session.setSessionName(options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName);
+    if (options.bindBeforeExtensions) {
+        try {
+            await options.onSessionCreated?.(session);
+            if (options.signal?.aborted)
+                throw new Error("Agent startup cancelled before prompt.");
+        }
+        catch (error) {
+            session.dispose();
+            throw error;
+        }
+    }
     // Bind extensions so that session_start fires and extensions can initialize
     // (e.g. loading credentials, setting up state). Tool gating already happened
     // at session construction via the `tools:` allowlist above — no separate
@@ -855,7 +866,10 @@ export async function runAgent(ctx, type, prompt, options) {
             nestedToolNames,
         });
     }
-    options.onSessionCreated?.(session);
+    if (!options.bindBeforeExtensions)
+        await options.onSessionCreated?.(session);
+    if (options.bindBeforeExtensions && options.signal?.aborted)
+        throw new Error("Agent startup cancelled before prompt.");
     // Track turns for graceful max_turns enforcement
     let turnCount = 0;
     const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);

@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { withSyntheticEnvironment } from "./helpers/work-adapter.js";
 
 const {
   createAgentSession,
@@ -222,6 +223,55 @@ describe("agent-runner final output capture", () => {
     const result = await runAgent(ctx, "Explore", "Say LOCKED", { pi });
 
     expect(result.responseText).toBe("LOCKED");
+  });
+
+  it("forwards exact caller cwd to child constructors without global cwd/environment writes", async () => {
+    const { session } = createSession("done");
+    createAgentSession.mockResolvedValue({ session });
+    const original = process.cwd();
+    const cwd = `${original}/.`;
+    const chdir = vi.spyOn(process, "chdir");
+    try {
+      await withSyntheticEnvironment(async writes => {
+        await runAgent(ctx, "Explore", "go", { pi, cwd, bindBeforeExtensions: true, onSessionCreated: async () => {} });
+        expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+        expect(defaultResourceLoaderCtor).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+        expect(sessionManagerCreate.mock.calls[0][0]).toBe(cwd);
+        expect(process.cwd()).toBe(original);
+        expect(chdir).not.toHaveBeenCalled();
+        expect(writes).not.toHaveBeenCalled();
+      });
+    } finally { chdir.mockRestore(); }
+  });
+
+  it("awaits Work binding before extension initialization or prompt execution", async () => {
+    const { session } = createSession("BOUND");
+    createAgentSession.mockResolvedValue({ session });
+    let authorize!: () => void;
+    const binding = new Promise<void>(resolve => { authorize = resolve; });
+    const onSessionCreated = vi.fn(() => binding);
+    const running = runAgent(ctx, "Explore", "go", { pi, bindBeforeExtensions: true, onSessionCreated });
+    await vi.waitFor(() => expect(onSessionCreated).toHaveBeenCalledWith(session));
+    expect(session.bindExtensions).not.toHaveBeenCalled();
+    expect(session.prompt).not.toHaveBeenCalled();
+    authorize();
+    await running;
+    expect(session.bindExtensions).toHaveBeenCalledOnce();
+    expect(session.prompt).toHaveBeenCalledOnce();
+  });
+
+  it("disposes a child whose Work bind fails without initializing extensions or prompting", async () => {
+    const { session } = createSession("NEVER");
+    const dispose = vi.fn();
+    Object.assign(session, { dispose });
+    createAgentSession.mockResolvedValue({ session });
+    await expect(runAgent(ctx, "Explore", "go", {
+      pi, bindBeforeExtensions: true,
+      onSessionCreated: async () => { throw new Error("binding refused"); },
+    })).rejects.toThrow("binding refused");
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(session.bindExtensions).not.toHaveBeenCalled();
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 
   it("binds extensions before prompting", async () => {

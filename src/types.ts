@@ -5,6 +5,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
+import type { WorkBinding, WorkLaunch } from "./work-lifecycle.js";
 
 export type { ThinkingLevel };
 
@@ -156,6 +157,8 @@ export type AgentMentionMode = 'model' | 'direct' | 'off';
  * and this is the little that is needed to find and describe it again.
  */
 export interface AgentTombstone {
+  work?: WorkBinding;
+  cwd?: string;
   handle: string;
   alias?: string;
   id: string;
@@ -189,6 +192,8 @@ export type MentionResolution =
 
 export interface AgentRecord {
   id: string;
+  work?: WorkBinding;
+  workLaunch?: WorkLaunch;
   type: SubagentType;
   /**
    * Typeable name for the `@handle message` prompt mention, derived from the
@@ -348,6 +353,8 @@ export interface ScheduledSubagent {
   intervalMs?: number;
 
   // spawn params (subset of Agent tool params; no inherit_context, no resume)
+  cwd?: string;
+  work?: WorkBinding;
   subagent_type: SubagentType;
   prompt: string;
   model?: string;
@@ -365,6 +372,8 @@ export interface ScheduledSubagent {
   /** Refreshed on every fire and on store load. */
   nextRun?: string;
   runCount: number;
+  /** Last allocated dispatch occurrence; persisted before spawn, not on settlement. */
+  occurrenceCount?: number;
 }
 
 export interface ScheduleStoreData {

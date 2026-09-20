@@ -41,7 +41,7 @@ export function registerRpcHandlers(deps) {
     const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
         return { version: PROTOCOL_VERSION };
     });
-    const unsubSpawn = handleRpc(events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
+    const unsubSpawn = handleRpc(events, "subagents:rpc:spawn", async ({ requestId, type, prompt, options }) => {
         const ctx = getCtx();
         if (!ctx)
             throw new Error("No active session");
@@ -51,7 +51,9 @@ export function registerRpcHandlers(deps) {
         // — same pattern the scheduler path already uses — so the spawned
         // agent's auth lookup doesn't crash with "No API key found for
         // undefined".
-        let normalizedOptions = options ?? {};
+        let normalizedOptions = options?.work !== undefined
+            ? { ...options, invocationId: options.invocationId ?? requestId }
+            : options ?? {};
         if (typeof normalizedOptions.model === "string") {
             const registry = ctx.modelRegistry;
             if (!registry) {

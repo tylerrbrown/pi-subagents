@@ -10,6 +10,7 @@
  *   /agents                 — Interactive agent management menu
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
@@ -62,6 +63,7 @@ import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
 import { beginBlockingWait, endBlockingWait, getWaitCeilingMs, noteWaitOutcome, PARALLEL_JOIN_REFUSAL, resetBlockingWaits, setWaitCeilingMs, shouldRefuseRepeatJoin, waitWithCeiling } from "./wait-ceiling.js";
+import { validateWorkBinding, type WorkBinding, WorkBindingSchema } from "./work-lifecycle.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 
 // ---- Shared helpers ----
@@ -505,6 +507,8 @@ export default function (pi: ExtensionAPI) {
       compactionCount: record.compactionCount,
       contextPercent: getSessionContextPercent(record.session),
       toolCallId: record.toolCallId,
+      work: record.work,
+      workLaunch: record.workLaunch && structuredClone(record.workLaunch),
       isBackground: record.isBackground,
       output: { file: record.outputFile, sessionFile: record.sessionFile },
       conversation,
@@ -702,6 +706,10 @@ export default function (pi: ExtensionAPI) {
 
   /** Helper: build event data for lifecycle events from an AgentRecord. */
   function buildEventData(record: AgentRecord) {
+    if (record.workLaunch) {
+      const { launchKey, parentSessionId, invocationId, childSessionId, work } = record.workLaunch;
+      return { id: record.id, launchKey, parentSessionId, invocationId, childSessionId, work, status: record.status };
+    }
     const durationMs = record.completedAt ? record.completedAt - record.startedAt : Date.now() - record.startedAt;
     // All three fields are lifetime-accumulated (Σ over every assistant message_end),
     // so they survive compaction together — input + output ≤ total always.
@@ -971,6 +979,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     invalidateNotificationTimer();
     currentCtx = ctx;
+    await manager.reconcileWork(pi, ctx.sessionManager.getBranch());
     const ledger = foldNotificationLedger(ctx.sessionManager.getBranch());
     persistedRecords = ledger.records;
     pendingNotificationIds = ledger.pending;
@@ -1100,7 +1109,7 @@ export default function (pi: ExtensionAPI) {
         // this message is still relayed even if the LLM read its last answer.
         record.resultConsumed = false;
         manager.steer(record.id, mention.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
+        pi.events.emit("subagents:steered", { id: record.id, ...(!record.workLaunch && { message: mention.message }) });
         ctx.ui.notify(`Sent to ${target}`, "info");
         return { action: "handled" };
       }
@@ -1167,6 +1176,9 @@ export default function (pi: ExtensionAPI) {
         // exception — both come from a tombstone this extension wrote.
         const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
           description: entry.description,
+          work: entry.work,
+          cwd: entry.cwd,
+          invocationId: randomUUID(),
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
           isBackground: true,
@@ -1467,7 +1479,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; runDeadlineMs?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; runDeadlineMs?: number; toolCallId?: string; work?: WorkBinding; cwd?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1500,6 +1512,10 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      work: opts.work,
+      cwd: opts.cwd,
+      invocationId: opts.toolCallId ?? randomUUID(),
+      toolCallId: opts.toolCallId,
       runDeadlineMs: opts.runDeadlineMs,
       onToolActivity: bgCallbacks.onToolActivity,
       onTextDelta: bgCallbacks.onTextDelta,
@@ -1851,6 +1867,8 @@ Terse command-style prompts produce shallow, generic work.
           description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
         }),
       ),
+      cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, description: "Absolute working directory for the child. Configuration remains inherited from the parent project." })),
+      work: Type.Optional(WorkBindingSchema),
       ...isolationParam(isWorktreeIsolationEnabled()),
       ...scheduleParam,
     }),
@@ -2049,6 +2067,10 @@ Terse command-style prompts produce shallow, generic work.
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
+      const work = validateWorkBinding(params.work);
+      if (work && (params.isolation === "worktree" || customConfig?.isolation === "worktree")) {
+        throw new Error("Work binding cannot be combined with Agent worktree isolation.");
+      }
       let capabilityAdditions: AgentCapabilityAdditions;
       try {
         capabilityAdditions = validateCapabilityAdditions({
@@ -2147,6 +2169,8 @@ Terse command-style prompts produce shallow, generic work.
             max_turns: effectiveMaxTurns,
             isolated: isolated,
             isolation: isolation,
+            cwd: params.cwd,
+            work,
           });
           const next = scheduler.getNextRun(job.id);
           return textResult(
@@ -2201,6 +2225,8 @@ Terse command-style prompts produce shallow, generic work.
             maxTurns: effectiveMaxTurns,
             runDeadlineMs: params.deadline_ms,
             toolCallId,
+            work,
+            cwd: params.cwd,
           });
           if (!record) {
             return textResult(`Failed to resume agent "${params.resume}".`);
@@ -2220,6 +2246,9 @@ Terse command-style prompts produce shallow, generic work.
         }
 
         const record = await manager.resume(params.resume, params.prompt, signal, {
+          work,
+          cwd: params.cwd,
+          toolCallId,
           runDeadlineMs: params.deadline_ms,
         });
         if (!record) {
@@ -2266,6 +2295,9 @@ Terse command-style prompts produce shallow, generic work.
         // tool call failed only when execute throws, and a returned message
         // reads to the model as a subagent that ran and reported this (#179).
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+          cwd: params.cwd,
+          work,
+          toolCallId,
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2401,6 +2433,9 @@ Terse command-style prompts produce shallow, generic work.
       let record: AgentRecord;
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
+          cwd: params.cwd,
+          work,
+          toolCallId,
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2662,17 +2697,17 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
-      if (!record.session) {
+      if (!record.session || (record.workLaunch && !record.workLaunch.bound)) {
         // Session not ready yet — queue the steer for delivery once initialized
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+        pi.events.emit("subagents:steered", { id: record.id, ...(!record.workLaunch && { message: params.message }) });
         return textResult(`Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
       }
 
       try {
         await steerAgent(record.session, params.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+        pi.events.emit("subagents:steered", { id: record.id, ...(!record.workLaunch && { message: params.message }) });
         const tokens = formatLifetimeTokens(record);
         const contextPercent = getSessionContextPercent(record.session);
         const stateParts: string[] = [];

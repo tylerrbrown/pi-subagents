@@ -20,7 +20,14 @@ import { describeModel, describeRequestedModel, resolveModel } from "./model-res
 import { classifyRunFailure } from "./status-note.js";
 import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, StopReason, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
+import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkReservation, type WorkBinding, type WorkSnapshot, workLaunchKey } from "./work-lifecycle.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeCleanupResult, } from "./worktree.js";
+
+type WorkRun = Readonly<{
+  token: symbol;
+  launch: NonNullable<AgentRecord["workLaunch"]>;
+  controller: AbortController;
+}>;
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -63,9 +70,9 @@ const MAX_TOMBSTONES = 100;
  * directory — curated errors instead of TypeErrors from path/fs internals
  * (RPC callers send arbitrary JSON: null, numbers, file paths).
  */
-function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | null {
+export function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | null {
   if (cwd == null) return;
-  if (typeof cwd !== "string" || !isAbsolute(cwd)) {
+  if (typeof cwd !== "string" || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd) || !isAbsolute(cwd)) {
     throw new Error(`SpawnOptions.cwd must be an absolute path: "${String(cwd)}"`);
   }
   let isDirectory = false;
@@ -106,7 +113,11 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions extends AgentCapabilityAdditions {
+export interface SpawnOptions extends AgentCapabilityAdditions {
+  work?: WorkBinding;
+  /** Original caller identity; RPC uses requestId, Agent uses toolCallId. */
+  invocationId?: string;
+  toolCallId?: string;
   description: string;
   /**
    * Optional memorable name for this instance, becoming a second handle
@@ -171,7 +182,7 @@ interface SpawnOptions extends AgentCapabilityAdditions {
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   /** Called when the agent session is created (for accessing session stats). */
-  onSessionCreated?: (session: AgentSession) => void;
+  onSessionCreated?: (session: AgentSession) => void | Promise<void>;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /** Called once per assistant message_end with that message's usage delta. */
@@ -190,7 +201,11 @@ interface SpawnOptions extends AgentCapabilityAdditions {
   rootSessionId?: string;
 }
 
-interface ResumeOptions {
+export interface ResumeOptions {
+  work?: WorkBinding;
+  invocationId?: string;
+  toolCallId?: string;
+  cwd?: string;
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -281,6 +296,116 @@ export class AgentManager {
   /** Startup is separate from the run: spawn still returns an ID synchronously. */
   private startups = new Map<string, Promise<void>>();
   private pi?: ExtensionAPI;
+  private workFinalizations = new Map<string, Promise<void>>();
+  private workLaunches = new Set<string>();
+  private queuedWorkSignals = new Map<string, () => void>();
+  /** A stopped record is not resumable until its asynchronous continuation settles. */
+  private workRuns = new Map<AgentRecord, WorkRun>();
+  private pendingWorkStarts = new WeakSet<AgentRecord>();
+
+  private ownsWorkRun(record: AgentRecord, run: WorkRun | undefined): boolean {
+    return !run || (this.workRuns.get(record)?.token === run.token
+      && record.workLaunch === run.launch && record.abortController === run.controller);
+  }
+
+  private assertWorkRun(record: AgentRecord, run: WorkRun | undefined, active = true): void {
+    if (!this.ownsWorkRun(record, run) || (active && (record.status !== "running"
+      || (run?.controller ?? record.abortController)?.signal.aborted))) {
+      throw new Error("Work run no longer owns this launch or was cancelled.");
+    }
+  }
+
+  private watchQueuedWork(record: AgentRecord, signal?: AbortSignal): void {
+    if (!record.workLaunch || !signal) return;
+    if (signal.aborted) { this.abort(record.id); return; }
+    const abort = () => this.abort(record.id);
+    signal.addEventListener("abort", abort, { once: true });
+    this.queuedWorkSignals.set(record.id, () => signal.removeEventListener("abort", abort));
+  }
+
+  private finalizeQueuedWork(record: AgentRecord): void {
+    const run = this.workRuns.get(record);
+    void this.finalizeWork(record, run).finally(() => {
+      if (run && this.ownsWorkRun(record, run)) this.workRuns.delete(record);
+    });
+  }
+
+  private detachQueuedWork(id: string): void {
+    this.queuedWorkSignals.get(id)?.();
+    this.queuedWorkSignals.delete(id);
+  }
+
+  private workSnapshot(record: AgentRecord): WorkSnapshot {
+    // Receipts carry only bounded identities and the typed terminal status; never the child's private result.
+    return { version: 1, launch: structuredClone(record.workLaunch!), status: record.status };
+  }
+
+  private persistWork(record: AgentRecord): void {
+    if (record.workLaunch) this.pi!.appendEntry("subagents:work-record", this.workSnapshot(record));
+  }
+
+  private finalizeWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<void> {
+    if (!this.ownsWorkRun(record, run)) return Promise.resolve();
+    const launch = run?.launch ?? record.workLaunch;
+    if (!launch || !this.pi) return Promise.resolve();
+    // Preserve late child identity even when an abort already sent the receipt.
+    // Persistence failure must not suppress the live receipt; reconcile retries on reconnect.
+    try { this.persistWork(record); } catch { /* adapter still receives the receipt */ }
+    const previous = this.workFinalizations.get(launch.launchKey);
+    if (previous) return previous;
+    const snapshot = this.workSnapshot(record);
+    const receipt = requestWork(this.pi.events, "finalize", snapshot).then(() => {}, () => {});
+    this.workFinalizations.set(launch.launchKey, receipt);
+    return receipt;
+  }
+
+  async reconcileWork(pi: ExtensionAPI, branch: readonly unknown[]): Promise<void> {
+    this.pi = pi;
+    const retained = new Map(retainedWorkSnapshots(branch).map(snapshot => [snapshot.launch.launchKey, snapshot]));
+    for (const key of retained.keys()) this.workLaunches.add(key);
+    for (const record of this.agents.values()) {
+      if (record.workLaunch) retained.set(record.workLaunch.launchKey, this.workSnapshot(record));
+    }
+    await Promise.allSettled([...retained.values()].map(snapshot => requestWork(pi.events, "reconcile", snapshot)));
+  }
+
+  private async reserveWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<void> {
+    this.assertWorkRun(record, run);
+    const launch = run?.launch ?? record.workLaunch;
+    if (!launch) return;
+    this.persistWork(record);
+    const reservation = await requestWork(this.pi!.events, "reserve", launch);
+    this.assertWorkRun(record, run, false);
+    launch.reservation = validateWorkReservation(reservation);
+    this.persistWork(record);
+    this.assertWorkRun(record, run);
+  }
+
+  private async bindWork(record: AgentRecord, session: AgentSession, run = this.workRuns.get(record)): Promise<void> {
+    this.assertWorkRun(record, run);
+    const launch = run?.launch ?? record.workLaunch;
+    if (!launch) return;
+    const childSessionId = session.sessionManager.getSessionId();
+    assertWorkString(childSessionId, "childSessionId", 512);
+    launch.childSessionId = childSessionId;
+    this.persistWork(record);
+    if (!launch.reservation) throw new Error("Work launch has no reservation.");
+    // Adapter enforcement boundary: bind must authorize this exact reservation,
+    // Work identity, cwd and child session before extensions or prompts can run.
+    // A successful transport reply alone is not authorization; the adapter must enforce it.
+    await requestWork(this.pi!.events, "bind", launch);
+    this.assertWorkRun(record, run);
+    launch.bound = true;
+    this.persistWork(record);
+    if (record.pendingSteers?.length) {
+      for (const message of record.pendingSteers) {
+        this.assertWorkRun(record, run);
+        await session.steer(message);
+      }
+      this.assertWorkRun(record, run);
+      record.pendingSteers = undefined;
+    }
+  }
   /** Idempotent cleanup shared by settlement and shutdown. */
   private worktreeCleanups = new Map<string, () => Promise<WorktreeCleanupResult>>();
 
@@ -352,6 +477,17 @@ export class AgentManager {
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
+    const work = validateWorkBinding(options.work);
+    if (work && (options.isolation === "worktree" || getAgentConfig(type)?.isolation === "worktree")) {
+      throw new Error("Work binding cannot be combined with Agent worktree isolation.");
+    }
+    if (work) {
+      assertWorkString(type, "agentType", 128);
+      assertWorkString(options.description, "description", 1024);
+      if (options.name !== undefined) assertWorkString(options.name, "agentName", 64);
+    }
+    // Snapshot caller-owned data before queued/asynchronous startup.
+    options = { ...options, work };
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
@@ -417,6 +553,8 @@ export class AgentManager {
     const record: AgentRecord = {
       id,
       type,
+      work,
+      toolCallId: options.toolCallId,
       // Nested children are filtered out of every top-level surface, so no
       // handle: nothing can address them and they must not consume a name a
       // top-level sibling could otherwise take.
@@ -442,8 +580,25 @@ export class AgentManager {
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
     };
+    if (work) {
+      const parentSessionId = ctx.sessionManager?.getSessionId?.();
+      const invocationId = options.toolCallId ?? options.invocationId;
+      assertWorkString(invocationId, "invocationId (required for work)", 512);
+      assertWorkString(parentSessionId, "parentSessionId", 512);
+      assertWorkString(options.cwd ?? ctx.cwd, "cwd", 4096);
+      record.workLaunch = {
+        launchKey: workLaunchKey(parentSessionId, invocationId), parentSessionId, invocationId,
+        agentId: id, agentType: type, agentName: options.name, description: options.description,
+        cwd: options.cwd ?? ctx.cwd, work,
+      };
+      if (this.workLaunches.has(record.workLaunch.launchKey)) {
+        throw new Error("Work invocation already launched; reconcile or retrieve its existing record.");
+      }
+    }
     this.agents.set(id, record);
     this.pi = pi;
+    try { this.persistWork(record); } catch (err) { this.agents.delete(id); throw err; }
+    if (record.workLaunch) this.workLaunches.add(record.workLaunch.launchKey);
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
@@ -461,6 +616,7 @@ export class AgentManager {
     if (occupiesPoolSlot(record) && !options.bypassQueue && this.backgroundSlots.size >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ id, start: () => { void this.launch(id, record, args, true); } });
+      this.watchQueuedWork(record, options.signal);
       return id;
     }
 
@@ -470,12 +626,18 @@ export class AgentManager {
 
   /** Register startup before returning the ID; drain-time errors stay on the record. */
   private launch(id: string, record: AgentRecord, args: SpawnArgs, queued: boolean): Promise<void> {
+    if (record.workLaunch) this.pendingWorkStarts.add(record);
     const startup = this.startAgent(id, record, args).then(
       () => { this.startups.delete(id); },
-      (err) => {
+      async (err) => {
         this.startups.delete(id);
         this.releaseBackgroundSlot(record);
         const message = err instanceof Error ? err.message : String(err);
+        if (record.workLaunch && record.promise) {
+          await record.promise;
+          this.drainQueue();
+          throw err;
+        }
         if (record.status === "stopped") {
           // Cancellation during asynchronous startup is terminal too. Keep the
           // stopped record (and any retained worktree result) while rejecting
@@ -484,7 +646,7 @@ export class AgentManager {
           record.failureKind = classifyRunFailure(message);
           completeRecord(record);
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-        } else if (queued) {
+        } else if (queued || record.workLaunch) {
           record.status = "error";
           record.error = message;
           record.failureKind = classifyRunFailure(record.error);
@@ -493,6 +655,8 @@ export class AgentManager {
         } else {
           this.agents.delete(id);
         }
+        await this.finalizeWork(record);
+        this.pendingWorkStarts.delete(record);
         this.drainQueue();
         throw err;
       },
@@ -545,6 +709,7 @@ export class AgentManager {
     let cleanupCopy: (() => Promise<WorktreeCleanupResult>) | undefined;
     let preservationFailure: string | undefined;
     try {
+      if (record.workLaunch) await this.reserveWork(record);
       if (record.status === "running" && options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
         const wt = await createWorktree(pi, baseCwd, id);
         if (!wt) {
@@ -591,7 +756,11 @@ export class AgentManager {
 
       this.onStart?.(record);
 
+      let boundReady: (() => void) | undefined;
+      let bindingFailed: ((error: unknown) => void) | undefined;
+      const binding = record.workLaunch ? new Promise<void>((resolve, reject) => { boundReady = resolve; bindingFailed = reject; }) : undefined;
       const promise = runAgent(ctx, type, prompt, {
+        bindBeforeExtensions: !!record.workLaunch,
         pi,
         agentId: id,
         model: options.model,
@@ -647,7 +816,8 @@ export class AgentManager {
           depth: record.depth ?? 1,
           maxSubagentDepth: record.maxSubagentDepth,
         },
-        onSessionCreated: (session) => {
+        onSessionCreated: async (session) => {
+          if (record.workLaunch) await this.bindWork(record, session);
           record.session = session;
           // Capture now, while the session object exists: after eviction this
           // path is the only thing that can reopen the conversation, and an
@@ -666,7 +836,8 @@ export class AgentManager {
             }
             record.pendingSteers = undefined;
           }
-          options.onSessionCreated?.(session);
+          await options.onSessionCreated?.(session);
+          boundReady?.();
         },
       })
         .then(async ({ responseText, session, aborted, timedOut, steered, failure }) => {
@@ -726,6 +897,7 @@ export class AgentManager {
             }
           }
           completeRecord(record);
+          await this.finalizeWork(record);
           detach();
 
           this.abortOwnedChildren(id);
@@ -743,6 +915,7 @@ export class AgentManager {
           return responseText;
         })
         .catch(async (err) => {
+          bindingFailed?.(err);
           if (record.session) syncEffectiveInvocation(record, record.session);
           // Final flush of streaming output file on error
           if (record.outputCleanup) {
@@ -769,6 +942,7 @@ export class AgentManager {
           record.error = preservationFailure ? `${runError} ${preservationFailure}` : runError;
           record.failureKind = classifyRunFailure(record.error);
           completeRecord(record);
+          await this.finalizeWork(record);
 
           detach();
 
@@ -787,12 +961,13 @@ export class AgentManager {
           return "";
         });
 
-      record.promise = promise;
+      record.promise = promise.finally(() => this.pendingWorkStarts.delete(record));
 
       // Notify caller that spawn is complete (record is in the map, promise is set).
       // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
       // Used by spawnAndWait to let the caller set up output files before streaming starts.
       options.onSpawned?.(id);
+      if (binding) await binding;
     } catch (err) {
       detach();
       // Synchronous runner/callback failures after creation still own a copy.
@@ -819,6 +994,7 @@ export class AgentManager {
   private drainQueue() {
     while (this.queue.length > 0 && this.backgroundSlots.size < this.maxConcurrent) {
       const next = this.queue.shift()!;
+      this.detachQueuedWork(next.id);
       const record = this.agents.get(next.id);
       if (!record || record.status !== "queued") continue;
       try {
@@ -830,6 +1006,7 @@ export class AgentManager {
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
         completeRecord(record);
+        this.finalizeQueuedWork(record);
         this.onComplete?.(record);
       }
     }
@@ -871,7 +1048,39 @@ export class AgentManager {
     if (!record?.session) return undefined;
     // Refuse active records before synchronizing posture or resetting either run
     // mode: direct manager callers must leave the live run untouched.
-    if (record.status === "running" || record.status === "queued") return undefined;
+    if (record.status === "running" || record.status === "queued"
+      || this.workRuns.has(record) || this.pendingWorkStarts.has(record)) return undefined;
+    const requestedWork = validateWorkBinding(options?.work);
+    if (requestedWork && !record.workLaunch) throw new Error("Cannot add Work binding to an unbound session; start a fresh agent.");
+    const priorBackgroundState = record.workLaunch && options?.isBackground ? {
+      workLaunch: record.workLaunch,
+      abortController: record.abortController,
+      stopReason: record.stopReason,
+      invocation: record.invocation ? { ...record.invocation } : undefined,
+      isBackground: record.isBackground,
+      resultConsumed: record.resultConsumed,
+      result: record.result,
+      error: record.error,
+      failureKind: record.failureKind,
+      completedAt: record.completedAt,
+      status: record.status,
+    } : undefined;
+    if (record.workLaunch) {
+      if (requestedWork && JSON.stringify(requestedWork) !== JSON.stringify(record.workLaunch.work)) {
+        throw new Error("Cannot change a resumed session's Work binding.");
+      }
+      if (options?.cwd !== undefined && options.cwd !== record.workLaunch.cwd) throw new Error("Cannot change a bound session's cwd on resume.");
+      const invocationId = options?.toolCallId ?? options?.invocationId;
+      assertWorkString(invocationId, "invocationId (required for bound resume)", 512);
+      const launchKey = workLaunchKey(record.workLaunch.parentSessionId, invocationId);
+      if (this.workLaunches.has(launchKey)) throw new Error("Work invocation already launched.");
+      this.workLaunches.add(launchKey);
+      record.workLaunch = { ...record.workLaunch, invocationId, launchKey, reservation: undefined, bound: false };
+      record.abortController = new AbortController();
+      this.workRuns.set(record, Object.freeze({ token: Symbol("work-resume"), launch: record.workLaunch, controller: record.abortController }));
+      record.stopReason = undefined;
+    }
+    const workRun = this.workRuns.get(record);
     syncEffectiveInvocation(record, record.session);
 
     // Background resume: settle asynchronously and notify on completion exactly
@@ -888,11 +1097,24 @@ export class AgentManager {
       record.failureKind = undefined;
       record.completedAt = undefined;
       record.status = "queued";
+      try {
+        this.persistWork(record);
+      } catch (err) {
+        if (priorBackgroundState && workRun) {
+          // No queue entry, reservation, or child run exists yet. Undo this
+          // launch locally rather than issuing a terminal Work receipt.
+          this.workLaunches.delete(workRun.launch.launchKey);
+          this.workRuns.delete(record);
+          Object.assign(record, priorBackgroundState);
+        }
+        throw err;
+      }
 
-      const start = () => this.startResume(id, record, prompt, signal, options);
+      const start = () => this.startResume(id, record, prompt, signal, options, workRun);
       if (occupiesPoolSlot(record) && this.backgroundSlots.size >= this.maxConcurrent) {
         // At the concurrency limit — queue it, drains when a slot frees.
         this.queue.push({ id, start });
+        this.watchQueuedWork(record, signal);
       } else {
         start();
       }
@@ -908,7 +1130,17 @@ export class AgentManager {
     record.error = undefined;
     record.failureKind = undefined;
 
+    const abortBoundResume = () => this.abort(id);
+    if (record.workLaunch && signal) {
+      if (signal.aborted) abortBoundResume();
+      else signal.addEventListener("abort", abortBoundResume, { once: true });
+    }
     try {
+      if (workRun) {
+        await this.reserveWork(record, workRun);
+        await this.bindWork(record, record.session, workRun);
+        this.assertWorkRun(record, workRun);
+      }
       const { text, failure, timedOut } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
           record.lastProgressAt = Date.now();
@@ -935,9 +1167,10 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: workRun ? workRun.controller.signal : signal,
         runDeadlineMs: options?.runDeadlineMs,
       });
+      if (!this.ownsWorkRun(record, workRun)) return record;
       syncEffectiveInvocation(record, record.session);
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
@@ -958,6 +1191,7 @@ export class AgentManager {
       }
       completeRecord(record);
     } catch (err) {
+      if (!this.ownsWorkRun(record, workRun)) return record;
       // resumeAgent can reject after Pi has already changed the live session's
       // posture; persist that final truth before the record settles.
       if (record.session) syncEffectiveInvocation(record, record.session);
@@ -967,9 +1201,16 @@ export class AgentManager {
       completeRecord(record);
     }
 
+    if (workRun) {
+      signal?.removeEventListener("abort", abortBoundResume);
+      if (workRun.controller.signal.aborted) record.status = "stopped";
+      await this.finalizeWork(record, workRun);
+    }
+
     // Same contract as the spawn settle paths: children spawned during the
     // resumed turn must not outlive it — nothing else can see or reach them.
     this.abortOwnedChildren(id);
+    if (workRun && this.ownsWorkRun(record, workRun)) this.workRuns.delete(record);
 
     return record;
   }
@@ -987,8 +1228,13 @@ export class AgentManager {
     prompt: string,
     parentSignal: AbortSignal | undefined,
     options: ResumeOptions,
+    workRun = this.workRuns.get(record),
   ) {
-    if (!record.session) return;
+    if (!this.ownsWorkRun(record, workRun)) return;
+    if (!record.session) {
+      if (workRun) this.workRuns.delete(record);
+      return;
+    }
     syncEffectiveInvocation(record, record.session);
 
     record.status = "running";
@@ -1001,7 +1247,7 @@ export class AgentManager {
 
     // Fresh abort controller so /agents stop and steering target THIS run rather
     // than the previous one's settled controller.
-    const abortController = new AbortController();
+    const abortController = workRun?.controller ?? new AbortController();
     record.abortController = abortController;
     // Optional, and NOT what the Agent tool passes for a detached resume: a
     // parent signal aborts on the parent's own interrupt (user Esc), which is
@@ -1009,6 +1255,7 @@ export class AgentManager {
     // for a detached one — background spawns omit it for exactly this reason.
     let detachParentSignal: (() => void) | undefined;
     if (parentSignal) {
+      if (record.workLaunch && parentSignal.aborted) this.abort(id);
       const onParentAbort = () => this.abort(id);
       parentSignal.addEventListener("abort", onParentAbort, { once: true });
       detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
@@ -1019,6 +1266,7 @@ export class AgentManager {
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
     const settle = () => {
+      if (!this.ownsWorkRun(record, workRun)) return;
       detachParentSignal?.();
       detachParentSignal = undefined;
       // Final flush of streaming output file
@@ -1034,7 +1282,9 @@ export class AgentManager {
     };
 
     const session = record.session;
-    const promise = resumeAgent(session, prompt, {
+    const run = () => {
+      if (workRun) this.assertWorkRun(record, workRun);
+      return resumeAgent(session, prompt, {
       onToolActivity: (activity) => {
         record.lastProgressAt = Date.now();
         if (activity.type === "end") record.toolUses++;
@@ -1062,8 +1312,14 @@ export class AgentManager {
       },
       signal: abortController.signal,
       runDeadlineMs: options.runDeadlineMs,
-    })
+      });
+    };
+    const authorizedRun = workRun
+      ? this.reserveWork(record, workRun).then(() => this.bindWork(record, session, workRun)).then(run)
+      : run();
+    const promise = authorizedRun
       .then(async ({ text, failure, timedOut }) => {
+        if (!this.ownsWorkRun(record, workRun)) return "";
         syncEffectiveInvocation(record, session);
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
@@ -1087,10 +1343,12 @@ export class AgentManager {
           record.session = undefined;
         }
         completeRecord(record);
+        await this.finalizeWork(record, workRun);
         settle();
         return text;
       })
-      .catch((err) => {
+      .catch(async (err) => {
+        if (!this.ownsWorkRun(record, workRun)) return "";
         syncEffectiveInvocation(record, session);
         if (record.status !== "stopped") {
           record.status = "error";
@@ -1098,8 +1356,12 @@ export class AgentManager {
           record.failureKind = classifyRunFailure(record.error);
         }
         completeRecord(record);
+        await this.finalizeWork(record, workRun);
         settle();
         return "";
+      })
+      .finally(() => {
+        if (workRun && this.ownsWorkRun(record, workRun)) this.workRuns.delete(record);
       });
 
     record.promise = promise;
@@ -1117,7 +1379,7 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record) return false;
     if (record.status !== "running" && record.status !== "queued") return false;
-    if (record.session) {
+    if (record.session && (!record.workLaunch || record.workLaunch.bound)) {
       record.session.steer(message).catch(() => {});
     } else {
       if (!record.pendingSteers) record.pendingSteers = [];
@@ -1234,10 +1496,12 @@ export class AgentManager {
 
     // Remove from queue if queued
     if (record.status === "queued") {
+      this.detachQueuedWork(id);
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
       record.stopReason = reason;
       completeRecord(record);
+      this.finalizeQueuedWork(record);
       return true;
     }
 
@@ -1246,6 +1510,8 @@ export class AgentManager {
     record.status = "stopped";
     record.stopReason = reason;
     completeRecord(record);
+    // Startup settlement includes any late reservation/child identity in its receipt.
+    if (!this.startups.has(id) && !this.workRuns.has(record)) void this.finalizeWork(record);
     return true;
   }
 
@@ -1279,6 +1545,8 @@ export class AgentManager {
     // tests. Revisit if `rememberAgents: false` projects start losing results.
     if (!record.handle || !record.sessionFile) return;
     this.tombstones.set(record.handle, {
+      work: record.work,
+      cwd: record.workLaunch?.cwd,
       handle: record.handle,
       alias: record.alias,
       id: record.id,
@@ -1366,6 +1634,7 @@ export class AgentManager {
     let count = 0;
     // Clear queued agents first
     for (const queued of this.queue) {
+      this.detachQueuedWork(queued.id);
       const record = this.agents.get(queued.id);
       if (record) {
         record.status = "stopped";
@@ -1373,6 +1642,10 @@ export class AgentManager {
         completeRecord(record);
         count++;
       }
+    }
+    for (const queued of this.queue) {
+      const record = this.agents.get(queued.id);
+      if (record) this.finalizeQueuedWork(record);
     }
     this.queue = [];
     // Abort running agents
@@ -1382,6 +1655,7 @@ export class AgentManager {
         record.status = "stopped";
         record.stopReason = reason;
         completeRecord(record);
+        if (!this.startups.has(record.id) && !this.workRuns.has(record)) void this.finalizeWork(record);
         count++;
       }
     }
@@ -1438,6 +1712,7 @@ export class AgentManager {
     // A copy in progress must finish its stopped-startup cleanup before quit.
     await Promise.allSettled(this.startups.values());
     this.startups.clear();
+    await Promise.allSettled(this.workFinalizations.values());
     // Clear queue
     this.queue = [];
     const records = [...this.agents.values()];

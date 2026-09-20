@@ -1,3 +1,4 @@
+import { retainedWorkSnapshots, validateWorkBinding } from "./work-lifecycle.js";
 export const SUBAGENT_RECORD_VERSION = 1;
 export const SUBAGENT_NOTIFICATION_VERSION = 1;
 const AGENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}$/;
@@ -119,8 +120,27 @@ function normalizeRecord(data) {
         || typeof data.notificationPending !== "boolean"
         || (data.notificationPending && data.isBackground === false))
         return undefined;
+    let work;
+    let workLaunch;
+    try {
+        work = validateWorkBinding(data.work);
+        if (data.workLaunch !== undefined) {
+            workLaunch = retainedWorkSnapshots([{ customType: "subagents:work-record", data: {
+                        version: 1, launch: data.workLaunch, status: data.status,
+                    } }])[0]?.launch;
+            if (!workLaunch || workLaunch.agentId !== data.id || JSON.stringify(work) !== JSON.stringify(workLaunch.work))
+                return undefined;
+        }
+        if (work && !workLaunch)
+            return undefined;
+    }
+    catch {
+        return undefined;
+    }
     return {
         version: SUBAGENT_RECORD_VERSION,
+        work,
+        workLaunch,
         id: data.id,
         handles: { handle, alias },
         type: data.type,

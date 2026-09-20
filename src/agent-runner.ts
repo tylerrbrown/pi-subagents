@@ -506,7 +506,9 @@ export interface RunOptions extends AgentCapabilityAdditions {
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
-  onSessionCreated?: (session: AgentSession) => void;
+  onSessionCreated?: (session: AgentSession) => void | Promise<void>;
+  /** Bound launches authorize the child before extension session_start handlers. */
+  bindBeforeExtensions?: boolean;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /**
@@ -1033,6 +1035,16 @@ export async function runAgent(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
 
+  if (options.bindBeforeExtensions) {
+    try {
+      await options.onSessionCreated?.(session);
+      if (options.signal?.aborted) throw new Error("Agent startup cancelled before prompt.");
+    } catch (error) {
+      session.dispose();
+      throw error;
+    }
+  }
+
   // Bind extensions so that session_start fires and extensions can initialize
   // (e.g. loading credentials, setting up state). Tool gating already happened
   // at session construction via the `tools:` allowlist above — no separate
@@ -1063,7 +1075,8 @@ export async function runAgent(
     });
   }
 
-  options.onSessionCreated?.(session);
+  if (!options.bindBeforeExtensions) await options.onSessionCreated?.(session);
+  if (options.bindBeforeExtensions && options.signal?.aborted) throw new Error("Agent startup cancelled before prompt.");
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;

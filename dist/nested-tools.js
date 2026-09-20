@@ -10,6 +10,7 @@ import { createOutputFilePath, getOutputTranscriptDefault, streamToOutputFile, w
 import { RELATIVE_PATH_GUIDANCE } from "./prompts.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { addUsage } from "./usage.js";
+import { validateWorkBinding, WorkBindingSchema } from "./work-lifecycle.js";
 import { isWorktreeIsolationEnabled } from "./worktree.js";
 /**
  * Hard ceiling on nesting for every branch: main session = 0, its subagents = 1,
@@ -74,15 +75,22 @@ export function createNestedSubagentTools(context) {
             resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
             isolated: Type.Optional(Type.Boolean()),
             inherit_context: Type.Optional(Type.Boolean()),
+            cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+            work: Type.Optional(WorkBindingSchema),
             ...isolationParam(isWorktreeIsolationEnabled()),
         }),
-        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+        execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
+            const work = validateWorkBinding(params.work);
+            if (work && params.isolation === "worktree")
+                throw new Error("Work binding cannot be combined with Agent worktree isolation.");
             if (params.resume) {
                 const existing = context.manager.getRecord(params.resume);
                 if (!ownsRecord(existing, context.parentAgentId)) {
                     return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
                 }
-                const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+                const resumed = work || existing.workLaunch || params.cwd !== undefined
+                    ? await context.manager.resume(params.resume, params.prompt, signal, { work, cwd: params.cwd, toolCallId })
+                    : await context.manager.resume(params.resume, params.prompt, signal);
                 return resumed
                     ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
                     : textResult(`Failed to resume nested agent "${params.resume}".`, true);
@@ -106,6 +114,8 @@ export function createNestedSubagentTools(context) {
                 return textResult(`Nested agent type "${resolvedType}" is not allowed for this parent. Allowed: ${[...allowed].join(", ")}.`, true);
             }
             const config = getAgentConfigIn(registry, resolvedType);
+            if (work && config?.isolation === "worktree")
+                throw new Error("Work binding cannot be combined with Agent worktree isolation.");
             // Foreground regardless of `backgroundByDefault` — see the reasoning on
             // ResolveOptions. An explicit `true` here still opts in.
             const invocation = resolveAgentInvocationConfig(config, params, {
@@ -140,6 +150,8 @@ export function createNestedSubagentTools(context) {
             const rootSessionId = context.manager.getRecord(context.parentAgentId)?.rootSessionId;
             const childDepth = context.depth + 1;
             const options = {
+                ...(params.cwd !== undefined && { cwd: params.cwd }),
+                ...(work && { work, toolCallId }),
                 description: params.description,
                 model,
                 maxTurns: invocation.maxTurns,
@@ -279,7 +291,7 @@ export function createNestedSubagentTools(context) {
             }
             // Session not ready yet — queue the steer. The manager flushes pending
             // steers when the session is created (same contract as the top-level tool).
-            if (!record.session) {
+            if (!record.session || (record.workLaunch && !record.workLaunch.bound)) {
                 if (!record.pendingSteers)
                     record.pendingSteers = [];
                 record.pendingSteers.push(params.message);

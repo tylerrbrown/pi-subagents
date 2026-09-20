@@ -18,11 +18,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Cron } from "croner";
 import { nanoid } from "nanoid";
-import type { AgentManager } from "./agent-manager.js";
+import { type AgentManager, assertValidSpawnCwd } from "./agent-manager.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import { validateWorkBinding, type WorkBinding } from "./work-lifecycle.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -34,6 +35,8 @@ export type ScheduleChangeEvent =
 
 /** Params accepted at job creation — ID, timestamps, and state are derived. */
 export interface NewJobInput {
+  cwd?: string;
+  work?: WorkBinding;
   name: string;
   description: string;
   schedule: string;
@@ -93,7 +96,12 @@ export class SubagentScheduler {
    */
   buildJob(input: NewJobInput): ScheduledSubagent {
     const detected = SubagentScheduler.detectSchedule(input.schedule);
+    assertValidSpawnCwd(input.cwd);
+    const work = validateWorkBinding(input.work);
+    if (work && input.isolation === "worktree") throw new Error("Work binding cannot be combined with Agent worktree isolation.");
     return {
+      cwd: input.cwd,
+      work,
       id: nanoid(10),
       name: input.name,
       description: input.description,
@@ -138,6 +146,13 @@ export class SubagentScheduler {
   /** Toggle / mutate a job. Re-arms based on the new `enabled` state. */
   updateJob(id: string, patch: Partial<ScheduledSubagent>): ScheduledSubagent | undefined {
     const store = this.requireStore();
+    const existing = store.get(id);
+    if (existing) {
+      const candidate = { ...existing, ...patch };
+      assertValidSpawnCwd(candidate.cwd);
+      const work = validateWorkBinding(candidate.work);
+      if (work && candidate.isolation === "worktree") throw new Error("Work binding cannot be combined with Agent worktree isolation.");
+    }
     const updated = store.update(id, patch);
     if (!updated) return undefined;
     this.unscheduleJob(id);
@@ -226,7 +241,10 @@ export class SubagentScheduler {
     const job = store.get(id);
     if (!job?.enabled) return;
 
-    store.update(id, { lastStatus: "running" });
+    // Never replay a retained in-flight launch after restart. Each timer tick is
+    // a new occurrence, even when an earlier child has not settled yet.
+    const occurrence = (job.occurrenceCount ?? (job.runCount + (job.lastStatus === "running" ? 1 : 0))) + 1;
+    store.update(id, { lastStatus: "running", occurrenceCount: occurrence });
 
     // Resolve model at fire time — registry contents may have changed since the
     // job was created (auth added/removed). Fall back silently to spawn-default
@@ -249,6 +267,9 @@ export class SubagentScheduler {
       if (!dispatch.ok) throw new Error(dispatch.message);
       agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
         description: job.description,
+        cwd: job.cwd,
+        work: job.work,
+        invocationId: `schedule:${job.id}:${occurrence}`,
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,
@@ -285,14 +306,20 @@ export class SubagentScheduler {
       .then(() => manager.getRecord(agentId)?.promise)
       .then(() => {
         const r = manager.getRecord(agentId);
-        const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped";
+        const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped" || r?.status === "timeout";
         finalize(failed ? "error" : "success");
       })
       .catch(() => finalize("error"));
   }
 
   private emit(event: ScheduleChangeEvent): void {
-    if (this.pi) this.pi.events.emit("subagents:scheduled", event);
+    if (!this.pi) return;
+    if ((event.type === "added" || event.type === "updated") && event.job.work) {
+      const { prompt: _prompt, ...job } = event.job;
+      this.pi.events.emit("subagents:scheduled", { ...event, job });
+    } else {
+      this.pi.events.emit("subagents:scheduled", event);
+    }
   }
 
   private requireStore(): ScheduleStore {

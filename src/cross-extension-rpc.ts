@@ -9,7 +9,10 @@
  *   error   → { success: false, error: string }
  */
 
+import type { SpawnOptions } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+
+export type RpcSpawnOptions = Omit<SpawnOptions, "model"> & { model?: SpawnOptions["model"] | string };
 
 /** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
@@ -80,8 +83,8 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     return { version: PROTOCOL_VERSION };
   });
 
-  const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
-    events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
+  const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: RpcSpawnOptions }>(
+    events, "subagents:rpc:spawn", async ({ requestId, type, prompt, options }) => {
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
 
@@ -91,7 +94,9 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // — same pattern the scheduler path already uses — so the spawned
       // agent's auth lookup doesn't crash with "No API key found for
       // undefined".
-      let normalizedOptions = options ?? {};
+      let normalizedOptions: Partial<RpcSpawnOptions> = options?.work !== undefined
+        ? { ...options, invocationId: options.invocationId ?? requestId }
+        : options ?? {};
       if (typeof normalizedOptions.model === "string") {
         const registry = (ctx as { modelRegistry?: ModelRegistry }).modelRegistry;
         if (!registry) {

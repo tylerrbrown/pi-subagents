@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
+import type { ResumeOptions } from "./agent-manager.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -35,6 +36,7 @@ import type {
   ThinkingLevel,
 } from "./types.js";
 import { addUsage } from "./usage.js";
+import { validateWorkBinding, type WorkBinding, WorkBindingSchema } from "./work-lifecycle.js";
 import { isWorktreeIsolationEnabled } from "./worktree.js";
 
 /**
@@ -51,6 +53,9 @@ export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.m
 const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
 
 interface NestedSpawnOptions {
+  cwd?: string;
+  work?: WorkBinding;
+  toolCallId?: string;
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -62,7 +67,7 @@ interface NestedSpawnOptions {
   invocation?: AgentInvocation;
   signal?: AbortSignal;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
-  onSessionCreated?: (session: AgentSession) => void;
+  onSessionCreated?: (session: AgentSession) => void | Promise<void>;
   depth: number;
   parentAgentId: string;
   maxSubagentDepth: number;
@@ -90,7 +95,7 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: ResumeOptions): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -179,15 +184,21 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
       inherit_context: Type.Optional(Type.Boolean()),
+      cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+      work: Type.Optional(WorkBindingSchema),
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
+      const work = validateWorkBinding(params.work);
+      if (work && params.isolation === "worktree") throw new Error("Work binding cannot be combined with Agent worktree isolation.");
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        const resumed = work || existing.workLaunch || params.cwd !== undefined
+          ? await context.manager.resume(params.resume, params.prompt, signal, { work, cwd: params.cwd, toolCallId })
+          : await context.manager.resume(params.resume, params.prompt, signal);
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);
@@ -223,6 +234,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       }
 
       const config = getAgentConfigIn(registry, resolvedType);
+      if (work && config?.isolation === "worktree") throw new Error("Work binding cannot be combined with Agent worktree isolation.");
       // Foreground regardless of `backgroundByDefault` — see the reasoning on
       // ResolveOptions. An explicit `true` here still opts in.
       const invocation = resolveAgentInvocationConfig(config, params, {
@@ -257,6 +269,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const rootSessionId = context.manager.getRecord(context.parentAgentId)?.rootSessionId;
       const childDepth = context.depth + 1;
       const options: NestedSpawnOptions = {
+        ...(params.cwd !== undefined && { cwd: params.cwd }),
+        ...(work && { work, toolCallId }),
         description: params.description,
         model,
         maxTurns: invocation.maxTurns,
@@ -404,7 +418,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       }
       // Session not ready yet — queue the steer. The manager flushes pending
       // steers when the session is created (same contract as the top-level tool).
-      if (!record.session) {
+      if (!record.session || (record.workLaunch && !record.workLaunch.bound)) {
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
         return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
