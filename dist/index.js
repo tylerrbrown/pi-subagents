@@ -19,7 +19,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getDefaultRunDeadlineMs, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setDefaultRunDeadlineMs, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveEnabledType, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -1125,7 +1125,9 @@ export default function (pi) {
         // which case the mention starts one.
         const typeHandle = mention.handle;
         const type = resolveHandleToType(typeHandle, getAvailableTypes())
-            ?? (alias ? resolveHandleToType(alias, getAvailableTypes()) : undefined);
+            ?? (alias ? resolveHandleToType(alias, getAvailableTypes()) : undefined)
+            ?? resolveEnabledType(typeHandle)
+            ?? (alias ? resolveEnabledType(alias) : undefined);
         if (!type)
             return { action: "continue" };
         // Claude Code never starts the agent itself: `@agent-<type>` becomes an

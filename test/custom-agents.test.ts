@@ -96,6 +96,62 @@ You are a security auditor.`);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
   });
 
+  it("parses aliases from inline lists, block lists, and scalars", () => {
+    writeAgent("inline", `---
+aliases: [helper, worker]
+---
+Inline.`);
+    writeAgent("block", `---
+aliases:
+  - searcher
+  - planner
+---
+Block.`);
+    writeAgent("scalar", `---
+aliases: delegate
+---
+Scalar.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("inline")?.aliases).toEqual(["helper", "worker"]);
+    expect(result.get("block")?.aliases).toEqual(["searcher", "planner"]);
+    expect(result.get("scalar")?.aliases).toEqual(["delegate"]);
+  });
+
+  it("warns with both agent names when enabled agents claim the same alias", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeAgent("alpha", "---\naliases: shared\n---\nAlpha.");
+      writeAgent("beta", "---\naliases: SHARED\n---\nBeta.");
+
+      loadCustomAgents(tmpDir);
+
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain("alpha");
+      expect(message).toContain("beta");
+      expect(message).toContain("shared");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("warns when an alias collides with another agent's real name", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeAgent("builder", "---\naliases: reviewer\n---\nBuilder.");
+      writeAgent("reviewer", "---\n---\nReviewer.");
+
+      loadCustomAgents(tmpDir);
+
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain("builder");
+      expect(message).toContain("reviewer");
+      expect(message).toContain("real name");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("uses sensible defaults when frontmatter is empty", () => {
     writeAgent("minimal", `---
 ---

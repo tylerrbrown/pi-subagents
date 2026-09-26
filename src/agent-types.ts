@@ -121,17 +121,21 @@ export function getAvailableTypesIn(registry: Map<string, AgentConfig>): string[
 }
 
 /**
- * Case-insensitive resolution that refuses to guess. An exact match always wins;
- * otherwise the name must match exactly one key. Two agents differing only in
- * case are reachable (`loadCustomAgents` keys by filename across three
- * directories), and picking whichever came first would silently dispatch a
- * different agent, model and tool policy than the caller meant.
+ * Case-insensitive resolution that refuses to guess. Real names are considered
+ * before aliases, so an alias can never shadow a registry key. Alias matching
+ * considers enabled agents only and succeeds only for one distinct agent.
  */
 function resolveUnambiguousKeyIn(registry: Map<string, AgentConfig>, name: string): string | undefined {
   if (registry.has(name)) return name;
   const lower = name.toLowerCase();
-  const matches = [...registry.keys()].filter(key => key.toLowerCase() === lower);
-  return matches.length === 1 ? matches[0] : undefined;
+  const nameMatches = [...registry.keys()].filter(key => key.toLowerCase() === lower);
+  if (nameMatches.length > 0) return nameMatches.length === 1 ? nameMatches[0] : undefined;
+
+  const aliasMatches = [...registry.entries()]
+    .filter(([_, config]) =>
+      config.enabled !== false && config.aliases?.some(alias => alias.toLowerCase() === lower))
+    .map(([key]) => key);
+  return aliasMatches.length === 1 ? aliasMatches[0] : undefined;
 }
 
 /**
@@ -148,6 +152,11 @@ export function resolveEnabledTypeIn(
   if (!raw) return undefined;
   const key = resolveUnambiguousKeyIn(registry, raw);
   return key !== undefined && registry.get(key)?.enabled !== false ? key : undefined;
+}
+
+/** Resolve a name or alias to exactly one enabled agent in the process registry. */
+export function resolveEnabledType(requested: unknown): string | undefined {
+  return resolveEnabledTypeIn(agents, requested);
 }
 
 /** Outcome of resolving a caller-supplied `subagent_type` into a spawnable type. */

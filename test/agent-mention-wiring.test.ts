@@ -445,6 +445,70 @@ describe("mentioning an agent that has never run", () => {
 
   });
 
+  it("starts an agent named by a unique alias", async () => {
+    hermetic = hermeticDir({
+      settings: { outputTranscript: false, agentMentions: "direct" },
+      agentFiles: { scout: "---\naliases: Seek\n---\nScout." },
+    });
+    const b = makePi();
+    subagentsExtension(b.pi);
+    booted = b.lifecycle;
+    heldRun(fakeSession());
+
+    const result = await send(b.lifecycle, "@SEEK find it");
+
+    expect(result).toEqual({ action: "handled" });
+    expect(runAgent).toHaveBeenCalledWith(expect.anything(), "scout", "find it", expect.anything());
+  });
+
+  it("does not spawn when an alias is claimed by multiple agents", async () => {
+    hermetic = hermeticDir({
+      settings: { outputTranscript: false, agentMentions: "direct" },
+      agentFiles: {
+        scout: "---\naliases: Seek\n---\nScout.",
+        researcher: "---\naliases: seek\n---\nResearcher.",
+      },
+    });
+    const b = makePi();
+    subagentsExtension(b.pi);
+    booted = b.lifecycle;
+    heldRun(fakeSession());
+
+    expect(await send(b.lifecycle, "@seek find it")).toEqual({ action: "continue" });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not spawn through a disabled agent's alias", async () => {
+    hermetic = hermeticDir({
+      settings: { outputTranscript: false, agentMentions: "direct" },
+      agentFiles: { scout: "---\naliases: Seek\nenabled: false\n---\nScout." },
+    });
+    const b = makePi();
+    subagentsExtension(b.pi);
+    booted = b.lifecycle;
+    heldRun(fakeSession());
+
+    expect(await send(b.lifecycle, "@seek find it")).toEqual({ action: "continue" });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("prefers a real agent name over another agent's colliding alias", async () => {
+    hermetic = hermeticDir({
+      settings: { outputTranscript: false, agentMentions: "direct" },
+      agentFiles: {
+        scout: "---\n---\nScout.",
+        router: "---\naliases: scout\n---\nRouter.",
+      },
+    });
+    const b = makePi();
+    subagentsExtension(b.pi);
+    booted = b.lifecycle;
+    heldRun(fakeSession());
+
+    expect(await send(b.lifecycle, "@SCOUT find it")).toEqual({ action: "handled" });
+    expect(runAgent).toHaveBeenCalledWith(expect.anything(), "scout", "find it", expect.anything());
+  });
+
   it("leaves model, thinking and max turns to the agent's own config", async () => {
     // runAgent resolves all three from the config when the spawn omits them,
     // so passing anything here would override frontmatter the user wrote.

@@ -398,6 +398,53 @@ describe("resolveSpawnType — fail-closed dispatch (#183)", () => {
     expect(resolveSpawnType("SCOUT")).toEqual({ ok: true, type: "scout" });
   });
 
+  it("resolves a unique alias case-insensitively without listing it in the roster", () => {
+    const registry = new Map([
+      ["scout", makeAgentConfig({ name: "scout", aliases: ["Explore"] })],
+    ]);
+    setDefaultsDisabled(true);
+    registerAgents(registry);
+
+    expect(resolveEnabledTypeIn(registry, "explore")).toBe("scout");
+    expect(resolveSpawnType("EXPLORE")).toEqual({ ok: true, type: "scout" });
+    expect(getAvailableTypes()).not.toContain("Explore");
+  });
+
+  it("prefers an exact real name over another agent's alias", () => {
+    const registry = new Map([
+      ["Explore", makeAgentConfig({ name: "Explore" })],
+      ["scout", makeAgentConfig({ name: "scout", aliases: ["Explore"] })],
+    ]);
+
+    expect(resolveEnabledTypeIn(registry, "Explore")).toBe("Explore");
+  });
+
+  it("refuses a duplicate alias rather than guessing", () => {
+    const registry = new Map([
+      ["scout", makeAgentConfig({ name: "scout", aliases: ["Explore"] })],
+      ["researcher", makeAgentConfig({ name: "researcher", aliases: ["explore"] })],
+    ]);
+
+    expect(resolveEnabledTypeIn(registry, "EXPLORE")).toBeUndefined();
+  });
+
+  it("ignores an alias that collides case-insensitively with a real name", () => {
+    const registry = new Map([
+      ["Explore", makeAgentConfig({ name: "Explore" })],
+      ["scout", makeAgentConfig({ name: "scout", aliases: ["explore"] })],
+    ]);
+
+    expect(resolveEnabledTypeIn(registry, "EXPLORE")).toBe("Explore");
+  });
+
+  it("does not resolve a disabled agent's alias", () => {
+    const registry = new Map([
+      ["retired", makeAgentConfig({ name: "retired", aliases: ["Explore"], enabled: false })],
+    ]);
+
+    expect(resolveEnabledTypeIn(registry, "Explore")).toBeUndefined();
+  });
+
   it("falls back to general-purpose when unset, reporting what was asked for", () => {
     registerAgents(roster());
     expect(resolveSpawnType("typoo")).toEqual({

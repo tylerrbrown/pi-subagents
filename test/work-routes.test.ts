@@ -1,15 +1,17 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ScheduleStore } from "../src/schedule-store.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Value } from "@sinclair/typebox/value";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ScheduleStore } from "../src/schedule-store.js";
+
 vi.mock("../src/agent-runner.js", async importOriginal => ({ ...await importOriginal<any>(), runAgent: vi.fn(), resumeAgent: vi.fn() }));
 vi.mock("../src/worktree.js", async importOriginal => ({ ...await importOriginal<any>(), createWorktree: vi.fn(), cleanupWorktree: vi.fn(), pruneWorktrees: vi.fn() }));
 vi.mock("../src/custom-agents.js", async importOriginal => ({ ...await importOriginal<any>(), loadCustomAgents: () => [] }));
 vi.mock("../src/settings.js", async importOriginal => ({ ...await importOriginal<any>(), loadSettings: () => ({}), applyAndEmitLoaded: vi.fn() }));
 vi.mock("../src/output-file.js", async importOriginal => ({ ...await importOriginal<any>(), getOutputTranscriptDefault: () => false, createOutputFilePath: vi.fn(() => "mock.output"), writeInitialEntry: vi.fn(), ensureOutputFile: vi.fn(), streamToOutputFile: vi.fn(() => vi.fn()) }));
-import { runAgent, resumeAgent } from "../src/agent-runner.js";
+
 import { AgentManager } from "../src/agent-manager.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import { registerRpcHandlers } from "../src/cross-extension-rpc.js";
 import subagentsExtension from "../src/index.js";

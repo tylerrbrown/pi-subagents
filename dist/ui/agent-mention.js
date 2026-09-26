@@ -49,7 +49,7 @@ import { handleBase, MENTION_TRIGGER } from "../mention.js";
  * name addresses the existing agent, which is what makes `@explore` mean
  * "message the one that's running" and only otherwise "start one".
  */
-export function mentionRoster(manager, types,
+export function mentionRoster(manager, types, 
 // Identity by default: a caller with no registry to consult gets the raw
 // type, which is also what `getConfig` falls back to when no label is set.
 displayNameOf = type => type) {

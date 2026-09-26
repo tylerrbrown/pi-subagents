@@ -5,7 +5,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, buildAgentRegistry } from "./agent-types.js";
 import { projectReadScopes } from "./project-scope.js";
 import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
 
@@ -41,6 +41,7 @@ export function loadCustomAgents(cwd: string, strict = false): Map<string, Agent
     loadFromDir(join(scope, ".claude", "agents"), agents, "project", strict);
   }
 
+  warnAliasConflicts(buildAgentRegistry(agents));
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();
   return agents;
@@ -96,6 +97,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
 
     agents.set(name, {
       name,
+      aliases: csvListOptional(fm.aliases),
       // Only `display_name` now: `name` is the type, and `getConfig` already
       // falls back to the type when no label is set — so a Claude Code file
       // with `name: code-reviewer` still badges as "code-reviewer".
@@ -163,6 +165,41 @@ function warnSkippedOverride(name: string, agents: Map<string, AgentConfig>): vo
   // either way (see resolveEnabledTypeIn), so there is no substitution to report.
   if (!surviving?.sourcePath || surviving.enabled === false) return;
   warnIfNew(`Agent "${name}" now loads from ${surviving.sourcePath} instead`);
+}
+
+/** Report alias spellings that dispatch deliberately refuses or ignores. */
+function warnAliasConflicts(agents: Map<string, AgentConfig>): void {
+  const realNames = new Map<string, string[]>();
+  for (const name of agents.keys()) {
+    const lower = name.toLowerCase();
+    realNames.set(lower, [...(realNames.get(lower) ?? []), name]);
+  }
+
+  const claims = new Map<string, Array<{ alias: string; name: string }>>();
+  for (const [name, config] of agents) {
+    if (config.enabled === false) continue;
+    for (const alias of config.aliases ?? []) {
+      const lower = alias.toLowerCase();
+      const collidingNames = (realNames.get(lower) ?? []).filter(realName => realName !== name);
+      if (collidingNames.length > 0) {
+        warnIfNew(
+          `Alias "${alias}" on agent "${name}" is ignored because it collides with the real name `
+          + `of agent "${collidingNames.join('", "')}"; real names always win.`,
+        );
+        continue;
+      }
+      claims.set(lower, [...(claims.get(lower) ?? []), { alias, name }]);
+    }
+  }
+
+  for (const claimants of claims.values()) {
+    const names = [...new Set(claimants.map(claim => claim.name))];
+    if (names.length < 2) continue;
+    warnIfNew(
+      `Alias "${claimants[0].alias}" is claimed by enabled agents "${names.join('", "')}"; `
+      + "it will not resolve.",
+    );
+  }
 }
 
 let warnedLastLoad = new Set<string>();
