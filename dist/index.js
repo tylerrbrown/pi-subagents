@@ -345,7 +345,14 @@ export default function (pi) {
     });
     // Read directly rather than waiting for applyAndEmitLoaded below: this decides
     // the initial load, which happens hundreds of lines before settings are applied.
-    let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+    const startupSettings = loadSettings(process.cwd());
+    let strictAgentFiles = startupSettings.strictAgentFiles === true;
+    // Same reason: the initial load builds the registry (and warns about alias
+    // conflicts) before settings apply, so a default the settings disable must
+    // already be absent, or aliases naming it warn falsely at every launch.
+    if (typeof startupSettings.disableDefaultAgents === "boolean") {
+        setDefaultsDisabled(startupSettings.disableDefaultAgents);
+    }
     /** Reload shared .claude/agents definitions and merge with enabled defaults. */
     const reloadCustomAgents = (strict = false) => {
         const userAgents = loadCustomAgents(process.cwd(), strict);
