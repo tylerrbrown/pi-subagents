@@ -1,6 +1,6 @@
 import type { AgentInvocation } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
-import { retainedWorkSnapshots, validateWorkBinding, type WorkBinding, type WorkLaunch, type WorkRecovery } from "./work-lifecycle.js";
+import { retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, type WorkBinding, type WorkLaunch, type WorkRecovery } from "./work-lifecycle.js";
 
 export const SUBAGENT_RECORD_VERSION = 1 as const;
 export const SUBAGENT_NOTIFICATION_VERSION = 1 as const;
@@ -274,21 +274,23 @@ export function workRecoveryDescriptor(record: PersistedAgentRecord): WorkRecove
   const launch = record.workLaunch;
   const reservation = launch.reservation;
   if (!reservation) return undefined;
-  return {
-    mode: launch.childSessionId === undefined ? "prebind-recovery" : "bound-reactivation",
-    predecessorAssignmentId: reservation.reservationId,
-    predecessorLaunchKey: launch.launchKey,
-    proof: {
-      status: "error",
-      bound: false,
-      reservationId: reservation.reservationId,
-      ...(launch.childSessionId !== undefined && { childSessionId: launch.childSessionId }),
-      toolUses: 0,
-      usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
-      resultPresent: false,
-      substantiveOutputPresent: false,
-    },
-  };
+  try {
+    return validateWorkRecovery({
+      mode: launch.childSessionId === undefined ? "prebind-recovery" : "bound-reactivation",
+      predecessorAssignmentId: reservation.reservationId,
+      predecessorLaunchKey: launch.launchKey,
+      proof: {
+        status: "error",
+        bound: false,
+        reservationId: reservation.reservationId,
+        ...(launch.childSessionId !== undefined && { childSessionId: launch.childSessionId }),
+        toolUses: 0,
+        usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+        resultPresent: false,
+        substantiveOutputPresent: false,
+      },
+    });
+  } catch { return undefined; }
 }
 
 function normalizeTransition(data: unknown): NotificationTransition | undefined {

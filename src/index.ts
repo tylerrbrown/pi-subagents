@@ -2254,6 +2254,11 @@ Terse command-style prompts produce shallow, generic work.
           const recoveryInvocation: AgentInvocation = { ...posture, runInBackground: runInBackground };
           const recoveryOutputTranscript = getAgentConfig(predecessor.type)?.outputTranscript ?? getOutputTranscriptDefault();
           const { state: recoveryState, callbacks: recoveryCallbacks } = createActivityTracker(posture.maxTurns);
+          const recoveryReclaim = predecessor.handles.handle
+            && !manager.resolveMention(predecessor.handles.handle)
+            && (!predecessor.handles.alias || !manager.resolveMention(predecessor.handles.alias))
+            ? { handle: predecessor.handles.handle, alias: predecessor.handles.alias }
+            : undefined;
           let successorId: string;
 
           if (runInBackground) {
@@ -2273,9 +2278,7 @@ Terse command-style prompts produce shallow, generic work.
               isBackground: true,
               isolation: posture.isolation,
               invocation: recoveryInvocation,
-              reclaim: predecessor.handles.handle
-                ? { handle: predecessor.handles.handle, alias: predecessor.handles.alias }
-                : undefined,
+              reclaim: recoveryReclaim,
               rootSessionId: ctx.sessionManager.getSessionId(),
               ...recoveryCallbacks,
             });
@@ -2298,7 +2301,7 @@ Terse command-style prompts produce shallow, generic work.
             );
           }
 
-          const foreground = await manager.spawnAndWait(pi, ctx, predecessor.type, params.prompt, {
+          successorId = manager.spawn(pi, ctx, predecessor.type, params.prompt, {
             cwd: predecessor.workLaunch!.cwd,
             work: predecessor.work!,
             recovery,
@@ -2311,21 +2314,22 @@ Terse command-style prompts produce shallow, generic work.
             isolated: posture.isolated,
             inheritContext: posture.inheritContext,
             thinkingLevel: posture.thinking as ThinkingLevel | undefined,
+            isBackground: false,
             isolation: posture.isolation,
             invocation: recoveryInvocation,
             signal,
-            reclaim: predecessor.handles.handle
-              ? { handle: predecessor.handles.handle, alias: predecessor.handles.alias }
-              : undefined,
+            reclaim: recoveryReclaim,
             rootSessionId: ctx.sessionManager.getSessionId(),
             ...recoveryCallbacks,
-          }, id => {
-            recoveredWorkAssignments.set(recovery.predecessorAssignmentId, id);
-            const successor = manager.getRecord(id);
-            if (successor && recoveryOutputTranscript) attachTranscript(successor, id);
           });
-          successorId = foreground.id;
-          const recovered = foreground.record;
+          // Spawn returns the identity before asynchronous reserve/bind work.
+          // Fence the ticket synchronously so a parallel foreground retry can
+          // only observe this successor, even when startup later fails.
+          recoveredWorkAssignments.set(recovery.predecessorAssignmentId, successorId);
+          const recovered = manager.getRecord(successorId)!;
+          if (recoveryOutputTranscript) attachTranscript(recovered, successorId);
+          await manager.awaitStartup(successorId);
+          await recovered.promise;
           if (!appendCompletedRecord(recovered, false, true)) throw new Error(`Could not persist recovered agent "${successorId}".`);
           recovered.resultConsumed = true;
           if (recovered.status === "error") {

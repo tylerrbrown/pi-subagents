@@ -1,4 +1,4 @@
-import { retainedWorkSnapshots, validateWorkBinding } from "./work-lifecycle.js";
+import { retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery } from "./work-lifecycle.js";
 export const SUBAGENT_RECORD_VERSION = 1;
 export const SUBAGENT_NOTIFICATION_VERSION = 1;
 const AGENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}$/;
@@ -225,21 +225,26 @@ export function workRecoveryDescriptor(record) {
     const reservation = launch.reservation;
     if (!reservation)
         return undefined;
-    return {
-        mode: launch.childSessionId === undefined ? "prebind-recovery" : "bound-reactivation",
-        predecessorAssignmentId: reservation.reservationId,
-        predecessorLaunchKey: launch.launchKey,
-        proof: {
-            status: "error",
-            bound: false,
-            reservationId: reservation.reservationId,
-            ...(launch.childSessionId !== undefined && { childSessionId: launch.childSessionId }),
-            toolUses: 0,
-            usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
-            resultPresent: false,
-            substantiveOutputPresent: false,
-        },
-    };
+    try {
+        return validateWorkRecovery({
+            mode: launch.childSessionId === undefined ? "prebind-recovery" : "bound-reactivation",
+            predecessorAssignmentId: reservation.reservationId,
+            predecessorLaunchKey: launch.launchKey,
+            proof: {
+                status: "error",
+                bound: false,
+                reservationId: reservation.reservationId,
+                ...(launch.childSessionId !== undefined && { childSessionId: launch.childSessionId }),
+                toolUses: 0,
+                usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+                resultPresent: false,
+                substantiveOutputPresent: false,
+            },
+        });
+    }
+    catch {
+        return undefined;
+    }
 }
 function normalizeTransition(data) {
     if (!isObject(data) || data.version !== SUBAGENT_NOTIFICATION_VERSION)

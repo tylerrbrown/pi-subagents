@@ -162,6 +162,28 @@ describe("Work assignment recovery through Agent resume", () => {
     done.resolve({ session: { dispose: vi.fn() }, responseText: "recovered", aborted: false, steered: false });
   });
 
+  it("fences parallel foreground recovery before asynchronous reserve", async () => {
+    const record = persistedRecord();
+    const harness = await boot(record); harnesses.push(harness);
+    const done = deferred<any>();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options!.onSessionCreated?.({
+        sessionManager: { getSessionId: () => "fresh-child-session" },
+        dispose: vi.fn(), steer: vi.fn(async () => {}),
+      } as any);
+      return done.promise;
+    });
+    const foreground = { ...resumeParams, run_in_background: false };
+    const first = harness.tools.get("Agent").execute("foreground-1", foreground, undefined, undefined, harness.ctx);
+    await vi.waitFor(() => expect(harness.adapter.requests.reserve).toHaveLength(1));
+    const second = await harness.tools.get("Agent").execute("foreground-2", foreground, undefined, undefined, harness.ctx);
+    expect(textOf(second)).toContain("Work recovery already started");
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(harness.adapter.requests.reserve).toHaveLength(1);
+    done.resolve({ session: { dispose: vi.fn() }, responseText: "recovered", aborted: false, steered: false });
+    expect(textOf(await first)).toContain("recovered");
+  });
+
   it("accepts an exact retained handle but not a partial handle", async () => {
     const record = persistedRecord();
     const harness = await boot(record); harnesses.push(harness);
@@ -185,6 +207,9 @@ describe("Work assignment recovery through Agent resume", () => {
     ["substantive output", { conversation: "a prior turn" }],
     ["old child session", { output: { sessionFile: "/sessions/old.jsonl" } }],
     ["missing reservation", { workLaunch: { ...predecessorLaunch(), reservation: undefined } }],
+    ["malformed reservation identity", { workLaunch: {
+      ...predecessorLaunch(), reservation: { reservationId: "reservation-04" },
+    } }],
     ["indeterminate bound", { workLaunch: { ...predecessorLaunch(), bound: undefined } }],
     ["indeterminate version", { version: 0 }],
   ])("refuses %s persisted records without starting a child", async (_label, overrides) => {
@@ -195,6 +220,30 @@ describe("Work assignment recovery through Agent resume", () => {
     expect(textOf(result)).toContain("Agent not found");
     expect(runAgent).not.toHaveBeenCalled();
     expect(harness.adapter.requests.reserve).toHaveLength(0);
+  });
+
+  it("does not reclaim a predecessor handle already held by a live agent", async () => {
+    const record = persistedRecord();
+    const harness = await boot(record); harnesses.push(harness);
+    let call = 0;
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      call++;
+      await options!.onSessionCreated?.({
+        sessionManager: { getSessionId: () => `child-${call}` },
+        dispose: vi.fn(), steer: vi.fn(async () => {}),
+      } as any);
+      if (call === 1) return new Promise(() => {});
+      return { session: { dispose: vi.fn() }, responseText: "done", aborted: false, steered: false } as any;
+    });
+    const live = await harness.tools.get("Agent").execute("live", {
+      prompt: "hold", description: "live holder", subagent_type: "general-purpose", run_in_background: true,
+    }, undefined, undefined, harness.ctx);
+    const liveId = /Agent ID: (\S+)/.exec(textOf(live))![1];
+    const recovered = await harness.tools.get("Agent").execute("recover", resumeParams, undefined, undefined, harness.ctx);
+    const successorId = /Agent ID: (\S+)/.exec(textOf(recovered))![1];
+    const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    expect(manager.getRecord(liveId).handle).toBe("general-purpose");
+    expect(manager.getRecord(successorId).handle).not.toBe("general-purpose");
   });
 
   it("keeps ordinary persisted no-session records on the Agent-not-found path", async () => {
