@@ -931,9 +931,10 @@ export default function (pi: ExtensionAPI) {
     const byId = persistedRecords.get(ref);
     if (byId) return byId;
     const normalized = ref.replace(/^@/, "").toLowerCase();
-    return [...persistedRecords.values()].find(record =>
+    const matches = [...persistedRecords.values()].filter(record =>
       record.handles.handle?.toLowerCase() === normalized || record.handles.alias?.toLowerCase() === normalized,
     );
+    return matches.length === 1 ? matches[0] : undefined;
   };
 
   const registryEntry = {

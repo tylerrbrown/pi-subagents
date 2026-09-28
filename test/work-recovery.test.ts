@@ -246,6 +246,34 @@ describe("Work assignment recovery through Agent resume", () => {
     expect(manager.getRecord(successorId).handle).not.toBe("general-purpose");
   });
 
+  it("refuses an ambiguous persisted handle while exact Agent ID remains recoverable", async () => {
+    const record = persistedRecord();
+    const otherId = "abcdef01-2345-678";
+    const otherAssignment = "fedcba98-7654-4321-8123-fedcba987654";
+    const other = persistedRecord(undefined, {
+      id: otherId,
+      workLaunch: {
+        ...predecessorLaunch(), agentId: otherId,
+        reservation: { reservationId: otherAssignment },
+      },
+    });
+    const harness = await boot(record, [other]); harnesses.push(harness);
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options!.onSessionCreated?.({ sessionManager: { getSessionId: () => "fresh-child" }, dispose: vi.fn() } as any);
+      return { session: { dispose: vi.fn() }, responseText: "done", aborted: false, steered: false } as any;
+    });
+    const ambiguous = await harness.tools.get("Agent").execute(
+      "ambiguous", { ...resumeParams, resume: "@original-assignment" }, undefined, undefined, harness.ctx,
+    );
+    expect(textOf(ambiguous)).toContain("Agent not found");
+    expect(runAgent).not.toHaveBeenCalled();
+    const exact = await harness.tools.get("Agent").execute(
+      "exact", { ...resumeParams, resume: predecessorId }, undefined, undefined, harness.ctx,
+    );
+    expect(textOf(exact)).toContain("Agent ID:");
+    expect(runAgent).toHaveBeenCalledOnce();
+  });
+
   it("keeps ordinary persisted no-session records on the Agent-not-found path", async () => {
     const record = persistedRecord(undefined, { work: undefined, workLaunch: undefined });
     const harness = await boot(record); harnesses.push(harness);
