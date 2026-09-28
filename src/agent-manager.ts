@@ -20,7 +20,7 @@ import { describeModel, describeRequestedModel, resolveModel } from "./model-res
 import { classifyRunFailure } from "./status-note.js";
 import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, StopReason, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
-import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkReservation, type WorkBinding, type WorkSnapshot, workLaunchKey } from "./work-lifecycle.js";
+import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, type WorkBinding, type WorkRecovery, type WorkSnapshot, workLaunchKey } from "./work-lifecycle.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeCleanupResult, } from "./worktree.js";
 
 type WorkRun = Readonly<{
@@ -115,6 +115,8 @@ interface SpawnArgs {
 
 export interface SpawnOptions extends AgentCapabilityAdditions {
   work?: WorkBinding;
+  /** Internal, ledger-derived authority for a fresh Work successor. */
+  recovery?: WorkRecovery;
   /** Original caller identity; RPC uses requestId, Agent uses toolCallId. */
   invocationId?: string;
   toolCallId?: string;
@@ -478,6 +480,8 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
     const work = validateWorkBinding(options.work);
+    const recovery = options.recovery === undefined ? undefined : validateWorkRecovery(options.recovery);
+    if (recovery && !work) throw new Error("Work recovery requires a Work binding.");
     if (work && (options.isolation === "worktree" || getAgentConfig(type)?.isolation === "worktree")) {
       throw new Error("Work binding cannot be combined with Agent worktree isolation.");
     }
@@ -487,7 +491,7 @@ export class AgentManager {
       if (options.name !== undefined) assertWorkString(options.name, "agentName", 64);
     }
     // Snapshot caller-owned data before queued/asynchronous startup.
-    options = { ...options, work };
+    options = { ...options, work, recovery };
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
@@ -589,7 +593,7 @@ export class AgentManager {
       record.workLaunch = {
         launchKey: workLaunchKey(parentSessionId, invocationId), parentSessionId, invocationId,
         agentId: id, agentType: type, agentName: options.name, description: options.description,
-        cwd: options.cwd ?? ctx.cwd, work,
+        cwd: options.cwd ?? ctx.cwd, work, bound: false, recovery,
       };
       if (this.workLaunches.has(record.workLaunch.launchKey)) {
         throw new Error("Work invocation already launched; reconcile or retrieve its existing record.");

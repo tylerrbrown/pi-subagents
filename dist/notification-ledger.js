@@ -42,6 +42,40 @@ function normalizeHandle(value) {
         return false;
     return value;
 }
+function normalizeInvocation(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isObject(value))
+        return false;
+    if (Object.keys(value).some(key => !["modelName", "modelId", "thinking", "requestedModel", "requestedModelId", "requestedThinking", "maxTurns", "isolated", "inheritContext", "runInBackground", "isolation"].includes(key)))
+        return false;
+    const thinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    if (!optionalBoundedString(value.modelName, 512)
+        || !optionalBoundedString(value.modelId, 512)
+        || !optionalBoundedString(value.requestedModel, 512)
+        || !optionalBoundedString(value.requestedModelId, 512)
+        || (value.thinking !== undefined && !thinking.has(value.thinking))
+        || (value.requestedThinking !== undefined && !thinking.has(value.requestedThinking))
+        || (value.maxTurns !== undefined && !count(value.maxTurns))
+        || (value.isolated !== undefined && typeof value.isolated !== "boolean")
+        || (value.inheritContext !== undefined && typeof value.inheritContext !== "boolean")
+        || (value.runInBackground !== undefined && typeof value.runInBackground !== "boolean")
+        || (value.isolation !== undefined && value.isolation !== "worktree" && value.isolation !== "off"))
+        return false;
+    return {
+        ...(value.modelName !== undefined && { modelName: value.modelName }),
+        ...(value.modelId !== undefined && { modelId: value.modelId }),
+        ...(value.thinking !== undefined && { thinking: value.thinking }),
+        ...(value.requestedModel !== undefined && { requestedModel: value.requestedModel }),
+        ...(value.requestedModelId !== undefined && { requestedModelId: value.requestedModelId }),
+        ...(value.requestedThinking !== undefined && { requestedThinking: value.requestedThinking }),
+        ...(value.maxTurns !== undefined && { maxTurns: value.maxTurns }),
+        ...(value.isolated !== undefined && { isolated: value.isolated }),
+        ...(value.inheritContext !== undefined && { inheritContext: value.inheritContext }),
+        ...(value.runInBackground !== undefined && { runInBackground: value.runInBackground }),
+        ...(value.isolation !== undefined && { isolation: value.isolation }),
+    };
+}
 function normalizeUsage(value, required) {
     if (!isObject(value))
         return required ? undefined : { input: 0, output: 0, cacheWrite: 0 };
@@ -108,7 +142,8 @@ function normalizeRecord(data) {
     const handle = normalizeHandle(data.handles.handle);
     const alias = normalizeHandle(data.handles.alias);
     const usage = normalizeUsage(data.lifetimeUsage, true);
-    if (handle === false || alias === false || !usage
+    const invocation = normalizeInvocation(data.invocation);
+    if (handle === false || alias === false || invocation === false || !usage
         || !count(data.toolUses)
         || !count(data.compactionCount)
         || (data.contextPercent !== null && !finiteNonnegative(data.contextPercent, 100))
@@ -155,6 +190,7 @@ function normalizeRecord(data) {
         compactionCount: data.compactionCount,
         contextPercent: data.contextPercent,
         toolCallId: data.toolCallId,
+        invocation,
         isBackground: data.isBackground,
         output: { file: data.output.file, sessionFile: data.output.sessionFile },
         conversation: data.conversation,
@@ -163,6 +199,47 @@ function normalizeRecord(data) {
 }
 export function isPersistedAgentSnapshot(data) {
     return normalizeRecord(data)?.version === SUBAGENT_RECORD_VERSION;
+}
+/**
+ * Return recovery authority only for a fully-known, zero-turn Work failure.
+ * Every counter and boolean in the result is reconstructed from the normalized
+ * retained record; no Agent-tool argument participates in this decision.
+ */
+export function workRecoveryDescriptor(record) {
+    if (record.version !== SUBAGENT_RECORD_VERSION || record.status !== "error"
+        || !record.work || !record.workLaunch || !record.workLaunch.reservation
+        || record.workLaunch.bound !== false || !record.invocation
+        || typeof record.isBackground !== "boolean"
+        || record.toolUses !== 0 || record.compactionCount !== 0
+        || record.result !== undefined || record.conversation !== undefined
+        // An output path can exist before child allocation: Agent writes the
+        // caller's initial prompt there synchronously. A child session file cannot.
+        || record.output.sessionFile !== undefined
+        || record.contextPercent !== null)
+        return undefined;
+    const usage = record.lifetimeUsage;
+    if (usage.input !== 0 || usage.output !== 0 || usage.cacheWrite !== 0
+        || (usage.cacheRead ?? 0) !== 0 || (usage.cost ?? 0) !== 0)
+        return undefined;
+    const launch = record.workLaunch;
+    const reservation = launch.reservation;
+    if (!reservation)
+        return undefined;
+    return {
+        mode: launch.childSessionId === undefined ? "prebind-recovery" : "bound-reactivation",
+        predecessorAssignmentId: reservation.reservationId,
+        predecessorLaunchKey: launch.launchKey,
+        proof: {
+            status: "error",
+            bound: false,
+            reservationId: reservation.reservationId,
+            ...(launch.childSessionId !== undefined && { childSessionId: launch.childSessionId }),
+            toolUses: 0,
+            usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+            resultPresent: false,
+            substantiveOutputPresent: false,
+        },
+    };
 }
 function normalizeTransition(data) {
     if (!isObject(data) || data.version !== SUBAGENT_NOTIFICATION_VERSION)

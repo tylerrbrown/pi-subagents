@@ -30,7 +30,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, describeRequestedModel, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { foldNotificationLedger, isPersistedAgentSnapshot, MAX_CAPTURE_CHARS, SUBAGENT_NOTIFICATION_VERSION, SUBAGENT_RECORD_VERSION } from "./notification-ledger.js";
+import { foldNotificationLedger, isPersistedAgentSnapshot, MAX_CAPTURE_CHARS, SUBAGENT_NOTIFICATION_VERSION, SUBAGENT_RECORD_VERSION, workRecoveryDescriptor } from "./notification-ledger.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { RELATIVE_PATH_GUIDANCE } from "./prompts.js";
 import { SubagentScheduler } from "./schedule.js";
@@ -44,7 +44,7 @@ import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, PendingUsagePool, toReportedUsage } from "./usage.js";
 import { beginBlockingWait, endBlockingWait, getWaitCeilingMs, noteWaitOutcome, PARALLEL_JOIN_REFUSAL, resetBlockingWaits, setWaitCeilingMs, shouldRefuseRepeatJoin, waitWithCeiling } from "./wait-ceiling.js";
-import { validateWorkBinding, WorkBindingSchema } from "./work-lifecycle.js";
+import { retainedWorkSnapshots, validateWorkBinding, WorkBindingSchema } from "./work-lifecycle.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 // ---- Shared helpers ----
 /** Tool execute return value for a text response. */
@@ -401,6 +401,8 @@ export default function (pi) {
     let notificationTimer;
     let notificationFlushActive = false;
     let persistedRecords = new Map();
+    /** One durable predecessor can allocate at most one fresh successor per activation. */
+    const recoveredWorkAssignments = new Map();
     let pendingNotificationIds = new Set();
     let claimedNotificationIds = new Set();
     let consumedNotificationIds = new Set();
@@ -460,6 +462,7 @@ export default function (pi) {
             toolCallId: record.toolCallId,
             work: record.work,
             workLaunch: record.workLaunch && structuredClone(record.workLaunch),
+            invocation: record.invocation && { ...record.invocation },
             isBackground: record.isBackground,
             output: { file: record.outputFile, sessionFile: record.sessionFile },
             conversation,
@@ -829,6 +832,9 @@ export default function (pi) {
         // Bypasses handle allocation, so a forged value would duplicate a live
         // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
         delete safeOptions.reclaim;
+        // Work recovery authority is minted only from this session's normalized
+        // durable ledger. RPC/registry callers cannot forge predecessor proof.
+        delete safeOptions.recovery;
         return spawnResolved(piRef, ctxRef, type, prompt, safeOptions);
     };
     /**
@@ -924,8 +930,16 @@ export default function (pi) {
     pi.on("session_start", async (_event, ctx) => {
         invalidateNotificationTimer();
         currentCtx = ctx;
-        await manager.reconcileWork(pi, ctx.sessionManager.getBranch());
-        const ledger = foldNotificationLedger(ctx.sessionManager.getBranch());
+        const branch = ctx.sessionManager.getBranch();
+        await manager.reconcileWork(pi, branch);
+        recoveredWorkAssignments.clear();
+        for (const snapshot of retainedWorkSnapshots(branch)) {
+            const predecessor = snapshot.launch.recovery?.predecessorAssignmentId;
+            if (predecessor && !recoveredWorkAssignments.has(predecessor)) {
+                recoveredWorkAssignments.set(predecessor, snapshot.launch.agentId);
+            }
+        }
+        const ledger = foldNotificationLedger(branch);
         persistedRecords = ledger.records;
         pendingNotificationIds = ledger.pending;
         claimedNotificationIds = ledger.claimed;
@@ -1223,6 +1237,7 @@ export default function (pi) {
             invalidateNotificationTimer();
             currentCtx = undefined;
             persistedRecords.clear();
+            recoveredWorkAssignments.clear();
             pendingNotificationIds.clear();
             claimedNotificationIds.clear();
             consumedNotificationIds.clear();
@@ -2044,7 +2059,121 @@ Terse command-style prompts produce shallow, generic work.
                 }
                 const existing = manager.getRecord(params.resume);
                 if (!existing || existing.parentAgentId) {
-                    return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+                    const predecessor = resolvePersistedAgentRef(params.resume);
+                    const recovery = predecessor && workRecoveryDescriptor(predecessor);
+                    if (!predecessor || !recovery) {
+                        return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+                    }
+                    // Recovery is keyed by the authoritative predecessor id, not the
+                    // caller's spelling (id, handle, or @handle). Set immediately after
+                    // spawn returns, before the first await, so concurrent exact resumes
+                    // can only observe and reuse one successor.
+                    const priorSuccessor = recoveredWorkAssignments.get(recovery.predecessorAssignmentId);
+                    if (priorSuccessor) {
+                        const successor = manager.getRecord(priorSuccessor) ?? persistedRecords.get(priorSuccessor);
+                        return textResult(`Work recovery already started.\nAgent ID: ${priorSuccessor}\n` +
+                            `Type: ${predecessor.type}\nStatus: ${successor?.status ?? "recorded"}`);
+                    }
+                    // Caller-supplied identity and counters never authorize recovery.
+                    // Optional work/cwd inputs may only restate the durable predecessor.
+                    if ((work && JSON.stringify(work) !== JSON.stringify(predecessor.work))
+                        || (params.cwd !== undefined && params.cwd !== predecessor.workLaunch.cwd)) {
+                        return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+                    }
+                    const recoveryDispatch = resolveSpawnType(predecessor.type);
+                    if (!recoveryDispatch.ok || recoveryDispatch.fellBackFrom !== undefined) {
+                        return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+                    }
+                    const posture = predecessor.invocation;
+                    const modelRef = posture.modelId ?? posture.requestedModelId ?? posture.requestedModel;
+                    let recoveryModel;
+                    if (modelRef) {
+                        const resolved = resolveModel(modelRef, ctx.modelRegistry);
+                        if (typeof resolved === "string")
+                            return textResult(`Cannot recover agent "${params.resume}": ${resolved}`);
+                        recoveryModel = resolved;
+                    }
+                    const recoveryInvocation = { ...posture, runInBackground: runInBackground };
+                    const recoveryOutputTranscript = getAgentConfig(predecessor.type)?.outputTranscript ?? getOutputTranscriptDefault();
+                    const { state: recoveryState, callbacks: recoveryCallbacks } = createActivityTracker(posture.maxTurns);
+                    let successorId;
+                    if (runInBackground) {
+                        successorId = manager.spawn(pi, ctx, predecessor.type, params.prompt, {
+                            cwd: predecessor.workLaunch.cwd,
+                            work: predecessor.work,
+                            recovery,
+                            toolCallId,
+                            description: predecessor.description,
+                            model: recoveryModel,
+                            requestedModel: posture.requestedModel,
+                            maxTurns: posture.maxTurns,
+                            runDeadlineMs: params.deadline_ms,
+                            isolated: posture.isolated,
+                            inheritContext: posture.inheritContext,
+                            thinkingLevel: posture.thinking,
+                            isBackground: true,
+                            isolation: posture.isolation,
+                            invocation: recoveryInvocation,
+                            reclaim: predecessor.handles.handle
+                                ? { handle: predecessor.handles.handle, alias: predecessor.handles.alias }
+                                : undefined,
+                            rootSessionId: ctx.sessionManager.getSessionId(),
+                            ...recoveryCallbacks,
+                        });
+                        recoveredWorkAssignments.set(recovery.predecessorAssignmentId, successorId);
+                        const successor = manager.getRecord(successorId);
+                        if (successor && recoveryOutputTranscript)
+                            attachTranscript(successor, successorId);
+                        await manager.awaitStartup(successorId);
+                        agentActivity.set(successorId, recoveryState);
+                        widget.ensureTimer();
+                        widget.update();
+                        fleet.ensureTimer();
+                        fleet.update();
+                        pi.events.emit("subagents:created", {
+                            id: successorId, type: predecessor.type, description: predecessor.description, isBackground: true,
+                        });
+                        return textResult(`Work recovery started in background.\nAgent ID: ${successorId}\nType: ${predecessor.type}\n` +
+                            `Description: ${predecessor.description}\n\nYou will be notified when this agent completes.`, { ...detailBaseFor(successor), toolUses: 0, tokens: "", durationMs: 0, status: "background", agentId: successorId });
+                    }
+                    const foreground = await manager.spawnAndWait(pi, ctx, predecessor.type, params.prompt, {
+                        cwd: predecessor.workLaunch.cwd,
+                        work: predecessor.work,
+                        recovery,
+                        toolCallId,
+                        description: predecessor.description,
+                        model: recoveryModel,
+                        requestedModel: posture.requestedModel,
+                        maxTurns: posture.maxTurns,
+                        runDeadlineMs: params.deadline_ms,
+                        isolated: posture.isolated,
+                        inheritContext: posture.inheritContext,
+                        thinkingLevel: posture.thinking,
+                        isolation: posture.isolation,
+                        invocation: recoveryInvocation,
+                        signal,
+                        reclaim: predecessor.handles.handle
+                            ? { handle: predecessor.handles.handle, alias: predecessor.handles.alias }
+                            : undefined,
+                        rootSessionId: ctx.sessionManager.getSessionId(),
+                        ...recoveryCallbacks,
+                    }, id => {
+                        recoveredWorkAssignments.set(recovery.predecessorAssignmentId, id);
+                        const successor = manager.getRecord(id);
+                        if (successor && recoveryOutputTranscript)
+                            attachTranscript(successor, id);
+                    });
+                    successorId = foreground.id;
+                    const recovered = foreground.record;
+                    if (!appendCompletedRecord(recovered, false, true))
+                        throw new Error(`Could not persist recovered agent "${successorId}".`);
+                    recovered.resultConsumed = true;
+                    if (recovered.status === "error") {
+                        return textResult(`Agent failed: ${recovered.error}${getFailureNote(recovered.failureKind)}${partialOutputSuffix(recovered)}`);
+                    }
+                    if (recovered.status === "timeout")
+                        return textResult(`Agent timed out (wall-clock deadline).${partialOutputSuffix(recovered)}`);
+                    return textResult(recovered.result?.trim() || "No output.");
                 }
                 // A detached resume hands control back while the record stays
                 // "running", so nothing stops the model from resuming the same agent

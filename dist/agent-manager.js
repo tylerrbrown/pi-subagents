@@ -16,7 +16,7 @@ import { assignHandle, handleBase, isReservedHandle } from "./mention.js";
 import { describeModel, describeRequestedModel, resolveModel } from "./model-resolver.js";
 import { classifyRunFailure } from "./status-note.js";
 import { addUsage } from "./usage.js";
-import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkReservation, workLaunchKey } from "./work-lifecycle.js";
+import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, workLaunchKey } from "./work-lifecycle.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
 /**
  * Default max concurrent background agents.
@@ -303,6 +303,9 @@ export class AgentManager {
         // can fix and retry; the RPC layer converts throws into error envelopes.
         assertValidSpawnCwd(options.cwd);
         const work = validateWorkBinding(options.work);
+        const recovery = options.recovery === undefined ? undefined : validateWorkRecovery(options.recovery);
+        if (recovery && !work)
+            throw new Error("Work recovery requires a Work binding.");
         if (work && (options.isolation === "worktree" || getAgentConfig(type)?.isolation === "worktree")) {
             throw new Error("Work binding cannot be combined with Agent worktree isolation.");
         }
@@ -313,7 +316,7 @@ export class AgentManager {
                 assertWorkString(options.name, "agentName", 64);
         }
         // Snapshot caller-owned data before queued/asynchronous startup.
-        options = { ...options, work };
+        options = { ...options, work, recovery };
         const id = randomUUID().slice(0, 17);
         const abortController = new AbortController();
         const taken = this.takenHandles();
@@ -415,7 +418,7 @@ export class AgentManager {
             record.workLaunch = {
                 launchKey: workLaunchKey(parentSessionId, invocationId), parentSessionId, invocationId,
                 agentId: id, agentType: type, agentName: options.name, description: options.description,
-                cwd: options.cwd ?? ctx.cwd, work,
+                cwd: options.cwd ?? ctx.cwd, work, bound: false, recovery,
             };
             if (this.workLaunches.has(record.workLaunch.launchKey)) {
                 throw new Error("Work invocation already launched; reconcile or retrieve its existing record.");

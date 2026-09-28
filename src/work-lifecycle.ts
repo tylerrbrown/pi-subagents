@@ -22,6 +22,28 @@ export const WorkBindingSchema = Type.Object({
 
 export interface WorkReservation { reservationId: string }
 
+/**
+ * Authoritative zero-turn evidence for replacing a failed Work assignment.
+ * The descriptor is created only from the retained predecessor record; Agent
+ * callers cannot supply it. Repo adapters use the mode to distinguish a bind
+ * that may already have committed from a failure before any child existed.
+ */
+export interface WorkRecovery {
+  mode: "bound-reactivation" | "prebind-recovery";
+  predecessorAssignmentId: string;
+  predecessorLaunchKey: string;
+  proof: {
+    status: "error";
+    bound: false;
+    reservationId: string;
+    childSessionId?: string;
+    toolUses: 0;
+    usage: { input: 0; output: 0; cacheWrite: 0; cacheRead: 0; cost: 0 };
+    resultPresent: false;
+    substantiveOutputPresent: false;
+  };
+}
+
 export interface WorkLaunch {
   launchKey: string;
   parentSessionId: string;
@@ -35,6 +57,7 @@ export interface WorkLaunch {
   reservation?: WorkReservation;
   childSessionId?: string;
   bound?: boolean;
+  recovery?: WorkRecovery;
 }
 
 export interface WorkSnapshot {
@@ -115,6 +138,46 @@ export function validateWorkReservation(value: unknown): WorkReservation {
   return { reservationId };
 }
 
+export function validateWorkRecovery(value: unknown): WorkRecovery {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Work recovery descriptor.");
+  const raw = value as Record<string, unknown>;
+  if (Object.keys(raw).some(key => !["mode", "predecessorAssignmentId", "predecessorLaunchKey", "proof"].includes(key))
+    || (raw.mode !== "bound-reactivation" && raw.mode !== "prebind-recovery")) {
+    throw new Error("Invalid Work recovery descriptor.");
+  }
+  assertWorkString(raw.predecessorAssignmentId, "predecessorAssignmentId", 128);
+  assertWorkString(raw.predecessorLaunchKey, "predecessorLaunchKey", 64);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(raw.predecessorAssignmentId)
+    || !/^[0-9a-f]{64}$/.test(raw.predecessorLaunchKey)) throw new Error("Invalid Work recovery predecessor identity.");
+  if (!raw.proof || typeof raw.proof !== "object" || Array.isArray(raw.proof)) throw new Error("Invalid Work recovery proof.");
+  const proof = raw.proof as Record<string, unknown>;
+  if (Object.keys(proof).some(key => !["status", "bound", "reservationId", "childSessionId", "toolUses", "usage", "resultPresent", "substantiveOutputPresent"].includes(key))
+    || proof.status !== "error" || proof.bound !== false || proof.toolUses !== 0
+    || proof.resultPresent !== false || proof.substantiveOutputPresent !== false) {
+    throw new Error("Invalid Work recovery proof.");
+  }
+  const reservation = validateWorkReservation({ reservationId: proof.reservationId });
+  if (proof.childSessionId !== undefined) assertWorkString(proof.childSessionId, "recovery.childSessionId", 512);
+  if ((raw.mode === "bound-reactivation") !== (proof.childSessionId !== undefined)) throw new Error("Work recovery mode does not match its proof.");
+  if (!proof.usage || typeof proof.usage !== "object" || Array.isArray(proof.usage)) throw new Error("Invalid Work recovery usage proof.");
+  const usage = proof.usage as Record<string, unknown>;
+  if (Object.keys(usage).some(key => !["input", "output", "cacheWrite", "cacheRead", "cost"].includes(key))
+    || usage.input !== 0 || usage.output !== 0 || usage.cacheWrite !== 0 || usage.cacheRead !== 0 || usage.cost !== 0) {
+    throw new Error("Invalid Work recovery usage proof.");
+  }
+  return {
+    mode: raw.mode,
+    predecessorAssignmentId: raw.predecessorAssignmentId,
+    predecessorLaunchKey: raw.predecessorLaunchKey,
+    proof: {
+      status: "error", bound: false, reservationId: reservation.reservationId,
+      ...(proof.childSessionId !== undefined && { childSessionId: proof.childSessionId as string }),
+      toolUses: 0, usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+      resultPresent: false, substantiveOutputPresent: false,
+    },
+  };
+}
+
 /** Corrupt retained receipts are ignored; they can never authorize a launch. */
 export function retainedWorkSnapshots(branch: readonly unknown[]): WorkSnapshot[] {
   const retained = new Map<string, WorkSnapshot>();
@@ -132,6 +195,8 @@ export function retainedWorkSnapshots(branch: readonly unknown[]): WorkSnapshot[
       if (launch.agentName !== undefined) assertWorkString(launch.agentName, "agentName", 64);
       if (launch.childSessionId !== undefined) assertWorkString(launch.childSessionId, "childSessionId", 512);
       if (launch.reservation !== undefined) validateWorkReservation(launch.reservation);
+      if (launch.bound !== undefined && typeof launch.bound !== "boolean") continue;
+      if (launch.recovery !== undefined) validateWorkRecovery(launch.recovery);
       if (!["queued", "running", "completed", "steered", "aborted", "stopped", "timeout", "error"].includes(snapshot.status)) continue;
       // Reconstruct the wire allowlist rather than forwarding persisted arbitrary fields.
       retained.set(launch.launchKey, {
@@ -141,7 +206,8 @@ export function retainedWorkSnapshots(branch: readonly unknown[]): WorkSnapshot[
           agentId: launch.agentId, agentType: launch.agentType, agentName: launch.agentName,
           description: launch.description, cwd: launch.cwd, work: validateWorkBinding(launch.work)!,
           reservation: launch.reservation && validateWorkReservation(launch.reservation),
-          childSessionId: launch.childSessionId, bound: launch.bound === true,
+          childSessionId: launch.childSessionId, bound: launch.bound,
+          recovery: launch.recovery && validateWorkRecovery(launch.recovery),
         },
         status: snapshot.status,
       });

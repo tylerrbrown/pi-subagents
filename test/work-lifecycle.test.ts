@@ -50,6 +50,17 @@ describe("Work wire protocol", () => {
     expect(snapshots).toHaveLength(1);
     expect(snapshots[0].status).toBe("completed");
   });
+  it("rejects malformed retained recovery descriptors", () => {
+    const recovery = {
+      mode: "prebind-recovery", predecessorAssignmentId: "not-an-agent", predecessorLaunchKey: launch.launchKey,
+      proof: { status: "error", bound: false, reservationId: "r", toolUses: 0,
+        usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+        resultPresent: false, substantiveOutputPresent: false },
+    };
+    expect(retainedWorkSnapshots([{ customType: "subagents:work-record", data: {
+      version: 1, launch: { ...launch, recovery }, status: "running",
+    } }])).toEqual([]);
+  });
   it("reconcile receipts retain identities, not private prompt/result fields", () => {
     const [snapshot] = retainedWorkSnapshots([{ customType: "subagents:work-record", data: {
       version: 1, launch: { ...launch, prompt: "SYNTHETIC_PRIVATE_PROMPT" }, status: "completed",
