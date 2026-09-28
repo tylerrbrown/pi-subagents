@@ -17,7 +17,8 @@ import { registerRpcHandlers } from "../src/cross-extension-rpc.js";
 import subagentsExtension from "../src/index.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
 import { SubagentScheduler } from "../src/schedule.js";
-import { makePi } from "./helpers/boot-extension.js";
+import * as lifecycle from "../src/work-lifecycle.js";
+import { makePi, textOf } from "./helpers/boot-extension.js";
 import { childSession, deferred, work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
 let adapter: ReturnType<typeof workAdapter>;
@@ -297,5 +298,273 @@ describe("Work binding through consumer routes", () => {
     expect(adapter.requests.finalize).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(5000);
     expect(runAgent).toHaveBeenCalledOnce();
+  });
+});
+
+const recoveryAgentId = "01234567-89ab-cde";
+const recoveryLaunchKey = lifecycle.workLaunchKey("parent-session", "original-call");
+const recoveryProof = {
+  schemaVersion: 2 as const,
+  reservationId: "assignment-04",
+  launchKey: recoveryLaunchKey,
+  childSessionId: "original-child",
+  bound: true,
+  promptDelivered: false,
+  modelTurnCount: 0,
+  toolUseCount: 0,
+  resultProduced: false,
+  terminalStatus: "error" as const,
+  startupEffectsAbsent: true,
+};
+const recoveryDescriptor = {
+  predecessorAssignmentId: recoveryProof.reservationId,
+  predecessorLaunchKey: recoveryLaunchKey,
+  recoveryAuthorizationId: "authorization-04",
+  expectedTerminalSnapshotDigest: lifecycle.workTerminalProofDigest(recoveryProof),
+};
+const predecessorLaunch = {
+  launchKey: recoveryLaunchKey,
+  parentSessionId: "parent-session",
+  invocationId: "original-call",
+  agentId: recoveryAgentId,
+  agentType: "general-purpose",
+  description: "recover me",
+  cwd: process.cwd(),
+  work,
+  reservation: { reservationId: recoveryProof.reservationId },
+  childSessionId: recoveryProof.childSessionId,
+  bound: true,
+};
+
+function recoveryBranch(proof: unknown = recoveryProof) {
+  return [
+    { customType: "subagents:work-record", data: { version: 2, launch: predecessorLaunch, proof } },
+    { customType: "subagents:record", data: {
+      version: 1,
+      id: recoveryAgentId,
+      handles: { handle: "general-purpose", alias: "recover-me" },
+      type: "general-purpose",
+      description: "recover me",
+      status: "error",
+      error: "provider unavailable",
+      toolUses: 0,
+      startedAt: 1,
+      completedAt: 2,
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+      compactionCount: 0,
+      contextPercent: null,
+      toolCallId: "original-call",
+      work,
+      workLaunch: predecessorLaunch,
+      invocation: { modelId: "pi-sub-anthropic/claude-haiku-4-5", thinking: "low", runInBackground: true },
+      isBackground: true,
+      output: {},
+      notificationPending: false,
+    } },
+  ];
+}
+
+async function bootRecovery(branch: unknown[], reply: { success: boolean; data?: unknown; error?: unknown }) {
+  const isolatedAdapter = workAdapter();
+  isolatedAdapter.held.add("reconcile");
+  isolatedAdapter.events.on("subagents:work:reconcile", request => {
+    isolatedAdapter.events.emit(`subagents:work:reconcile:reply:${request.requestId}`, reply);
+  });
+  const host = makePi();
+  Object.assign(host.pi, isolatedAdapter.pi);
+  subagentsExtension(host.pi);
+  const ctx = workContext();
+  ctx.modelRegistry.find = vi.fn((provider: string, id: string) => ({ provider, id, name: id }));
+  ctx.modelRegistry.getAvailable = () => [{
+    provider: "pi-sub-anthropic",
+    id: "claude-haiku-4-5",
+    name: "claude-haiku-4-5",
+  }];
+  ctx.sessionManager.getBranch = () => branch;
+  await host.lifecycle.get("session_start")?.({}, ctx);
+  return { host, ctx, adapter: isolatedAdapter };
+}
+
+async function closeRecovery(host: ReturnType<typeof makePi>, ctx: any) {
+  await host.lifecycle.get("session_shutdown")?.({}, ctx);
+  delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for("pi-subagents:manager")];
+}
+
+describe("Work recovery replay route", () => {
+  const durableAck = {
+    status: "already_applied",
+    terminalSnapshotDigest: recoveryDescriptor.expectedTerminalSnapshotDigest,
+  };
+
+  it.each([
+    ["already_applied in data", { success: false, data: durableAck }],
+    ["already_applied in error", { success: false, error: durableAck }],
+    ["recovery in data", { success: false, data: recoveryDescriptor }],
+    ["recovery in error", { success: false, error: recoveryDescriptor }],
+  ])("never checkpoints or projects recovery from success:false with %s", async (_label, reply) => {
+    const attempt = await bootRecovery(recoveryBranch(), reply);
+    try {
+      expect(attempt.adapter.requests.reconcile).toHaveLength(1);
+      expect(attempt.adapter.entries).toHaveLength(0);
+      expect(attempt.adapter.requests.reserve).toHaveLength(0);
+      expect(attempt.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await closeRecovery(attempt.host, attempt.ctx);
+    }
+  });
+
+  it("checkpoints exact success:true recovery data and projects it after restart", async () => {
+    const first = await bootRecovery(recoveryBranch(), { success: true, data: recoveryDescriptor });
+    try {
+      expect(first.adapter.entries).toEqual([{
+        customType: "subagents:work-reconcile-ack",
+        data: {
+          version: 1,
+          protocolVersion: 2,
+          launchKey: recoveryLaunchKey,
+          snapshotDigest: recoveryDescriptor.expectedTerminalSnapshotDigest,
+          recovery: recoveryDescriptor,
+        },
+      }]);
+    } finally {
+      await closeRecovery(first.host, first.ctx);
+    }
+
+    const restarted = await bootRecovery([...recoveryBranch(), ...first.adapter.entries], {
+      success: true,
+      data: durableAck,
+    });
+    try {
+      const result = await restarted.host.tools.get("Agent").execute("authorized-successor", {
+        subagent_type: "general-purpose",
+        description: "continue",
+        prompt: "retry",
+        resume: recoveryAgentId,
+        run_in_background: true,
+      }, undefined, undefined, restarted.ctx);
+      expect(textOf(result)).toContain("Work recovery started in background");
+      expect(restarted.adapter.requests.reserve).toHaveLength(1);
+      expect(restarted.adapter.requests.reserve[0].recovery).toEqual(recoveryDescriptor);
+      expect(runAgent).toHaveBeenCalledOnce();
+    } finally {
+      await closeRecovery(restarted.host, restarted.ctx);
+    }
+  });
+
+  it("checkpoints only a matching Work success and skips replay after restart", async () => {
+    const first = await bootRecovery(recoveryBranch(), { success: true, data: durableAck });
+    try {
+      expect(first.adapter.requests.reconcile).toHaveLength(1);
+      expect(first.adapter.requests.reconcile[0]).toMatchObject({
+        proof: recoveryProof,
+        terminalSnapshotDigest: recoveryDescriptor.expectedTerminalSnapshotDigest,
+      });
+      expect(first.adapter.entries).toEqual([{
+        customType: "subagents:work-reconcile-ack",
+        data: expect.objectContaining({
+          protocolVersion: 2,
+          launchKey: recoveryLaunchKey,
+          snapshotDigest: recoveryDescriptor.expectedTerminalSnapshotDigest,
+        }),
+      }]);
+      expect(first.adapter.requests.reserve).toHaveLength(0);
+      expect(first.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await closeRecovery(first.host, first.ctx);
+    }
+
+    const retained = [...recoveryBranch(), ...first.adapter.entries];
+    const second = await bootRecovery(retained, { success: true, data: durableAck });
+    try {
+      expect(second.adapter.requests.reconcile).toHaveLength(0);
+      expect(second.adapter.entries).toHaveLength(0);
+      expect(second.adapter.requests.reserve).toHaveLength(0);
+      expect(second.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+      const result = await second.host.tools.get("Agent").execute("no-authority", {
+        subagent_type: "general-purpose", description: "continue", prompt: "retry",
+        resume: recoveryAgentId, run_in_background: true,
+      }, undefined, undefined, second.ctx);
+      expect(textOf(result)).toContain("Agent not found");
+    } finally {
+      await closeRecovery(second.host, second.ctx);
+    }
+  });
+
+  it("replays after a lost ACK checkpoint without reserve, bind, or child creation", async () => {
+    const firstAdapter = workAdapter();
+    firstAdapter.held.add("reconcile");
+    firstAdapter.events.on("subagents:work:reconcile", request => {
+      firstAdapter.events.emit(`subagents:work:reconcile:reply:${request.requestId}`, {
+        success: true, data: durableAck,
+      });
+    });
+    firstAdapter.pi.appendEntry = vi.fn(() => { throw new Error("synthetic lost ACK"); });
+    const firstManager = new AgentManager();
+    await expect(firstManager.reconcileWork(firstAdapter.pi, recoveryBranch())).rejects.toThrow("lost ACK");
+    await firstManager.dispose();
+
+    const retry = await bootRecovery(recoveryBranch(), { success: true, data: durableAck });
+    try {
+      expect(firstAdapter.requests.reconcile).toHaveLength(1);
+      expect(retry.adapter.requests.reconcile).toHaveLength(1);
+      expect(retry.adapter.entries).toHaveLength(1);
+      expect(retry.adapter.requests.reserve).toHaveLength(0);
+      expect(retry.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await closeRecovery(retry.host, retry.ctx);
+    }
+  });
+
+  it("quarantines changed proof once across two restarts and ignores corrupt proof", async () => {
+    const changed = { ...recoveryProof, modelTurnCount: 1 };
+    const changedDigest = lifecycle.workTerminalProofDigest(changed);
+    const refusal = {
+      success: false,
+      error: { status: "refused", code: "terminal_snapshot_conflict", action: "quarantine", retryable: false },
+    };
+    const first = await bootRecovery(recoveryBranch(changed), refusal);
+    try {
+      expect(first.adapter.requests.reconcile).toHaveLength(1);
+      expect(first.adapter.requests.reconcile[0].terminalSnapshotDigest).toBe(changedDigest);
+      expect(first.adapter.entries).toHaveLength(1);
+      expect(first.adapter.entries[0]).toMatchObject({
+        customType: "subagents:work-reconcile-diagnostic",
+        data: { launchKey: recoveryLaunchKey, snapshotDigest: changedDigest, code: "terminal_snapshot_conflict" },
+      });
+      expect(first.adapter.requests.reserve).toHaveLength(0);
+      expect(first.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await closeRecovery(first.host, first.ctx);
+    }
+
+    const retained = [...recoveryBranch(changed), ...first.adapter.entries];
+    const second = await bootRecovery(retained, refusal);
+    try {
+      expect(second.adapter.requests.reconcile).toHaveLength(0);
+      expect(second.adapter.entries).toHaveLength(0);
+      expect(second.adapter.requests.reserve).toHaveLength(0);
+      expect(second.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await closeRecovery(second.host, second.ctx);
+    }
+
+    const corrupt = await bootRecovery(recoveryBranch({ ...recoveryProof, modelTurnCount: "0" }), {
+      success: true, data: durableAck,
+    });
+    try {
+      expect(corrupt.adapter.requests.reconcile).toHaveLength(0);
+      expect(corrupt.adapter.entries).toHaveLength(0);
+      expect(corrupt.adapter.requests.reserve).toHaveLength(0);
+      expect(corrupt.adapter.requests.bind).toHaveLength(0);
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await closeRecovery(corrupt.host, corrupt.ctx);
+    }
   });
 });

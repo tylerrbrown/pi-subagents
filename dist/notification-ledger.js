@@ -1,6 +1,10 @@
-import { retainedWorkSnapshots, validateWorkBinding } from "./work-lifecycle.js";
+import { retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery } from "./work-lifecycle.js";
 export const SUBAGENT_RECORD_VERSION = 1;
 export const SUBAGENT_NOTIFICATION_VERSION = 1;
+export const WORK_RECONCILE_CHECKPOINT_VERSION = 1;
+function workReconcileKey(protocolVersion, launchKey, snapshotDigest) {
+    return `${protocolVersion}:${launchKey}:${snapshotDigest}`;
+}
 const AGENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}$/;
 const HANDLE = /^[a-z0-9][a-z0-9_-]*$/;
 const MAX_RECORDS = 10_000;
@@ -200,13 +204,65 @@ function normalizeRecord(data) {
 export function isPersistedAgentSnapshot(data) {
     return normalizeRecord(data)?.version === SUBAGENT_RECORD_VERSION;
 }
+/** Fold append-only terminal replay checkpoints. Invalid entries never suppress replay. */
+export function foldWorkReconcileLedger(branch) {
+    const state = {
+        acknowledged: new Set(), quarantined: new Map(), diagnostics: new Set(),
+    };
+    for (const rawEntry of branch) {
+        if (!isObject(rawEntry))
+            continue;
+        const entry = rawEntry;
+        if (!isObject(entry.data) || entry.data.version !== WORK_RECONCILE_CHECKPOINT_VERSION
+            || entry.data.protocolVersion !== 2
+            || !boundedString(entry.data.launchKey, 512, false)
+            || !boundedString(entry.data.snapshotDigest, 64, false)
+            || !/^[0-9a-f]{64}$/.test(entry.data.snapshotDigest))
+            continue;
+        const key = workReconcileKey(2, entry.data.launchKey, entry.data.snapshotDigest);
+        if (entry.customType === "subagents:work-reconcile-ack") {
+            if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "recovery"].includes(field)))
+                continue;
+            if (entry.data.recovery !== undefined) {
+                try {
+                    const recovery = validateWorkRecovery(entry.data.recovery);
+                    if (recovery.predecessorLaunchKey !== entry.data.launchKey
+                        || recovery.expectedTerminalSnapshotDigest !== entry.data.snapshotDigest)
+                        continue;
+                }
+                catch {
+                    continue;
+                }
+            }
+            state.acknowledged.add(key);
+        }
+        else if (entry.customType === "subagents:work-reconcile-diagnostic") {
+            if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "failureDigest", "code", "action"].includes(field))
+                || !boundedString(entry.data.failureDigest, 64, false) || !/^[0-9a-f]{64}$/.test(entry.data.failureDigest)
+                || !boundedString(entry.data.code, 128, false) || !boundedString(entry.data.action, 128, false))
+                continue;
+            state.quarantined.set(key, entry.data.failureDigest);
+            state.diagnostics.add(entry.data.failureDigest);
+        }
+    }
+    return state;
+}
+export function workReconcileCheckpointKey(protocolVersion, launchKey, snapshotDigest) {
+    return workReconcileKey(protocolVersion, launchKey, snapshotDigest);
+}
 /**
  * A retained v1 record cannot mint successor authority. S04 will persist and
  * return the exact Work-issued v2 descriptor after authorization; until then,
  * missing proof fails closed rather than inferring zero work from usage.
  */
-export function workRecoveryDescriptor(_record) {
-    return undefined;
+export function workRecoveryDescriptor(record) {
+    const launch = record.workLaunch;
+    const recovery = launch?.recovery;
+    if (!launch || !recovery
+        || recovery.predecessorAssignmentId !== launch.reservation?.reservationId
+        || recovery.predecessorLaunchKey !== launch.launchKey)
+        return undefined;
+    return recovery;
 }
 function normalizeTransition(data) {
     if (!isObject(data) || data.version !== SUBAGENT_NOTIFICATION_VERSION)
@@ -281,6 +337,31 @@ export function foldNotificationLedger(branch) {
                 state.claimed.add(id);
             else
                 state.consumed.add(id);
+        }
+    }
+    // Project only Work-issued, digest-bound successor authority into memory;
+    // historical session records stay append-only and unchanged.
+    const recoveries = new Map();
+    for (const rawEntry of branch) {
+        if (!isObject(rawEntry))
+            continue;
+        const entry = rawEntry;
+        if (entry.customType !== "subagents:work-reconcile-ack" || !isObject(entry.data)
+            || entry.data.version !== WORK_RECONCILE_CHECKPOINT_VERSION || entry.data.protocolVersion !== 2
+            || !boundedString(entry.data.launchKey, 512, false) || !boundedString(entry.data.snapshotDigest, 64, false))
+            continue;
+        try {
+            const recovery = validateWorkRecovery(entry.data.recovery);
+            if (recovery.predecessorLaunchKey === entry.data.launchKey
+                && recovery.expectedTerminalSnapshotDigest === entry.data.snapshotDigest)
+                recoveries.set(entry.data.launchKey, recovery);
+        }
+        catch { /* ACKs without successor authority are normal. */ }
+    }
+    for (const [id, record] of state.records) {
+        const recovery = record.workLaunch && recoveries.get(record.workLaunch.launchKey);
+        if (recovery && recovery.predecessorAssignmentId === record.workLaunch?.reservation?.reservationId) {
+            state.records.set(id, { ...record, workLaunch: { ...record.workLaunch, recovery } });
         }
     }
     return state;

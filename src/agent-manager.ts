@@ -7,7 +7,7 @@
  * nested children — see `occupiesPoolSlot`.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
@@ -17,10 +17,11 @@ import { getAgentConfig } from "./agent-types.js";
 import { syncEffectiveInvocation } from "./invocation-truth.js";
 import { assignHandle, handleBase, isReservedHandle } from "./mention.js";
 import { describeModel, describeRequestedModel, resolveModel } from "./model-resolver.js";
+import { foldWorkReconcileLedger, WORK_RECONCILE_CHECKPOINT_VERSION, workReconcileCheckpointKey } from "./notification-ledger.js";
 import { classifyRunFailure } from "./status-note.js";
 import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, StopReason, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
-import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, type WorkBinding, type WorkRecovery, type WorkSnapshot, type WorkTerminalProof, workLaunchKey } from "./work-lifecycle.js";
+import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, type WorkBinding, type WorkRecovery, type WorkSnapshot, type WorkSnapshotV2, type WorkTerminalProof, workLaunchKey, workTerminalProofDigest } from "./work-lifecycle.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeCleanupResult, } from "./worktree.js";
 
 type WorkRun = Readonly<{
@@ -425,6 +426,68 @@ export class AgentManager {
     if (record.workLaunch) this.pi!.appendEntry("subagents:work-record", this.workSnapshot(record));
   }
 
+  private terminalEnvelope(snapshot: WorkSnapshot): WorkSnapshot | (WorkSnapshotV2 & { terminalSnapshotDigest: string }) {
+    if (snapshot.version !== 2) return snapshot;
+    return { ...snapshot, terminalSnapshotDigest: workTerminalProofDigest(snapshot.proof) };
+  }
+
+  private appendWorkAck(envelope: WorkSnapshotV2 & { terminalSnapshotDigest: string }, recovery?: WorkRecovery): void {
+    this.pi!.appendEntry("subagents:work-reconcile-ack", {
+      version: WORK_RECONCILE_CHECKPOINT_VERSION,
+      protocolVersion: 2,
+      launchKey: envelope.launch.launchKey,
+      snapshotDigest: envelope.terminalSnapshotDigest,
+      ...(recovery && { recovery }),
+    });
+  }
+
+  /** Terminal transport preserves allowlisted typed refusals; the legacy helper intentionally does not. */
+  private requestWorkTerminal(action: "finalize" | "reconcile", payload: WorkSnapshot | (WorkSnapshotV2 & { terminalSnapshotDigest: string })): Promise<{ success: true; data: unknown } | { success: false; error: unknown }> {
+    const events = this.pi!.events;
+    const requestId = randomUUID();
+    const channel = `subagents:work:${action}`;
+    return new Promise((resolve, reject) => {
+      let unsubscribe = () => {};
+      const timer = setTimeout(() => { unsubscribe(); reject(new Error(`Work ${action} adapter did not reply.`)); }, 5000);
+      const finish = (error?: Error, value?: { success: true; data: unknown } | { success: false; error: unknown }) => {
+        clearTimeout(timer);
+        unsubscribe();
+        if (error) reject(error); else resolve(value!);
+      };
+      try {
+        unsubscribe = events.on(`${channel}:reply:${requestId}`, raw => {
+          const response = raw as { success?: unknown; data?: unknown; error?: unknown } | null;
+          if (response?.success === true) finish(undefined, { success: true, data: response.data });
+          else finish(undefined, { success: false, error: response?.error });
+        });
+        events.emit(channel, { ...JSON.parse(JSON.stringify(payload)), requestId });
+      } catch { finish(new Error(`Work ${action} adapter unavailable.`)); }
+    });
+  }
+
+  private durableWorkAck(reply: unknown, envelope: WorkSnapshotV2 & { terminalSnapshotDigest: string }): { recovery?: WorkRecovery } | undefined {
+    if (!reply || typeof reply !== "object" || Array.isArray(reply)) return undefined;
+    const value = reply as Record<string, unknown>;
+    if (value.status === "already_applied" && value.terminalSnapshotDigest === envelope.terminalSnapshotDigest) return {};
+    try {
+      const recovery = validateWorkRecovery(reply);
+      if (recovery.expectedTerminalSnapshotDigest !== envelope.terminalSnapshotDigest
+        || recovery.predecessorLaunchKey !== envelope.launch.launchKey
+        || recovery.predecessorAssignmentId !== envelope.proof.reservationId) return undefined;
+      return { recovery };
+    } catch { return undefined; }
+  }
+
+  private typedWorkRefusal(reply: unknown): { code: string; action: string; retryable: boolean } | undefined {
+    if (!reply || typeof reply !== "object" || Array.isArray(reply)) return undefined;
+    const value = reply as Record<string, unknown>;
+    if (value.status !== undefined && value.status !== "pending" && value.status !== "quarantined" && value.status !== "refused") return undefined;
+    if (typeof value.code !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(value.code)
+      || typeof value.action !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(value.action)
+      || typeof value.retryable !== "boolean") return undefined;
+    return { code: value.code, action: value.action, retryable: value.retryable };
+  }
+
   private finalizeWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<void> {
     if (!this.ownsWorkRun(record, run)) return Promise.resolve();
     const launch = run?.launch ?? record.workLaunch;
@@ -434,10 +497,62 @@ export class AgentManager {
     try { this.persistWork(record); } catch { /* adapter still receives the receipt */ }
     const previous = this.workFinalizations.get(launch.launchKey);
     if (previous) return previous;
-    const snapshot = this.workSnapshot(record);
-    const receipt = requestWork(this.pi.events, "finalize", snapshot).then(() => {}, () => {});
+    const envelope = this.terminalEnvelope(this.workSnapshot(record));
+    const receipt = this.requestWorkTerminal("finalize", envelope).then(response => {
+      if (response.success && envelope.version === 2 && "terminalSnapshotDigest" in envelope) {
+        const ack = this.durableWorkAck(response.data, envelope);
+        if (ack) this.appendWorkAck(envelope, ack.recovery);
+      }
+    }, () => {});
     this.workFinalizations.set(launch.launchKey, receipt);
     return receipt;
+  }
+
+  private async reconcileSnapshot(snapshot: WorkSnapshot, ledger: ReturnType<typeof foldWorkReconcileLedger>): Promise<void> {
+    const envelope = this.terminalEnvelope(snapshot);
+    if (envelope.version !== 2 || !("terminalSnapshotDigest" in envelope)) {
+      // V1 remains visible to old adapters for migration diagnostics only. It can
+      // never create a durable ACK or recovery authority.
+      try { await this.requestWorkTerminal("reconcile", envelope); } catch { /* diagnostic-only */ }
+      return;
+    }
+    const key = workReconcileCheckpointKey(2, envelope.launch.launchKey, envelope.terminalSnapshotDigest);
+    if (ledger.acknowledged.has(key) || ledger.quarantined.has(key)) return;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let response: { success: true; data: unknown } | { success: false; error: unknown };
+      try { response = await this.requestWorkTerminal("reconcile", envelope); }
+      catch { return; } // Timeout is unknown; retry only after a fresh exact read/restart.
+      const ack = response.success ? this.durableWorkAck(response.data, envelope) : undefined;
+      if (ack) {
+        this.appendWorkAck(envelope, ack.recovery);
+        ledger.acknowledged.add(key);
+        return;
+      }
+      const refusal = this.typedWorkRefusal(response.success ? response.data : response.error);
+      if (!refusal) return;
+      if (refusal.retryable) {
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 25 * (2 ** attempt)));
+        continue;
+      }
+      const failureDigest = createHash("sha256").update(JSON.stringify([
+        2, envelope.launch.launchKey, envelope.terminalSnapshotDigest, refusal.code, refusal.action,
+      ])).digest("hex");
+      if (!ledger.diagnostics.has(failureDigest)) {
+        this.pi!.appendEntry("subagents:work-reconcile-diagnostic", {
+          version: WORK_RECONCILE_CHECKPOINT_VERSION,
+          protocolVersion: 2,
+          launchKey: envelope.launch.launchKey,
+          snapshotDigest: envelope.terminalSnapshotDigest,
+          failureDigest,
+          code: refusal.code,
+          action: refusal.action,
+        });
+        ledger.diagnostics.add(failureDigest);
+      }
+      ledger.quarantined.set(key, failureDigest);
+      return;
+    }
   }
 
   async reconcileWork(pi: ExtensionAPI, branch: readonly unknown[]): Promise<void> {
@@ -447,7 +562,17 @@ export class AgentManager {
     for (const record of this.agents.values()) {
       if (record.workLaunch) retained.set(record.workLaunch.launchKey, this.workSnapshot(record));
     }
-    await Promise.allSettled([...retained.values()].map(snapshot => requestWork(pi.events, "reconcile", snapshot)));
+    const ledger = foldWorkReconcileLedger(branch);
+    const pending = [...retained.values()];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < pending.length) {
+        const snapshot = pending[cursor++];
+        await this.reconcileSnapshot(snapshot, ledger);
+      }
+    };
+    const workers = Array.from({ length: Math.min(DEFAULT_MAX_CONCURRENT, pending.length) }, worker);
+    for (const task of workers) await task;
   }
 
   private async reserveWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<void> {

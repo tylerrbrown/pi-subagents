@@ -5,6 +5,8 @@ vi.mock("../src/worktree.js", () => ({ createWorktree: vi.fn(), cleanupWorktree:
 
 import { AgentManager } from "../src/agent-manager.js";
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
+import { workRecoveryDescriptor } from "../src/notification-ledger.js";
+import { workTerminalProofDigest } from "../src/work-lifecycle.js";
 import { childSession, deferred, withSyntheticEnvironment, work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
 let manager: AgentManager;
@@ -122,17 +124,113 @@ describe("Work manager launch boundary", () => {
     expect(adapter.requests.finalize).toHaveLength(1);
     expect(adapter.requests.finalize[0].launch.agentId).toBe(id);
   });
-  it("restart reconcile deduplicates retained receipts without spawning or finalizing again", async () => {
+  it("sends canonical v2 digest and checkpoints only an explicit durable Work ACK", async () => {
+    adapter.held.add("finalize");
+    adapter.events.on("subagents:work:finalize", request => adapter.events.emit(
+      `subagents:work:finalize:reply:${request.requestId}`,
+      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.terminalSnapshotDigest } },
+    ));
+    const id = spawn(); await settle(id);
+    const request = adapter.requests.finalize[0];
+    expect(request.version).toBe(2);
+    expect(request.terminalSnapshotDigest).toBe(workTerminalProofDigest(request.proof));
+    expect(adapter.entries).toContainEqual({ customType: "subagents:work-reconcile-ack", data: {
+      version: 1, protocolVersion: 2, launchKey: request.launch.launchKey,
+      snapshotDigest: request.terminalSnapshotDigest,
+    } });
+  });
+
+  it.each(["already_applied", "recovery"])("never checkpoints a success=false %s body", async shape => {
+    adapter.held.add("finalize");
+    adapter.events.on("subagents:work:finalize", request => adapter.events.emit(
+      `subagents:work:finalize:reply:${request.requestId}`,
+      { success: false, error: shape === "already_applied"
+        ? { status: "already_applied", terminalSnapshotDigest: request.terminalSnapshotDigest }
+        : {
+            predecessorAssignmentId: request.proof.reservationId,
+            predecessorLaunchKey: request.launch.launchKey,
+            recoveryAuthorizationId: "must-not-persist",
+            expectedTerminalSnapshotDigest: request.terminalSnapshotDigest,
+          } },
+    ));
+    const id = spawn(); await settle(id);
+    expect(adapter.entries.some(entry => entry.customType === "subagents:work-reconcile-ack")).toBe(false);
+  });
+
+  it("does not re-arm predecessor recovery authority from a successor record", () => {
+    const predecessorLaunchKey = "a".repeat(64);
+    const recovery = {
+      predecessorAssignmentId: "assignment-04",
+      predecessorLaunchKey,
+      recoveryAuthorizationId: "authorization-04",
+      expectedTerminalSnapshotDigest: "b".repeat(64),
+    };
+    const predecessor = {
+      id: "11111111-1111-111",
+      workLaunch: {
+        launchKey: predecessorLaunchKey,
+        reservation: { reservationId: "assignment-04" },
+        recovery,
+      },
+    } as any;
+    const successor = {
+      id: "22222222-2222-222",
+      workLaunch: {
+        launchKey: "c".repeat(64),
+        reservation: { reservationId: "assignment-04" },
+        recovery,
+      },
+    } as any;
+    expect(workRecoveryDescriptor(predecessor)).toEqual(recovery);
+    expect(workRecoveryDescriptor(successor)).toBeUndefined();
+  });
+
+  it("restart reconcile skips an exact durable ACK without spawning or replaying terminal", async () => {
+    adapter.held.add("finalize");
+    adapter.events.on("subagents:work:finalize", request => adapter.events.emit(
+      `subagents:work:finalize:reply:${request.requestId}`,
+      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.terminalSnapshotDigest } },
+    ));
     const id = spawn(); await settle(id); await manager.dispose();
     manager = new AgentManager();
     const before = adapter.requests.finalize.length;
     await manager.reconcileWork(adapter.pi, adapter.entries);
     await manager.reconcileWork(adapter.pi, adapter.entries);
-    expect(adapter.requests.reconcile).toHaveLength(2);
-    expect(adapter.requests.reconcile[0].launch.launchKey).toBe(adapter.requests.reconcile[1].launch.launchKey);
+    expect(adapter.requests.reconcile).toHaveLength(0);
     expect(() => spawn()).toThrow(/already launched/);
     expect(runAgent).toHaveBeenCalledOnce();
     expect(adapter.requests.finalize).toHaveLength(before);
+  });
+
+  it("keeps retryable reconciliation pending with bounded retries", async () => {
+    const id = spawn(); await settle(id); await manager.dispose();
+    manager = new AgentManager();
+    adapter.held.add("reconcile");
+    adapter.events.on("subagents:work:reconcile", request => adapter.events.emit(
+      `subagents:work:reconcile:reply:${request.requestId}`,
+      { success: true, data: { status: "pending", code: "child_bind_indeterminate", retryable: true, action: "retry_exact_read" } },
+    ));
+    await manager.reconcileWork(adapter.pi, adapter.entries);
+    expect(adapter.requests.reconcile).toHaveLength(3);
+    expect(adapter.entries.some(entry => entry.customType === "subagents:work-reconcile-ack")).toBe(false);
+  });
+
+  it("quarantines permanent reconciliation refusal and deduplicates its stable diagnostic", async () => {
+    const id = spawn(); await settle(id); await manager.dispose();
+    manager = new AgentManager();
+    adapter.held.add("reconcile");
+    adapter.events.on("subagents:work:reconcile", request => adapter.events.emit(
+      `subagents:work:reconcile:reply:${request.requestId}`,
+      { success: true, data: { status: "quarantined", code: "terminal_proof_insufficient", retryable: false, action: "inspect" } },
+    ));
+    await manager.reconcileWork(adapter.pi, adapter.entries);
+    const afterFirst = adapter.requests.reconcile.length;
+    const diagnostics = adapter.entries.filter(entry => entry.customType === "subagents:work-reconcile-diagnostic");
+    expect(afterFirst).toBe(1);
+    expect(diagnostics).toHaveLength(1);
+    await manager.reconcileWork(adapter.pi, adapter.entries);
+    expect(adapter.requests.reconcile).toHaveLength(afterFirst);
+    expect(adapter.entries.filter(entry => entry.customType === "subagents:work-reconcile-diagnostic")).toHaveLength(1);
   });
   it("persists binding identities without prompt or private result", async () => {
     const id = spawn(); await settle(id);
