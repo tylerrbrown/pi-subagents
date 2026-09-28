@@ -1,6 +1,6 @@
 import type { AgentInvocation } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
-import { retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, type WorkBinding, type WorkLaunch, type WorkRecovery } from "./work-lifecycle.js";
+import { retainedWorkSnapshots, validateWorkBinding, type WorkBinding, type WorkLaunch, type WorkRecovery } from "./work-lifecycle.js";
 
 export const SUBAGENT_RECORD_VERSION = 1 as const;
 export const SUBAGENT_NOTIFICATION_VERSION = 1 as const;
@@ -253,44 +253,12 @@ export function isPersistedAgentSnapshot(data: unknown): data is PersistedAgentS
 }
 
 /**
- * Return recovery authority only for a fully-known, zero-turn Work failure.
- * Every counter and boolean in the result is reconstructed from the normalized
- * retained record; no Agent-tool argument participates in this decision.
+ * A retained v1 record cannot mint successor authority. S04 will persist and
+ * return the exact Work-issued v2 descriptor after authorization; until then,
+ * missing proof fails closed rather than inferring zero work from usage.
  */
-export function workRecoveryDescriptor(record: PersistedAgentRecord): WorkRecovery | undefined {
-  if (record.version !== SUBAGENT_RECORD_VERSION || record.status !== "error"
-    || !record.work || !record.workLaunch || !record.workLaunch.reservation
-    || record.workLaunch.bound !== false || !record.invocation
-    || typeof record.isBackground !== "boolean"
-    || record.toolUses !== 0 || record.compactionCount !== 0
-    || record.result !== undefined || record.conversation !== undefined
-    // An output path can exist before child allocation: Agent writes the
-    // caller's initial prompt there synchronously. A child session file cannot.
-    || record.output.sessionFile !== undefined
-    || record.contextPercent !== null) return undefined;
-  const usage = record.lifetimeUsage;
-  if (usage.input !== 0 || usage.output !== 0 || usage.cacheWrite !== 0
-    || (usage.cacheRead ?? 0) !== 0 || (usage.cost ?? 0) !== 0) return undefined;
-  const launch = record.workLaunch;
-  const reservation = launch.reservation;
-  if (!reservation) return undefined;
-  try {
-    return validateWorkRecovery({
-      mode: launch.childSessionId === undefined ? "prebind-recovery" : "bound-reactivation",
-      predecessorAssignmentId: reservation.reservationId,
-      predecessorLaunchKey: launch.launchKey,
-      proof: {
-        status: "error",
-        bound: false,
-        reservationId: reservation.reservationId,
-        ...(launch.childSessionId !== undefined && { childSessionId: launch.childSessionId }),
-        toolUses: 0,
-        usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
-        resultPresent: false,
-        substantiveOutputPresent: false,
-      },
-    });
-  } catch { return undefined; }
+export function workRecoveryDescriptor(_record: PersistedAgentRecord): WorkRecovery | undefined {
+  return undefined;
 }
 
 function normalizeTransition(data: unknown): NotificationTransition | undefined {

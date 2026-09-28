@@ -19,18 +19,14 @@ export function validateWorkBinding(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("work must be an object.");
     const raw = value;
-    if (Object.keys(raw).some(key => !["case", "execution", "actor", "scopes", "intendedOutcome"].includes(key))) {
+    if (Object.keys(raw).some(key => !["case", "execution", "actor", "scopes", "intendedOutcome"].includes(key)))
         throw new Error("Unknown work binding field.");
-    }
     assertWorkString(raw.case, "work.case", 256);
     assertWorkString(raw.execution, "work.execution", 256);
     assertWorkString(raw.actor, "work.actor", 256);
     if (!Array.isArray(raw.scopes) || raw.scopes.length < 1 || raw.scopes.length > 64)
         throw new Error("work.scopes must contain 1-64 scopes.");
-    const scopes = raw.scopes.map(scope => {
-        assertWorkString(scope, "work.scopes[]", 1024);
-        return scope;
-    });
+    const scopes = raw.scopes.map(scope => { assertWorkString(scope, "work.scopes[]", 1024); return scope; });
     if (new Set(scopes).size !== scopes.length)
         throw new Error("work.scopes must be unique.");
     if (raw.intendedOutcome !== undefined)
@@ -48,10 +44,7 @@ export function requestWork(events, action, payload) {
     const requestId = randomUUID();
     return new Promise((resolve, reject) => {
         let unsubscribe = () => { };
-        const timer = setTimeout(() => {
-            unsubscribe();
-            reject(new Error(`Work ${action} adapter did not reply.`));
-        }, 5000);
+        const timer = setTimeout(() => { unsubscribe(); reject(new Error(`Work ${action} adapter did not reply.`)); }, 5000);
         const finish = (error, data) => {
             clearTimeout(timer);
             unsubscribe();
@@ -63,13 +56,11 @@ export function requestWork(events, action, payload) {
         try {
             unsubscribe = events.on(`${channel}:reply:${requestId}`, raw => {
                 const reply = raw;
-                // Do not echo an adapter's arbitrary error body into terminal events.
                 if (!reply || reply.success !== true)
                     finish(new Error(`Work ${action} adapter refused the request.`));
                 else
                     finish(undefined, reply.data);
             });
-            // Detached JSON data prevents a listener from mutating the authorization state.
             events.emit(channel, { ...JSON.parse(JSON.stringify(payload)), requestId });
         }
         catch {
@@ -78,8 +69,7 @@ export function requestWork(events, action, payload) {
     });
 }
 export function validateWorkReservation(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)
-        || Object.keys(value).some(key => key !== "reservationId"))
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => key !== "reservationId"))
         throw new Error("Invalid Work reservation reply.");
     const reservationId = value.reservationId;
     assertWorkString(reservationId, "reservationId", 512);
@@ -89,90 +79,112 @@ export function validateWorkRecovery(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("Invalid Work recovery descriptor.");
     const raw = value;
-    if (Object.keys(raw).some(key => !["mode", "predecessorAssignmentId", "predecessorLaunchKey", "proof"].includes(key))
-        || (raw.mode !== "bound-reactivation" && raw.mode !== "prebind-recovery")) {
+    const fields = ["predecessorAssignmentId", "predecessorLaunchKey", "recoveryAuthorizationId", "expectedTerminalSnapshotDigest"];
+    if (Object.keys(raw).length !== fields.length || Object.keys(raw).some(key => !fields.includes(key)))
         throw new Error("Invalid Work recovery descriptor.");
-    }
-    assertWorkString(raw.predecessorAssignmentId, "predecessorAssignmentId", 128);
-    assertWorkString(raw.predecessorLaunchKey, "predecessorLaunchKey", 64);
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(raw.predecessorAssignmentId)
-        || !/^[0-9a-f]{64}$/.test(raw.predecessorLaunchKey))
-        throw new Error("Invalid Work recovery predecessor identity.");
-    if (!raw.proof || typeof raw.proof !== "object" || Array.isArray(raw.proof))
-        throw new Error("Invalid Work recovery proof.");
-    const proof = raw.proof;
-    if (Object.keys(proof).some(key => !["status", "bound", "reservationId", "childSessionId", "toolUses", "usage", "resultPresent", "substantiveOutputPresent"].includes(key))
-        || proof.status !== "error" || proof.bound !== false || proof.toolUses !== 0
-        || proof.resultPresent !== false || proof.substantiveOutputPresent !== false) {
-        throw new Error("Invalid Work recovery proof.");
-    }
-    const reservation = validateWorkReservation({ reservationId: proof.reservationId });
-    if (proof.childSessionId !== undefined)
-        assertWorkString(proof.childSessionId, "recovery.childSessionId", 512);
-    if ((raw.mode === "bound-reactivation") !== (proof.childSessionId !== undefined))
-        throw new Error("Work recovery mode does not match its proof.");
-    if (!proof.usage || typeof proof.usage !== "object" || Array.isArray(proof.usage))
-        throw new Error("Invalid Work recovery usage proof.");
-    const usage = proof.usage;
-    if (Object.keys(usage).some(key => !["input", "output", "cacheWrite", "cacheRead", "cost"].includes(key))
-        || usage.input !== 0 || usage.output !== 0 || usage.cacheWrite !== 0 || usage.cacheRead !== 0 || usage.cost !== 0) {
-        throw new Error("Invalid Work recovery usage proof.");
-    }
+    assertWorkString(raw.predecessorAssignmentId, "predecessorAssignmentId", 512);
+    assertWorkString(raw.predecessorLaunchKey, "predecessorLaunchKey", 512);
+    assertWorkString(raw.recoveryAuthorizationId, "recoveryAuthorizationId", 512);
+    assertWorkString(raw.expectedTerminalSnapshotDigest, "expectedTerminalSnapshotDigest", 64);
+    if (!/^[0-9a-f]{64}$/.test(raw.expectedTerminalSnapshotDigest))
+        throw new Error("Invalid Work terminal snapshot digest.");
     return {
-        mode: raw.mode,
         predecessorAssignmentId: raw.predecessorAssignmentId,
         predecessorLaunchKey: raw.predecessorLaunchKey,
-        proof: {
-            status: "error", bound: false, reservationId: reservation.reservationId,
-            ...(proof.childSessionId !== undefined && { childSessionId: proof.childSessionId }),
-            toolUses: 0, usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
-            resultPresent: false, substantiveOutputPresent: false,
-        },
+        recoveryAuthorizationId: raw.recoveryAuthorizationId,
+        expectedTerminalSnapshotDigest: raw.expectedTerminalSnapshotDigest,
     };
 }
-/** Corrupt retained receipts are ignored; they can never authorize a launch. */
+const TERMINAL_STATUSES = ["completed", "steered", "aborted", "stopped", "timeout", "error"];
+export function validateWorkTerminalProof(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("Invalid Work terminal proof.");
+    const raw = value;
+    const fields = ["schemaVersion", "reservationId", "launchKey", "childSessionId", "bound", "promptDelivered", "modelTurnCount", "toolUseCount", "resultProduced", "terminalStatus", "startupEffectsAbsent"];
+    if (Object.keys(raw).length !== fields.length || Object.keys(raw).some(key => !fields.includes(key)) || raw.schemaVersion !== 2)
+        throw new Error("Invalid Work terminal proof.");
+    assertWorkString(raw.reservationId, "proof.reservationId", 512);
+    assertWorkString(raw.launchKey, "proof.launchKey", 512);
+    if (raw.childSessionId !== null)
+        assertWorkString(raw.childSessionId, "proof.childSessionId", 512);
+    if (typeof raw.bound !== "boolean" || typeof raw.promptDelivered !== "boolean" || typeof raw.resultProduced !== "boolean" || typeof raw.startupEffectsAbsent !== "boolean")
+        throw new Error("Invalid Work terminal proof boolean.");
+    if (!Number.isSafeInteger(raw.modelTurnCount) || raw.modelTurnCount < 0 || !Number.isSafeInteger(raw.toolUseCount) || raw.toolUseCount < 0)
+        throw new Error("Invalid Work terminal proof counter.");
+    if (!TERMINAL_STATUSES.includes(raw.terminalStatus) || (raw.bound && raw.childSessionId === null))
+        throw new Error("Invalid Work terminal proof state.");
+    return {
+        schemaVersion: 2, reservationId: raw.reservationId, launchKey: raw.launchKey,
+        childSessionId: raw.childSessionId, bound: raw.bound,
+        promptDelivered: raw.promptDelivered, modelTurnCount: raw.modelTurnCount,
+        toolUseCount: raw.toolUseCount, resultProduced: raw.resultProduced,
+        terminalStatus: raw.terminalStatus,
+        startupEffectsAbsent: raw.startupEffectsAbsent,
+    };
+}
+/** UTF-8, lexicographically keyed, whitespace-free JSON shared with Work. */
+export function canonicalWorkTerminalProofBytes(value) {
+    const proof = validateWorkTerminalProof(value);
+    return Buffer.from(JSON.stringify({
+        bound: proof.bound, childSessionId: proof.childSessionId, launchKey: proof.launchKey,
+        modelTurnCount: proof.modelTurnCount, promptDelivered: proof.promptDelivered,
+        reservationId: proof.reservationId, resultProduced: proof.resultProduced,
+        schemaVersion: proof.schemaVersion, startupEffectsAbsent: proof.startupEffectsAbsent,
+        terminalStatus: proof.terminalStatus, toolUseCount: proof.toolUseCount,
+    }), "utf8");
+}
+export function workTerminalProofDigest(value) {
+    return createHash("sha256").update(canonicalWorkTerminalProofBytes(value)).digest("hex");
+}
+function normalizedLaunch(launch) {
+    if (!validateWorkBinding(launch.work) || launch.launchKey !== workLaunchKey(launch.parentSessionId, launch.invocationId))
+        throw new Error("Invalid Work launch.");
+    assertWorkString(launch.agentId, "agentId", 128);
+    assertWorkString(launch.agentType, "agentType", 128);
+    assertWorkString(launch.description, "description", 1024);
+    assertWorkString(launch.cwd, "cwd", 4096);
+    if (launch.agentName !== undefined)
+        assertWorkString(launch.agentName, "agentName", 64);
+    if (launch.childSessionId !== undefined)
+        assertWorkString(launch.childSessionId, "childSessionId", 512);
+    if (launch.bound !== undefined && typeof launch.bound !== "boolean")
+        throw new Error("Invalid bound state.");
+    return {
+        launchKey: launch.launchKey, parentSessionId: launch.parentSessionId, invocationId: launch.invocationId,
+        agentId: launch.agentId, agentType: launch.agentType, agentName: launch.agentName,
+        description: launch.description, cwd: launch.cwd, work: validateWorkBinding(launch.work),
+        reservation: launch.reservation && validateWorkReservation(launch.reservation),
+        childSessionId: launch.childSessionId, bound: launch.bound,
+        recovery: launch.recovery && validateWorkRecovery(launch.recovery),
+    };
+}
+/** V1 is retained for diagnostics/reconciliation only; it carries no recovery proof. */
 export function retainedWorkSnapshots(branch) {
     const retained = new Map();
     for (const raw of branch) {
         try {
             const entry = raw;
-            if (entry?.customType !== "subagents:work-record" || entry.data?.version !== 1)
+            if (entry?.customType !== "subagents:work-record" || !entry.data)
                 continue;
             const snapshot = entry.data;
-            const launch = snapshot.launch;
-            if (!validateWorkBinding(launch.work) || launch.launchKey !== workLaunchKey(launch.parentSessionId, launch.invocationId))
-                continue;
-            assertWorkString(launch.agentId, "agentId", 128);
-            assertWorkString(launch.agentType, "agentType", 128);
-            assertWorkString(launch.description, "description", 1024);
-            assertWorkString(launch.cwd, "cwd", 4096);
-            if (launch.agentName !== undefined)
-                assertWorkString(launch.agentName, "agentName", 64);
-            if (launch.childSessionId !== undefined)
-                assertWorkString(launch.childSessionId, "childSessionId", 512);
-            if (launch.reservation !== undefined)
-                validateWorkReservation(launch.reservation);
-            if (launch.bound !== undefined && typeof launch.bound !== "boolean")
-                continue;
-            if (launch.recovery !== undefined)
-                validateWorkRecovery(launch.recovery);
-            if (!["queued", "running", "completed", "steered", "aborted", "stopped", "timeout", "error"].includes(snapshot.status))
-                continue;
-            // Reconstruct the wire allowlist rather than forwarding persisted arbitrary fields.
-            retained.set(launch.launchKey, {
-                version: 1,
-                launch: {
-                    launchKey: launch.launchKey, parentSessionId: launch.parentSessionId, invocationId: launch.invocationId,
-                    agentId: launch.agentId, agentType: launch.agentType, agentName: launch.agentName,
-                    description: launch.description, cwd: launch.cwd, work: validateWorkBinding(launch.work),
-                    reservation: launch.reservation && validateWorkReservation(launch.reservation),
-                    childSessionId: launch.childSessionId, bound: launch.bound,
-                    recovery: launch.recovery && validateWorkRecovery(launch.recovery),
-                },
-                status: snapshot.status,
-            });
+            if (snapshot.version === 1) {
+                if (!["queued", "running", ...TERMINAL_STATUSES].includes(snapshot.status))
+                    continue;
+                const launch = normalizedLaunch(snapshot.launch);
+                if (retained.get(launch.launchKey)?.version === 2)
+                    continue;
+                retained.set(launch.launchKey, { version: 1, launch, status: snapshot.status });
+            }
+            else if (snapshot.version === 2) {
+                const launch = normalizedLaunch(snapshot.launch);
+                const proof = validateWorkTerminalProof(snapshot.proof);
+                if (!launch.reservation || proof.reservationId !== launch.reservation.reservationId || proof.launchKey !== launch.launchKey
+                    || proof.childSessionId !== (launch.childSessionId ?? null) || proof.bound !== launch.bound || proof.reservationId === launch.agentId)
+                    continue;
+                retained.set(launch.launchKey, { version: 2, launch, proof, recovery: snapshot.recovery && validateWorkRecovery(snapshot.recovery) });
+            }
         }
-        catch { /* Invalid receipt; never respawn from replay. */ }
+        catch { /* Corrupt retained receipts never authorize a launch. */ }
     }
     return [...retained.values()];
 }

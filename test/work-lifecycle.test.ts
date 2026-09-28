@@ -1,6 +1,17 @@
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkReservation, workLaunchKey } from "../src/work-lifecycle.js";
-import { work, workAdapter } from "./helpers/work-adapter.js";
+
+vi.mock("../src/agent-runner.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/agent-runner.js")>(),
+  runAgent: vi.fn(),
+  resumeAgent: vi.fn(),
+}));
+vi.mock("../src/worktree.js", () => ({ createWorktree: vi.fn(), cleanupWorktree: vi.fn(), pruneWorktrees: vi.fn(), isWorktreeIsolationEnabled: () => true }));
+
+import { AgentManager } from "../src/agent-manager.js";
+import { bindExtensionsWithStartupObservation, runAgent } from "../src/agent-runner.js";
+import { canonicalWorkTerminalProofBytes, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, validateWorkTerminalProof, workLaunchKey, workTerminalProofDigest } from "../src/work-lifecycle.js";
+import { childSession, deferred, work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
 const launch = { launchKey: workLaunchKey("parent", "call"), parentSessionId: "parent", invocationId: "call", agentId: "agent", agentType: "general-purpose", description: "test", cwd: process.cwd(), work };
 afterEach(() => vi.useRealTimers());
@@ -68,5 +79,187 @@ describe("Work wire protocol", () => {
     } }]);
     expect(snapshot.launch.work).toEqual(work);
     expect(JSON.stringify(snapshot)).not.toContain("SYNTHETIC_PRIVATE");
+  });
+  it("matches the frozen v2 canonical proof bytes and SHA-256", () => {
+    const fixture = JSON.parse(readFileSync("C:/Users/tyler.TYWARE/SynologyDrive/Claude/shared/lib/tests/fixtures/work_assignment_lifecycle_v2.json", "utf8"));
+    expect(validateWorkTerminalProof(fixture.terminalProof)).toEqual(fixture.terminalProof);
+    expect(canonicalWorkTerminalProofBytes(fixture.terminalProof).toString("utf8")).toBe(fixture.canonicalProofJson);
+    expect(workTerminalProofDigest(fixture.terminalProof)).toBe(fixture.terminalProofDigest);
+  });
+  it("requires every explicit v2 proof field without coercion", () => {
+    const proof = {
+      schemaVersion: 2, reservationId: "assignment-1", launchKey: launch.launchKey,
+      childSessionId: "child-1", bound: true, promptDelivered: false,
+      modelTurnCount: 0, toolUseCount: 0, resultProduced: false,
+      terminalStatus: "error", startupEffectsAbsent: true,
+    };
+    for (const key of Object.keys(proof)) {
+      const missing = { ...proof } as Record<string, unknown>;
+      delete missing[key];
+      expect(() => validateWorkTerminalProof(missing)).toThrow();
+    }
+    expect(() => validateWorkTerminalProof({ ...proof, modelTurnCount: "0" })).toThrow();
+    expect(() => validateWorkTerminalProof({ ...proof, toolUseCount: -1 })).toThrow();
+    expect(() => validateWorkTerminalProof({ ...proof, privateResult: "secret" })).toThrow();
+  });
+  it("does not claim clean startup when bind fails before the runner observation", async () => {
+    const adapter = workAdapter();
+    adapter.refused.add("bind");
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      options.onStartupEffectsObserved?.(true);
+      return { session, responseText: "", aborted: false, timedOut: false, steered: false };
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: "failed-bind-call", work,
+    });
+    await expect(manager.awaitStartup(id)).rejects.toThrow("refused");
+    expect(adapter.requests.finalize).toHaveLength(1);
+    expect(adapter.requests.finalize[0]).toMatchObject({ version: 1, status: "error" });
+    expect(adapter.requests.finalize[0].proof).toBeUndefined();
+    await manager.dispose();
+  });
+  it("keeps startup effects non-authorizing when no-extension binding fails", async () => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    session.bindExtensions = vi.fn(async () => { throw new Error("synthetic bind failure"); });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      await bindExtensionsWithStartupObservation(session, true, options.onStartupEffectsObserved, () => {});
+      return { session, responseText: "", aborted: false, timedOut: false, steered: false };
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: "extension-bind-failure", work,
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)?.promise;
+    expect(session.bindExtensions).toHaveBeenCalledOnce();
+    expect(adapter.requests.finalize[0]).toMatchObject({
+      version: 2,
+      proof: { terminalStatus: "error", startupEffectsAbsent: false },
+    });
+    await manager.dispose();
+  });
+  it.each(["aborted", "stopped"] as const)("requires confirmed disposal before v2 for %s", async terminal => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    const done = deferred<any>();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: `fenced-${terminal}`, work,
+    });
+    await manager.awaitStartup(id);
+    if (terminal === "stopped") manager.abort(id);
+    done.resolve({ session, responseText: "", aborted: terminal === "aborted", timedOut: false, steered: false });
+    await manager.getRecord(id)?.promise;
+    expect(session.dispose).toHaveBeenCalled();
+    expect(adapter.requests.finalize[0]).toMatchObject({ version: 2, proof: { terminalStatus: terminal } });
+    await manager.dispose();
+  });
+  it.each(["aborted", "stopped"] as const)("keeps %s on v1 when disposal cannot confirm the fence", async terminal => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    session.dispose.mockImplementation(() => { throw new Error("synthetic dispose failure"); });
+    const done = deferred<any>();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: `unfenced-${terminal}`, work,
+    });
+    await manager.awaitStartup(id);
+    if (terminal === "stopped") manager.abort(id);
+    done.resolve({ session, responseText: "", aborted: terminal === "aborted", timedOut: false, steered: false });
+    await manager.getRecord(id)?.promise;
+    expect(session.dispose).toHaveBeenCalled();
+    expect(adapter.requests.finalize[0]).toMatchObject({ version: 1, status: terminal });
+    expect(adapter.requests.finalize[0].proof).toBeUndefined();
+    await manager.dispose();
+  });
+  it("keeps an unfenced terminal child on v1 non-authorizing proof", async () => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    session.dispose.mockImplementation(() => { throw new Error("synthetic dispose failure"); });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return { session, responseText: "", aborted: false, timedOut: false, steered: false, failure: "provider failed" };
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: "unfenced-error-call", work,
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)?.promise;
+    expect(session.dispose).toHaveBeenCalled();
+    expect(adapter.requests.finalize[0]).toMatchObject({ version: 1, status: "error" });
+    expect(adapter.requests.finalize[0].proof).toBeUndefined();
+    await manager.dispose();
+  });
+  it("emits v2 terminal proof only after confirming the child fence", async () => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return { session, responseText: "", aborted: false, timedOut: false, steered: false, failure: "provider failed" };
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: "fenced-error-call", work,
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)?.promise;
+    expect(session.dispose).toHaveBeenCalled();
+    expect(adapter.requests.finalize[0]).toMatchObject({ version: 2, proof: { terminalStatus: "error" } });
+    await manager.dispose();
+  });
+  it("carries opaque distinct predecessor/current reservations without minting authority", async () => {
+    const descriptor = {
+      predecessorAssignmentId: "predecessor-assignment", predecessorLaunchKey: "attempt-1",
+      recoveryAuthorizationId: "authorization-1", expectedTerminalSnapshotDigest: "a".repeat(64),
+    };
+    expect(validateWorkRecovery(descriptor)).toEqual(descriptor);
+    expect(() => validateWorkRecovery({ ...descriptor, expectedTerminalSnapshotDigest: "bad" })).toThrow();
+
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return { session, responseText: "", aborted: false, timedOut: false, steered: false };
+    });
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "test", invocationId: "successor-call", work, recovery: descriptor,
+    });
+    await expect(manager.awaitStartup(id)).resolves.toBeUndefined();
+    await manager.getRecord(id)?.promise;
+    expect(adapter.requests.reserve[0].recovery).toEqual(descriptor);
+    expect(adapter.requests.reserve[0].reservation?.reservationId).toBeUndefined();
+    expect(adapter.requests.bind[0].reservation.reservationId).toBe("reservation-04");
+    expect(adapter.requests.bind[0].recovery.predecessorAssignmentId).toBe("predecessor-assignment");
+    await manager.dispose();
+  });
+  it("retains validated v2 terminal proof while decoding v1 read-only", () => {
+    const v2Launch = { ...launch, reservation: { reservationId: "assignment-1" }, childSessionId: "child-1", bound: true };
+    const proof = {
+      schemaVersion: 2 as const, reservationId: "assignment-1", launchKey: launch.launchKey,
+      childSessionId: "child-1", bound: true, promptDelivered: false,
+      modelTurnCount: 0, toolUseCount: 0, resultProduced: false,
+      terminalStatus: "error" as const, startupEffectsAbsent: true,
+    };
+    const snapshots = retainedWorkSnapshots([
+      { customType: "subagents:work-record", data: { version: 1, launch, status: "error" } },
+      { customType: "subagents:work-record", data: { version: 2, launch: v2Launch, proof } },
+    ]);
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({ version: 2, proof });
   });
 });

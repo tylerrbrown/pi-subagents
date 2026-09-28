@@ -95,6 +95,7 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
+  observeWorkPromptDelivery(record: AgentRecord): void;
   resume(id: string, prompt: string, signal?: AbortSignal, options?: ResumeOptions): Promise<AgentRecord | undefined>;
 }
 
@@ -424,6 +425,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
       }
       try {
+        context.manager.observeWorkPromptDelivery(record);
         await record.session.steer(params.message);
       } catch (err) {
         return textResult(`Failed to steer nested agent: ${err instanceof Error ? err.message : String(err)}`, true);

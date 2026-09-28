@@ -18,7 +18,7 @@ import subagentsExtension from "../src/index.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
 import { SubagentScheduler } from "../src/schedule.js";
 import { makePi } from "./helpers/boot-extension.js";
-import { childSession, work, workAdapter, workContext } from "./helpers/work-adapter.js";
+import { childSession, deferred, work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
 let adapter: ReturnType<typeof workAdapter>;
 let manager: AgentManager;
@@ -132,6 +132,52 @@ describe("Work binding through consumer routes", () => {
     const [agent] = createNestedSubagentTools({ manager, pi: adapter.pi, parentAgentId: "owner", depth: 1, maxSubagentDepth: 3, allowedSubagents: "all", configCwd: process.cwd() });
     await assertBoundary(() => agent.execute("nested-call", { ...params, run_in_background: background, cwd: process.cwd() }, undefined, undefined, workContext()));
     expect(adapter.requests.reserve[0].invocationId).toBe("nested-call");
+  });
+  it.each([false, true])("top-level direct steer observes delivery before session call failure=%s", async failed => {
+    const host = makePi();
+    Object.assign(host.pi, adapter.pi);
+    subagentsExtension(host.pi);
+    shutdown = async () => { await host.lifecycle.get("session_shutdown")?.({}, workContext()); };
+    const done = deferred<any>();
+    const session = childSession();
+    session.steer.mockImplementation(async () => { if (failed) throw new Error("synthetic steer failure"); });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const observe = vi.spyOn(AgentManager.prototype, "observeWorkPromptDelivery");
+    await host.tools.get("Agent").execute("top-level-spawn", { ...params, run_in_background: true }, undefined, undefined, workContext());
+    const id = adapter.requests.reserve[0].agentId;
+    const result = await host.tools.get("steer_subagent").execute("top-level-steer", { agent_id: id, message: "new direction" });
+    expect(observe).toHaveBeenCalledOnce();
+    expect(observe.mock.invocationCallOrder[0]).toBeLessThan(session.steer.mock.invocationCallOrder[0]);
+    expect(result.content[0].text).toContain(failed ? "Failed to steer" : "Steering message sent");
+    done.resolve({ session, responseText: "", aborted: false, timedOut: false, steered: false });
+    await vi.waitFor(() => expect(adapter.requests.finalize).toHaveLength(1));
+    expect(adapter.requests.finalize[0].proof.promptDelivered).toBe(true);
+  });
+  it.each([false, true])("nested direct steer observes delivery before session call failure=%s", async failed => {
+    const done = deferred<any>();
+    const session = childSession();
+    session.steer.mockImplementation(async () => { if (failed) throw new Error("synthetic steer failure"); });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const observe = vi.spyOn(manager, "observeWorkPromptDelivery");
+    const id = manager.spawn(adapter.pi, workContext(), "general-purpose", "prompt", {
+      description: "nested", invocationId: "nested-steer-spawn", work,
+      parentAgentId: "owner", isBackground: true,
+    });
+    await manager.awaitStartup(id);
+    const tools = createNestedSubagentTools({ manager, pi: adapter.pi, parentAgentId: "owner", depth: 1, maxSubagentDepth: 3, allowedSubagents: "all", configCwd: process.cwd() });
+    const result = await tools[2].execute("nested-steer", { agent_id: id, message: "new direction" });
+    expect(observe).toHaveBeenCalledOnce();
+    expect(observe.mock.invocationCallOrder[0]).toBeLessThan(session.steer.mock.invocationCallOrder[0]);
+    expect(result.content[0].text).toContain(failed ? "Failed to steer" : "Steering message sent");
+    done.resolve({ session, responseText: "", aborted: false, timedOut: false, steered: false });
+    await manager.getRecord(id)?.promise;
+    expect(adapter.requests.finalize[0].proof.promptDelivered).toBe(true);
   });
   it("Agent resume carries binding through reserve/bind on the original child", async () => {
     const agent = boot();

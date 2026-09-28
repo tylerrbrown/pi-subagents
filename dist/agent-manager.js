@@ -92,6 +92,8 @@ function completeRecord(record) {
  * `assertActive()` from a bare timer callback — an uncaughtException that kills pi (#242).
  */
 async function shutdownChildSession(session) {
+    if (!session?.dispose)
+        return session === undefined;
     try {
         const runner = session?.extensionRunner;
         // Optional all the way down: on a pi without the getter, or a stubbed session from a
@@ -109,9 +111,12 @@ async function shutdownChildSession(session) {
     catch { /* a partial session must degrade, not take the teardown down with it */ }
     // Always, even on timeout: disposal is what this function ultimately exists to do.
     try {
-        session?.dispose?.();
+        session.dispose();
+        return true;
     }
-    catch { /* ignore */ }
+    catch {
+        return false;
+    }
 }
 /** How long a record whose result has been read is kept, purely to bound memory. */
 const CONSUMED_RETENTION_MS = 10 * 60_000;
@@ -141,6 +146,53 @@ export class AgentManager {
     /** A stopped record is not resumable until its asynchronous continuation settles. */
     workRuns = new Map();
     pendingWorkStarts = new WeakSet();
+    workProofs = new WeakMap();
+    resetWorkProof(record) {
+        this.workProofs.set(record, {
+            promptDelivered: false,
+            modelTurnCount: 0,
+            toolUseCount: 0,
+            resultProduced: false,
+            // Unknown is non-authorizing until the runner observes a clean boundary.
+            startupEffectsAbsent: false,
+            // No child has been observed yet, so there is nothing actionable to fence.
+            fenced: true,
+            settled: false,
+        });
+    }
+    settleWorkProof(record) {
+        const proof = this.workProofs.get(record);
+        if (proof)
+            proof.settled = true;
+    }
+    /** Observation seam for every manager-owned prompt/steer delivery path. */
+    observeWorkPromptDelivery(record) {
+        const proof = this.workProofs.get(record);
+        if (proof)
+            proof.promptDelivered = true;
+    }
+    workObservationCallbacks(record) {
+        return {
+            onPromptDelivered: () => this.observeWorkPromptDelivery(record),
+            onModelAttemptStart: () => { const proof = this.workProofs.get(record); if (proof)
+                proof.modelTurnCount++; },
+            onToolDispatch: () => { const proof = this.workProofs.get(record); if (proof)
+                proof.toolUseCount++; },
+            onResultProduced: () => { const proof = this.workProofs.get(record); if (proof)
+                proof.resultProduced = true; },
+            onStartupEffectsObserved: (absent) => { const proof = this.workProofs.get(record); if (proof)
+                proof.startupEffectsAbsent = absent; },
+            onSessionFenced: (fenced) => { const proof = this.workProofs.get(record); if (proof)
+                proof.fenced = fenced; },
+        };
+    }
+    async fenceWorkSession(record, session) {
+        const proof = this.workProofs.get(record);
+        if (proof)
+            proof.fenced = await shutdownChildSession(session);
+        if (proof?.fenced && record.session === session)
+            record.session = undefined;
+    }
     ownsWorkRun(record, run) {
         return !run || (this.workRuns.get(record)?.token === run.token
             && record.workLaunch === run.launch && record.abortController === run.controller);
@@ -163,6 +215,7 @@ export class AgentManager {
         this.queuedWorkSignals.set(record.id, () => signal.removeEventListener("abort", abort));
     }
     finalizeQueuedWork(record) {
+        this.settleWorkProof(record);
         const run = this.workRuns.get(record);
         void this.finalizeWork(record, run).finally(() => {
             if (run && this.ownsWorkRun(record, run))
@@ -174,8 +227,31 @@ export class AgentManager {
         this.queuedWorkSignals.delete(id);
     }
     workSnapshot(record) {
-        // Receipts carry only bounded identities and the typed terminal status; never the child's private result.
-        return { version: 1, launch: structuredClone(record.workLaunch), status: record.status };
+        const launch = structuredClone(record.workLaunch);
+        const observation = this.workProofs.get(record);
+        const terminal = ["completed", "steered", "aborted", "stopped", "timeout", "error"].includes(record.status);
+        const requiresFence = ["error", "aborted", "stopped", "timeout"].includes(record.status);
+        // In-progress/v1 receipts remain diagnostic only. Error-like outcomes stay
+        // v1 until disposal/fencing confirms the predecessor cannot act.
+        if (!terminal || !observation?.settled || (requiresFence && !observation.fenced) || !launch.reservation) {
+            return { version: 1, launch, status: record.status };
+        }
+        const proof = {
+            schemaVersion: 2,
+            reservationId: launch.reservation.reservationId,
+            launchKey: launch.launchKey,
+            childSessionId: launch.childSessionId ?? null,
+            bound: launch.bound === true,
+            promptDelivered: observation.promptDelivered,
+            modelTurnCount: observation.modelTurnCount,
+            toolUseCount: observation.toolUseCount,
+            resultProduced: observation.resultProduced,
+            terminalStatus: record.status,
+            startupEffectsAbsent: observation.startupEffectsAbsent,
+        };
+        const recovery = launch.recovery;
+        delete launch.recovery;
+        return { version: 2, launch, proof, ...(recovery && { recovery }) };
     }
     persistWork(record) {
         if (record.workLaunch)
@@ -245,6 +321,7 @@ export class AgentManager {
         if (record.pendingSteers?.length) {
             for (const message of record.pendingSteers) {
                 this.assertWorkRun(record, run);
+                this.observeWorkPromptDelivery(record);
                 await session.steer(message);
             }
             this.assertWorkRun(record, run);
@@ -420,6 +497,7 @@ export class AgentManager {
                 agentId: id, agentType: type, agentName: options.name, description: options.description,
                 cwd: options.cwd ?? ctx.cwd, work, bound: false, recovery,
             };
+            this.resetWorkProof(record);
             if (this.workLaunches.has(record.workLaunch.launchKey)) {
                 throw new Error("Work invocation already launched; reconcile or retrieve its existing record.");
             }
@@ -490,6 +568,7 @@ export class AgentManager {
             else {
                 this.agents.delete(id);
             }
+            this.settleWorkProof(record);
             await this.finalizeWork(record);
             this.pendingWorkStarts.delete(record);
             this.drainQueue();
@@ -611,6 +690,7 @@ export class AgentManager {
                 worktreeBase: worktreeCwd ? baseCwd : undefined,
                 configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
                 signal: record.abortController.signal,
+                ...this.workObservationCallbacks(record),
                 onToolActivity: (activity) => {
                     record.lastProgressAt = Date.now();
                     if (activity.type === "end")
@@ -644,6 +724,9 @@ export class AgentManager {
                     maxSubagentDepth: record.maxSubagentDepth,
                 },
                 onSessionCreated: async (session) => {
+                    const proof = this.workProofs.get(record);
+                    if (proof)
+                        proof.fenced = false;
                     if (record.workLaunch)
                         await this.bindWork(record, session);
                     record.session = session;
@@ -660,6 +743,7 @@ export class AgentManager {
                     // Flush any steers that arrived before the session was ready
                     if (record.pendingSteers?.length) {
                         for (const msg of record.pendingSteers) {
+                            this.observeWorkPromptDelivery(record);
                             session.steer(msg).catch(() => { });
                         }
                         record.pendingSteers = undefined;
@@ -671,13 +755,9 @@ export class AgentManager {
                 .then(async ({ responseText, session, aborted, timedOut, steered, failure }) => {
                 syncEffectiveInvocation(record, session);
                 record.result = responseText;
-                if (timedOut) {
-                    await shutdownChildSession(session);
-                    record.session = undefined;
-                }
-                else {
-                    record.session = session;
-                }
+                record.session = session;
+                if (timedOut)
+                    await this.fenceWorkSession(record, session);
                 // Final flush of streaming output file
                 if (record.outputCleanup) {
                     try {
@@ -731,7 +811,14 @@ export class AgentManager {
                         record.status = steered ? "steered" : "completed";
                     }
                 }
+                if (!timedOut && record.status === "error") {
+                    await this.fenceWorkSession(record, session);
+                }
+                else if (["aborted", "stopped"].includes(record.status)) {
+                    await this.fenceWorkSession(record, session);
+                }
                 completeRecord(record);
+                this.settleWorkProof(record);
                 await this.finalizeWork(record);
                 detach();
                 this.abortOwnedChildren(id);
@@ -784,7 +871,10 @@ export class AgentManager {
                 const runError = err instanceof Error ? err.message : String(err);
                 record.error = preservationFailure ? `${runError} ${preservationFailure}` : runError;
                 record.failureKind = classifyRunFailure(record.error);
+                if (record.session)
+                    await this.fenceWorkSession(record, record.session);
                 completeRecord(record);
+                this.settleWorkProof(record);
                 await this.finalizeWork(record);
                 detach();
                 this.abortOwnedChildren(id);
@@ -909,6 +999,11 @@ export class AgentManager {
                 throw new Error("Work invocation already launched.");
             this.workLaunches.add(launchKey);
             record.workLaunch = { ...record.workLaunch, invocationId, launchKey, reservation: undefined, bound: false };
+            this.resetWorkProof(record);
+            // A resumed session has already run extension startup and is actionable.
+            const proof = this.workProofs.get(record);
+            proof.startupEffectsAbsent = false;
+            proof.fenced = false;
             record.abortController = new AbortController();
             this.workRuns.set(record, Object.freeze({ token: Symbol("work-resume"), launch: record.workLaunch, controller: record.abortController }));
             record.stopReason = undefined;
@@ -968,13 +1063,16 @@ export class AgentManager {
             else
                 signal.addEventListener("abort", abortBoundResume, { once: true });
         }
+        let resumeStarted = false;
         try {
             if (workRun) {
                 await this.reserveWork(record, workRun);
                 await this.bindWork(record, record.session, workRun);
                 this.assertWorkRun(record, workRun);
             }
+            resumeStarted = true;
             const { text, failure, timedOut } = await resumeAgent(record.session, prompt, {
+                ...this.workObservationCallbacks(record),
                 onToolActivity: (activity) => {
                     record.lastProgressAt = Date.now();
                     if (activity.type === "end")
@@ -1021,7 +1119,10 @@ export class AgentManager {
                 }
             }
             record.result = text;
-            if (timedOut) {
+            if (workRun && (timedOut || record.status === "error")) {
+                await this.fenceWorkSession(record, record.session);
+            }
+            else if (timedOut) {
                 await shutdownChildSession(record.session);
                 record.session = undefined;
             }
@@ -1034,15 +1135,26 @@ export class AgentManager {
             // posture; persist that final truth before the record settles.
             if (record.session)
                 syncEffectiveInvocation(record, record.session);
-            record.status = "error";
-            record.error = err instanceof Error ? err.message : String(err);
-            record.failureKind = classifyRunFailure(record.error);
+            const stopped = workRun?.controller.signal.aborted === true;
+            if (stopped)
+                record.status = "stopped";
+            else {
+                record.status = "error";
+                record.error = err instanceof Error ? err.message : String(err);
+                record.failureKind = classifyRunFailure(record.error);
+            }
+            if (workRun && (!stopped || resumeStarted))
+                await this.fenceWorkSession(record, record.session);
             completeRecord(record);
         }
         if (workRun) {
             signal?.removeEventListener("abort", abortBoundResume);
-            if (workRun.controller.signal.aborted)
+            if (workRun.controller.signal.aborted) {
                 record.status = "stopped";
+                if (resumeStarted)
+                    await this.fenceWorkSession(record, record.session);
+            }
+            this.settleWorkProof(record);
             await this.finalizeWork(record, workRun);
         }
         // Same contract as the spawn settle paths: children spawned during the
@@ -1120,10 +1232,13 @@ export class AgentManager {
             this.drainQueue();
         };
         const session = record.session;
+        let resumeStarted = false;
         const run = () => {
             if (workRun)
                 this.assertWorkRun(record, workRun);
+            resumeStarted = true;
             return resumeAgent(session, prompt, {
+                ...this.workObservationCallbacks(record),
                 onToolActivity: (activity) => {
                     record.lastProgressAt = Date.now();
                     if (activity.type === "end")
@@ -1180,11 +1295,15 @@ export class AgentManager {
                 }
             }
             record.result = text;
-            if (timedOut) {
+            if (workRun && ["error", "stopped", "timeout"].includes(record.status)) {
+                await this.fenceWorkSession(record, session);
+            }
+            else if (timedOut) {
                 await shutdownChildSession(session);
                 record.session = undefined;
             }
             completeRecord(record);
+            this.settleWorkProof(record);
             await this.finalizeWork(record, workRun);
             settle();
             return text;
@@ -1198,7 +1317,10 @@ export class AgentManager {
                 record.error = err instanceof Error ? err.message : String(err);
                 record.failureKind = classifyRunFailure(record.error);
             }
+            if (workRun && (record.status !== "stopped" || resumeStarted))
+                await this.fenceWorkSession(record, session);
             completeRecord(record);
+            this.settleWorkProof(record);
             await this.finalizeWork(record, workRun);
             settle();
             return "";
@@ -1224,6 +1346,7 @@ export class AgentManager {
         if (record.status !== "running" && record.status !== "queued")
             return false;
         if (record.session && (!record.workLaunch || record.workLaunch.bound)) {
+            this.observeWorkPromptDelivery(record);
             record.session.steer(message).catch(() => { });
         }
         else {
@@ -1357,9 +1480,12 @@ export class AgentManager {
         record.status = "stopped";
         record.stopReason = reason;
         completeRecord(record);
-        // Startup settlement includes any late reservation/child identity in its receipt.
-        if (!this.startups.has(id) && !this.workRuns.has(record))
+        // The active run owns terminal proof; its settlement path finalizes after
+        // callbacks are fenced. Pre-run failures have no run promise to await.
+        if (!record.promise && !this.startups.has(id) && !this.workRuns.has(record)) {
+            this.settleWorkProof(record);
             void this.finalizeWork(record);
+        }
         return true;
     }
     /** Dispose a record's session and remove it from the map. */
@@ -1502,8 +1628,10 @@ export class AgentManager {
                 record.status = "stopped";
                 record.stopReason = reason;
                 completeRecord(record);
-                if (!this.startups.has(record.id) && !this.workRuns.has(record))
+                if (!record.promise && !this.startups.has(record.id) && !this.workRuns.has(record)) {
+                    this.settleWorkProof(record);
                     void this.finalizeWork(record);
+                }
                 count++;
             }
         }

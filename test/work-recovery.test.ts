@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async importOriginal => ({
   ...await importOriginal<typeof import("../src/agent-runner.js")>(),
@@ -17,88 +18,40 @@ vi.mock("../src/settings.js", async importOriginal => ({
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
-import { retainedWorkSnapshots, workLaunchKey } from "../src/work-lifecycle.js";
+import * as lifecycle from "../src/work-lifecycle.js";
 import { makePi, textOf } from "./helpers/boot-extension.js";
-import { deferred, work, workAdapter, workContext } from "./helpers/work-adapter.js";
+import { work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
-const predecessorId = "01234567-89ab-cde";
-const predecessorAssignmentId = "01234567-89ab-4cde-8123-0123456789ab";
-const predecessorLaunch = (childSessionId?: string) => ({
-  launchKey: workLaunchKey("parent-session", "original-call"),
-  parentSessionId: "parent-session",
-  invocationId: "original-call",
-  agentId: predecessorId,
-  agentType: "general-purpose",
-  description: "original assignment",
-  cwd: process.cwd(),
-  work,
-  reservation: { reservationId: predecessorAssignmentId },
-  childSessionId,
-  bound: false,
-});
+const assignmentId = "00000000-0000-4000-8000-000000000001";
+const agentId = "01234567-89ab-cde";
+const launchKey = "attempt-launch-002";
+const proof = {
+  schemaVersion: 2,
+  reservationId: assignmentId,
+  launchKey,
+  childSessionId: "01a0e600-0000-7000-8000-000000000002",
+  bound: true,
+  promptDelivered: false,
+  modelTurnCount: 0,
+  toolUseCount: 0,
+  resultProduced: false,
+  terminalStatus: "error",
+  startupEffectsAbsent: true,
+} as const;
+const canonicalProofJson = "{\"bound\":true,\"childSessionId\":\"01a0e600-0000-7000-8000-000000000002\",\"launchKey\":\"attempt-launch-002\",\"modelTurnCount\":0,\"promptDelivered\":false,\"reservationId\":\"00000000-0000-4000-8000-000000000001\",\"resultProduced\":false,\"schemaVersion\":2,\"startupEffectsAbsent\":true,\"terminalStatus\":\"error\",\"toolUseCount\":0}";
+const proofDigest = "f2c0abed87d025e08cd2f6765041dcdc6737050a7f1e5874647e6dbb3be68a83";
 
-function persistedRecord(childSessionId?: string, overrides: Record<string, unknown> = {}) {
-  const launch = predecessorLaunch(childSessionId);
-  return {
-    customType: "subagents:record",
-    data: {
-      version: 1,
-      id: predecessorId,
-      handles: { handle: "general-purpose", alias: "original-assignment" },
-      type: "general-purpose",
-      description: "original assignment",
-      status: "error",
-      error: "Work bind adapter refused the request.",
-      toolUses: 0,
-      startedAt: 100,
-      completedAt: 200,
-      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
-      compactionCount: 0,
-      contextPercent: null,
-      toolCallId: "original-call",
-      work,
-      workLaunch: launch,
-      invocation: { modelId: "pi-sub-anthropic/claude-haiku-4-5", thinking: "low", runInBackground: true },
-      isBackground: true,
-      // Agent may create the transcript path before reserve/bind; the path is
-      // not evidence that the child produced substantive output.
-      output: { file: "/bounded/new-agent.output" },
-      notificationPending: false,
-      ...overrides,
-    },
-  };
+function exported(name: string): (...args: unknown[]) => unknown {
+  const value = Reflect.get(lifecycle, name);
+  expect(value, `${name} must be exported by the lifecycle-v2 boundary`).toBeTypeOf("function");
+  return value as (...args: unknown[]) => unknown;
 }
 
-function branch(record: ReturnType<typeof persistedRecord>) {
-  return [
-    { customType: "subagents:work-record", data: { version: 1, launch: record.data.workLaunch, status: "error" } },
-    record,
-  ];
+function validate(value: unknown): Record<string, unknown> {
+  return exported("validateWorkTerminalProof")(value) as Record<string, unknown>;
 }
 
-async function boot(record: ReturnType<typeof persistedRecord>, retained: unknown[] = []) {
-  const adapter = workAdapter();
-  const host = makePi();
-  Object.assign(host.pi, adapter.pi);
-  subagentsExtension(host.pi);
-  const ctx = workContext();
-  ctx.modelRegistry.find = vi.fn((provider: string, id: string) => ({ provider, id, name: id }));
-  ctx.modelRegistry.getAvailable = vi.fn(() => [{ provider: "pi-sub-anthropic", id: "claude-haiku-4-5", name: "Haiku" }]);
-  ctx.sessionManager.getBranch = () => [...branch(record), ...retained];
-  await host.lifecycle.get("session_start")?.({}, ctx);
-  return { ...host, adapter, ctx };
-}
-
-const resumeParams = {
-  subagent_type: "general-purpose",
-  description: "continue assignment",
-  prompt: "retry the assignment",
-  resume: predecessorId,
-  run_in_background: true,
-};
-
-const harnesses: Array<Awaited<ReturnType<typeof boot>>> = [];
-beforeEach(() => vi.clearAllMocks());
+const harnesses: Array<{ lifecycle: Map<string, (event: unknown, ctx: any) => Promise<void> | void>; ctx: any }> = [];
 afterEach(async () => {
   for (const harness of harnesses.splice(0)) {
     await harness.lifecycle.get("session_shutdown")?.({}, harness.ctx);
@@ -107,237 +60,150 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-describe("Work assignment recovery through Agent resume", () => {
-  it.each([
-    [undefined, "prebind-recovery"],
-    ["allocated-child", "bound-reactivation"],
-  ] as const)("starts one fresh successor for %s mode", async (childSessionId, mode) => {
-    const record = persistedRecord(childSessionId);
-    const harness = await boot(record); harnesses.push(harness);
-    const done = deferred<any>();
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      expect(options?.resumeSessionFile).toBeUndefined();
-      expect(options?.model).toMatchObject({ provider: "pi-sub-anthropic", id: "claude-haiku-4-5" });
-      expect(options?.thinkingLevel).toBe("low");
-      await options!.onSessionCreated?.({
-        sessionManager: { getSessionId: () => "fresh-child-session" },
-        dispose: vi.fn(), steer: vi.fn(async () => {}),
-      } as any);
-      return done.promise;
+describe("lifecycle-v2 proof contract", () => {
+  it("keeps Assignment/reservation identity distinct from Agent identity in the predecessor descriptor", () => {
+    expect(assignmentId).not.toBe(agentId);
+    const descriptor = exported("validateWorkRecovery")({
+      predecessorAssignmentId: assignmentId,
+      predecessorLaunchKey: launchKey,
+      recoveryAuthorizationId: "recovery-authorization-001",
+      expectedTerminalSnapshotDigest: proofDigest,
+    }) as Record<string, unknown>;
+    expect(descriptor).toMatchObject({
+      predecessorAssignmentId: assignmentId,
+      predecessorLaunchKey: launchKey,
+      recoveryAuthorizationId: "recovery-authorization-001",
+      expectedTerminalSnapshotDigest: proofDigest,
     });
+    expect(descriptor.predecessorAssignmentId).toBe(proof.reservationId);
+    expect(descriptor.predecessorAssignmentId).not.toBe(agentId);
+  });
 
-    const first = await harness.tools.get("Agent").execute("recovery-call", resumeParams, undefined, undefined, harness.ctx);
-    const successorId = /Agent ID: (\S+)/.exec(textOf(first))?.[1];
-    expect(successorId).toBeTruthy();
-    expect(successorId).not.toBe(predecessorId);
-    expect(harness.adapter.requests.reserve).toHaveLength(1);
-    expect(harness.adapter.requests.reserve[0]).toMatchObject({
-      agentId: successorId,
+  it("matches the frozen Python canonical proof bytes and SHA-256 digest exactly", () => {
+    const bytes = exported("canonicalWorkTerminalProofBytes")({
+      // Deliberately reverse the fixture order: canonicalization, not insertion order, owns the bytes.
+      toolUseCount: 0,
+      terminalStatus: "error",
+      startupEffectsAbsent: true,
+      schemaVersion: 2,
+      resultProduced: false,
+      reservationId: assignmentId,
+      promptDelivered: false,
+      modelTurnCount: 0,
+      launchKey,
+      childSessionId: proof.childSessionId,
+      bound: true,
+    });
+    const buffer = Buffer.from(bytes as Uint8Array);
+    expect(buffer.toString("utf8")).toBe(canonicalProofJson);
+    expect(createHash("sha256").update(buffer).digest("hex")).toBe(proofDigest);
+    expect(exported("workTerminalProofDigest")(proof)).toBe(proofDigest);
+  });
+
+  it.each([
+    ["missing bound", { bound: undefined }],
+    ["coerced bound", { bound: 0 }],
+    ["missing prompt observation", { promptDelivered: undefined }],
+    ["coerced prompt observation", { promptDelivered: "false" }],
+    ["missing result observation", { resultProduced: undefined }],
+    ["missing startup observation", { startupEffectsAbsent: undefined }],
+    ["missing model counter", { modelTurnCount: undefined }],
+    ["missing tool counter", { toolUseCount: undefined }],
+    ["fractional counter", { modelTurnCount: 0.5 }],
+    ["negative counter", { toolUseCount: -1 }],
+    ["unsafe counter", { modelTurnCount: Number.MAX_SAFE_INTEGER + 1 }],
+    ["coerced counter", { modelTurnCount: "0" }],
+  ])("refuses %s rather than coercing or defaulting", (_label, change) => {
+    const validator = exported("validateWorkTerminalProof");
+    expect(() => validator({ ...proof, ...change })).toThrow();
+  });
+
+  it("preserves distinct bound=true and bound=false zero-turn shapes", () => {
+    const bound = validate(proof);
+    const unbound = validate({ ...proof, bound: false, childSessionId: null });
+    expect(bound).toMatchObject({ bound: true, childSessionId: proof.childSessionId });
+    expect(unbound).toMatchObject({ bound: false, childSessionId: null });
+    expect(bound).not.toEqual(unbound);
+  });
+
+  it("refuses contradictory bound proof", () => {
+    const validator = exported("validateWorkTerminalProof");
+    expect(() => validator({ ...proof, childSessionId: null })).toThrow();
+  });
+
+  it("retains non-zero observations as proof facts rather than erasing them", () => {
+    expect(validate({
+      ...proof,
+      promptDelivered: true,
+      modelTurnCount: 1,
+      toolUseCount: 1,
+      resultProduced: true,
+      startupEffectsAbsent: false,
+    })).toMatchObject({
+      promptDelivered: true,
+      modelTurnCount: 1,
+      toolUseCount: 1,
+      resultProduced: true,
+      startupEffectsAbsent: false,
+    });
+  });
+});
+
+describe("legacy retained records", () => {
+  it.each(["error", "aborted", "stopped"] as const)("never turns a v1 %s record with inferred zero usage into recovery authority", async terminalStatus => {
+    const predecessorLaunch = {
+      launchKey: lifecycle.workLaunchKey("parent-session", "original-call"),
+      parentSessionId: "parent-session",
+      invocationId: "original-call",
+      agentId,
       agentType: "general-purpose",
       description: "original assignment",
       cwd: process.cwd(),
       work,
-      recovery: {
-        mode,
-        predecessorAssignmentId,
-        predecessorLaunchKey: record.data.workLaunch.launchKey,
-        proof: {
-          status: "error",
-          bound: false,
-          reservationId: predecessorAssignmentId,
-          toolUses: 0,
-          usage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
-          resultPresent: false,
-          substantiveOutputPresent: false,
-          ...(childSessionId ? { childSessionId } : {}),
-        },
+      reservation: { reservationId: assignmentId },
+      childSessionId: proof.childSessionId,
+      bound: false,
+    };
+    const record = {
+      customType: "subagents:record",
+      data: {
+        version: 1,
+        id: agentId,
+        handles: { handle: "general-purpose", alias: "original-assignment" },
+        type: "general-purpose",
+        description: "original assignment",
+        status: terminalStatus,
+        toolUses: 0,
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 },
+        toolCallId: "original-call",
+        work,
+        workLaunch: predecessorLaunch,
+        invocation: { modelId: "pi-sub-anthropic/claude-haiku-4-5", thinking: "low", runInBackground: true },
+        isBackground: true,
       },
-    });
+    };
+    const adapter = workAdapter();
+    const host = makePi();
+    Object.assign(host.pi, adapter.pi);
+    subagentsExtension(host.pi);
+    const ctx = workContext();
+    ctx.modelRegistry.find = vi.fn((provider: string, id: string) => ({ provider, id, name: id }));
+    ctx.sessionManager.getBranch = () => [
+      { customType: "subagents:work-record", data: { version: 1, launch: predecessorLaunch, status: terminalStatus } },
+      record,
+    ];
+    await host.lifecycle.get("session_start")?.({}, ctx);
+    harnesses.push({ lifecycle: host.lifecycle, ctx });
 
-    const repeated = await harness.tools.get("Agent").execute("recovery-call-2", resumeParams, undefined, undefined, harness.ctx);
-    expect(textOf(repeated)).toContain(successorId!);
-    expect(runAgent).toHaveBeenCalledOnce();
-    expect(harness.adapter.requests.reserve).toHaveLength(1);
-
-    done.resolve({ session: { dispose: vi.fn() }, responseText: "recovered", aborted: false, steered: false });
-  });
-
-  it("fences parallel foreground recovery before asynchronous reserve", async () => {
-    const record = persistedRecord();
-    const harness = await boot(record); harnesses.push(harness);
-    const done = deferred<any>();
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      await options!.onSessionCreated?.({
-        sessionManager: { getSessionId: () => "fresh-child-session" },
-        dispose: vi.fn(), steer: vi.fn(async () => {}),
-      } as any);
-      return done.promise;
-    });
-    const foreground = { ...resumeParams, run_in_background: false };
-    const first = harness.tools.get("Agent").execute("foreground-1", foreground, undefined, undefined, harness.ctx);
-    await vi.waitFor(() => expect(harness.adapter.requests.reserve).toHaveLength(1));
-    const second = await harness.tools.get("Agent").execute("foreground-2", foreground, undefined, undefined, harness.ctx);
-    expect(textOf(second)).toContain("Work recovery already started");
-    expect(runAgent).toHaveBeenCalledOnce();
-    expect(harness.adapter.requests.reserve).toHaveLength(1);
-    done.resolve({ session: { dispose: vi.fn() }, responseText: "recovered", aborted: false, steered: false });
-    expect(textOf(await first)).toContain("recovered");
-  });
-
-  it("accepts an exact retained handle but not a partial handle", async () => {
-    const record = persistedRecord();
-    const harness = await boot(record); harnesses.push(harness);
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      await options!.onSessionCreated?.({ sessionManager: { getSessionId: () => "fresh-child" }, dispose: vi.fn() } as any);
-      return { session: { dispose: vi.fn() }, responseText: "done", aborted: false, steered: false } as any;
-    });
-    const partial = await harness.tools.get("Agent").execute("partial", { ...resumeParams, resume: "original" }, undefined, undefined, harness.ctx);
-    expect(textOf(partial)).toContain("Agent not found");
-    const exact = await harness.tools.get("Agent").execute("exact", { ...resumeParams, resume: "@original-assignment" }, undefined, undefined, harness.ctx);
-    expect(textOf(exact)).toMatch(/Agent ID: (?!01234567-89ab-cde)/);
-    expect(runAgent).toHaveBeenCalledOnce();
-  });
-
-  it.each([
-    ["bound", { workLaunch: { ...predecessorLaunch(), bound: true } }],
-    ["non-error", { status: "completed" }],
-    ["tool use", { toolUses: 1 }],
-    ["usage", { lifetimeUsage: { input: 1, output: 0, cacheWrite: 0 } }],
-    ["result", { result: "partial" }],
-    ["substantive output", { conversation: "a prior turn" }],
-    ["old child session", { output: { sessionFile: "/sessions/old.jsonl" } }],
-    ["missing reservation", { workLaunch: { ...predecessorLaunch(), reservation: undefined } }],
-    ["malformed reservation identity", { workLaunch: {
-      ...predecessorLaunch(), reservation: { reservationId: "reservation-04" },
-    } }],
-    ["indeterminate bound", { workLaunch: { ...predecessorLaunch(), bound: undefined } }],
-    ["indeterminate version", { version: 0 }],
-  ])("refuses %s persisted records without starting a child", async (_label, overrides) => {
-    const record = persistedRecord(undefined, overrides);
-    // Keep the work receipt consistent when this case changes the persisted launch.
-    const harness = await boot(record); harnesses.push(harness);
-    const result = await harness.tools.get("Agent").execute("recovery-call", resumeParams, undefined, undefined, harness.ctx);
+    const result = await host.tools.get("Agent").execute("recovery", {
+      subagent_type: "general-purpose",
+      description: "continue",
+      prompt: "retry",
+      resume: agentId,
+      run_in_background: true,
+    }, undefined, undefined, ctx);
     expect(textOf(result)).toContain("Agent not found");
     expect(runAgent).not.toHaveBeenCalled();
-    expect(harness.adapter.requests.reserve).toHaveLength(0);
-  });
-
-  it("does not reclaim a predecessor handle already held by a live agent", async () => {
-    const record = persistedRecord();
-    const harness = await boot(record); harnesses.push(harness);
-    let call = 0;
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      call++;
-      await options!.onSessionCreated?.({
-        sessionManager: { getSessionId: () => `child-${call}` },
-        dispose: vi.fn(), steer: vi.fn(async () => {}),
-      } as any);
-      if (call === 1) return new Promise(() => {});
-      return { session: { dispose: vi.fn() }, responseText: "done", aborted: false, steered: false } as any;
-    });
-    const live = await harness.tools.get("Agent").execute("live", {
-      prompt: "hold", description: "live holder", subagent_type: "general-purpose", run_in_background: true,
-    }, undefined, undefined, harness.ctx);
-    const liveId = /Agent ID: (\S+)/.exec(textOf(live))![1];
-    const recovered = await harness.tools.get("Agent").execute("recover", resumeParams, undefined, undefined, harness.ctx);
-    const successorId = /Agent ID: (\S+)/.exec(textOf(recovered))![1];
-    const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
-    expect(manager.getRecord(liveId).handle).toBe("general-purpose");
-    expect(manager.getRecord(successorId).handle).not.toBe("general-purpose");
-  });
-
-  it("refuses an ambiguous persisted handle while exact Agent ID remains recoverable", async () => {
-    const record = persistedRecord();
-    const otherId = "abcdef01-2345-678";
-    const otherAssignment = "fedcba98-7654-4321-8123-fedcba987654";
-    const other = persistedRecord(undefined, {
-      id: otherId,
-      workLaunch: {
-        ...predecessorLaunch(), agentId: otherId,
-        reservation: { reservationId: otherAssignment },
-      },
-    });
-    const harness = await boot(record, [other]); harnesses.push(harness);
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      await options!.onSessionCreated?.({ sessionManager: { getSessionId: () => "fresh-child" }, dispose: vi.fn() } as any);
-      return { session: { dispose: vi.fn() }, responseText: "done", aborted: false, steered: false } as any;
-    });
-    const ambiguous = await harness.tools.get("Agent").execute(
-      "ambiguous", { ...resumeParams, resume: "@original-assignment" }, undefined, undefined, harness.ctx,
-    );
-    expect(textOf(ambiguous)).toContain("Agent not found");
-    expect(runAgent).not.toHaveBeenCalled();
-    const exact = await harness.tools.get("Agent").execute(
-      "exact", { ...resumeParams, resume: predecessorId }, undefined, undefined, harness.ctx,
-    );
-    expect(textOf(exact)).toContain("Agent ID:");
-    expect(runAgent).toHaveBeenCalledOnce();
-  });
-
-  it("keeps ordinary persisted no-session records on the Agent-not-found path", async () => {
-    const record = persistedRecord(undefined, { work: undefined, workLaunch: undefined });
-    const harness = await boot(record); harnesses.push(harness);
-    const result = await harness.tools.get("Agent").execute("ordinary-resume", resumeParams, undefined, undefined, harness.ctx);
-    expect(textOf(result)).toContain("Agent not found");
-    expect(runAgent).not.toHaveBeenCalled();
-  });
-
-  it("does not allocate a second successor when retained Work replay already records one", async () => {
-    const record = persistedRecord();
-    const recovery = {
-      mode: "prebind-recovery" as const,
-      predecessorAssignmentId,
-      predecessorLaunchKey: predecessorLaunch().launchKey,
-      proof: {
-        status: "error" as const, bound: false as const, reservationId: predecessorAssignmentId,
-        toolUses: 0 as const,
-        usage: { input: 0 as const, output: 0 as const, cacheWrite: 0 as const, cacheRead: 0 as const, cost: 0 as const },
-        resultPresent: false as const, substantiveOutputPresent: false as const,
-      },
-    };
-    const successorId = "fedcba98-7654-321";
-    const successor = {
-      ...predecessorLaunch(),
-      launchKey: workLaunchKey("parent-session", "successor-call"),
-      invocationId: "successor-call",
-      agentId: successorId,
-      recovery,
-    };
-    const harness = await boot(record, [{
-      customType: "subagents:work-record",
-      data: { version: 1, launch: successor, status: "running" },
-    }]);
-    harnesses.push(harness);
-
-    const result = await harness.tools.get("Agent").execute("recovery-call", resumeParams, undefined, undefined, harness.ctx);
-    expect(textOf(result)).toContain(successorId);
-    expect(runAgent).not.toHaveBeenCalled();
-    expect(harness.adapter.requests.reserve).toHaveLength(0);
-  });
-
-  it("retains the typed recovery descriptor through Work snapshot replay", () => {
-    const recovery = {
-      mode: "prebind-recovery" as const,
-      predecessorAssignmentId,
-      predecessorLaunchKey: predecessorLaunch().launchKey,
-      proof: {
-        status: "error" as const,
-        bound: false as const,
-        reservationId: predecessorAssignmentId,
-        toolUses: 0 as const,
-        usage: { input: 0 as const, output: 0 as const, cacheWrite: 0 as const, cacheRead: 0 as const, cost: 0 as const },
-        resultPresent: false as const,
-        substantiveOutputPresent: false as const,
-      },
-    };
-    const launch = {
-      ...predecessorLaunch(),
-      launchKey: workLaunchKey("parent-session", "successor-call"),
-      invocationId: "successor-call",
-      agentId: "fedcba98-7654-321",
-      recovery,
-    };
-    const [snapshot] = retainedWorkSnapshots([{ customType: "subagents:work-record", data: { version: 1, launch, status: "running" } }]);
-    expect(snapshot.launch.recovery).toEqual(recovery);
+    expect(adapter.requests.reserve).toHaveLength(0);
   });
 });

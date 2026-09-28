@@ -2853,6 +2853,7 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       try {
+        manager.observeWorkPromptDelivery(record);
         await steerAgent(record.session, params.message);
         pi.events.emit("subagents:steered", { id: record.id, ...(!record.workLaunch && { message: params.message }) });
         const tokens = formatLifetimeTokens(record);

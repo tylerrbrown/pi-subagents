@@ -2654,6 +2654,7 @@ Terse command-style prompts produce shallow, generic work.
                 return textResult(`Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
             }
             try {
+                manager.observeWorkPromptDelivery(record);
                 await steerAgent(record.session, params.message);
                 pi.events.emit("subagents:steered", { id: record.id, ...(!record.workLaunch && { message: params.message }) });
                 const tokens = formatLifetimeTokens(record);

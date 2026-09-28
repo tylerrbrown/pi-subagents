@@ -298,6 +298,7 @@ export function createNestedSubagentTools(context) {
                 return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
             }
             try {
+                context.manager.observeWorkPromptDelivery(record);
                 await record.session.steer(params.message);
             }
             catch (err) {

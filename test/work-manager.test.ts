@@ -71,7 +71,7 @@ describe("Work manager launch boundary", () => {
     const id = spawn(); await settle(id);
     manager.abort(id); await manager.dispose();
     expect(adapter.requests.finalize).toHaveLength(1);
-    expect(adapter.requests.finalize[0].status).toBe(status);
+    expect(adapter.requests.finalize[0].proof?.terminalStatus ?? adapter.requests.finalize[0].status).toBe(status);
   });
   it("abort while reserve is pending never starts a child or duplicates finalize", async () => {
     adapter.held.add("reserve");
@@ -105,7 +105,7 @@ describe("Work manager launch boundary", () => {
     done.reject(new Error("late child failure"));
     await manager.getRecord(id)!.promise;
     expect(adapter.requests.finalize).toHaveLength(1);
-    expect(adapter.requests.finalize[0].status).toBe("stopped");
+    expect(adapter.requests.finalize[0].proof?.terminalStatus ?? adapter.requests.finalize[0].status).toBe("stopped");
   });
   it("queued cancellation never reserves or creates the cancelled child", async () => {
     const done = deferred<any>();
@@ -302,5 +302,302 @@ describe("Work manager launch boundary", () => {
     expect(resumeAgent).toHaveBeenCalledOnce();
     expect(adapter.requests.finalize).toHaveLength(2);
     expect(new Set(adapter.requests.finalize.map(r => r.launch.launchKey)).size).toBe(2);
+  });
+});
+
+describe("Work lifecycle-v2 observations", () => {
+  function observation(options: unknown, name: string): (...args: unknown[]) => unknown {
+    const callback = Reflect.get(options as object, name);
+    expect(callback, `${name} must be wired to the runner boundary`).toBeTypeOf("function");
+    return callback as (...args: unknown[]) => unknown;
+  }
+
+  function terminalProof() {
+    expect(adapter.requests.finalize).toHaveLength(1);
+    expect(adapter.requests.finalize[0].version).toBe(2);
+    return adapter.requests.finalize[0].proof;
+  }
+
+  it("emits explicit clean bound zero-turn proof after run settlement", async () => {
+    const done = deferred<any>();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const id = spawn();
+    await manager.awaitStartup(id);
+    expect(adapter.requests.finalize).toHaveLength(0);
+    expect(adapter.entries.some(entry => entry.data?.proof?.terminalStatus)).toBe(false);
+
+    done.resolve({ session, responseText: "", aborted: false, steered: false, failure: "provider unavailable" });
+    await manager.getRecord(id)!.promise;
+    expect(terminalProof()).toMatchObject({
+      schemaVersion: 2,
+      reservationId: "reservation-04",
+      launchKey: adapter.requests.reserve[0].launchKey,
+      childSessionId: "actual-child-session",
+      bound: true,
+      promptDelivered: false,
+      modelTurnCount: 0,
+      toolUseCount: 0,
+      resultProduced: false,
+      terminalStatus: "error",
+      startupEffectsAbsent: false,
+    });
+  });
+
+  it("marks a pending steer delivered before invoking the newly bound session", async () => {
+    adapter.held.add("bind");
+    const steer = vi.fn(async () => {
+      const record = manager.getRecord(id)!;
+      expect(Reflect.get(manager, "workProofs").get(record).promptDelivered).toBe(true);
+    });
+    session.steer = steer;
+    const done = deferred<any>();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const id = spawn();
+    await vi.waitFor(() => expect(adapter.requests.bind).toHaveLength(1));
+    expect(manager.steer(id, "queued steer")).toBe(true);
+    adapter.reply("bind", adapter.requests.bind[0]);
+    await manager.awaitStartup(id);
+    expect(steer).toHaveBeenCalledWith("queued steer");
+    done.resolve({ session, responseText: "", aborted: false, steered: false, failure: "synthetic failure" });
+    await manager.getRecord(id)!.promise;
+    expect(terminalProof()).toMatchObject({ promptDelivered: true });
+  });
+
+  it("marks a reachable bound session steer delivered before invoking session.steer", async () => {
+    const done = deferred<any>();
+    const steer = vi.fn(async () => {
+      const record = manager.getRecord(id)!;
+      expect(Reflect.get(manager, "workProofs").get(record).promptDelivered).toBe(true);
+    });
+    session.steer = steer;
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const id = spawn();
+    await manager.awaitStartup(id);
+    expect(manager.steer(id, "live steer")).toBe(true);
+    expect(steer).toHaveBeenCalledWith("live steer");
+    done.resolve({ session, responseText: "", aborted: false, steered: false, failure: "synthetic failure" });
+    await manager.getRecord(id)!.promise;
+    expect(terminalProof()).toMatchObject({ promptDelivered: true });
+  });
+
+  it("marks a reachable bound resume steer delivered before invoking session.steer", async () => {
+    const id = spawn(); await settle(id);
+    const resumed = deferred<any>();
+    const steer = vi.fn(async () => {
+      const record = manager.getRecord(id)!;
+      expect(Reflect.get(manager, "workProofs").get(record).promptDelivered).toBe(true);
+    });
+    session.steer = steer;
+    vi.mocked(resumeAgent).mockImplementation(() => resumed.promise);
+    const continuation = manager.resume(id, "resume prompt", undefined, { toolCallId: "steered-resume" });
+    await vi.waitFor(() => expect(resumeAgent).toHaveBeenCalledOnce());
+    expect(manager.steer(id, "resume steer")).toBe(true);
+    expect(steer).toHaveBeenCalledWith("resume steer");
+    resumed.resolve({ text: "", failure: "synthetic failure" });
+    await continuation;
+    expect(adapter.requests.finalize.at(-1).proof).toMatchObject({ promptDelivered: true });
+  });
+
+  it("keeps terminal-looking error, abort, and shutdown states on v1 until the run fence is confirmed", async () => {
+    const done = deferred<any>();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      return done.promise;
+    });
+    const id = spawn();
+    await manager.awaitStartup(id);
+    const record = manager.getRecord(id)!;
+    const snapshot = () => Reflect.get(manager, "workSnapshot").call(manager, record);
+
+    for (const status of ["error", "aborted", "stopped"] as const) {
+      record.status = status;
+      expect(snapshot()).toMatchObject({ version: 1, status });
+      expect(snapshot()).not.toHaveProperty("proof");
+    }
+
+    const observationState = Reflect.get(manager, "workProofs").get(record);
+    observationState.fenced = true;
+    observationState.settled = true;
+    expect(snapshot()).toMatchObject({ version: 2, proof: { terminalStatus: "stopped" } });
+
+    observationState.settled = false;
+    record.status = "running";
+    done.resolve({ session, responseText: "done", aborted: false, steered: false });
+    await record.promise;
+    expect(terminalProof()).toMatchObject({ terminalStatus: "completed" });
+  });
+
+  it("counts a failed model attempt even when no assistant turn completes", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      observation(opts, "onPromptDelivered")();
+      observation(opts, "onModelAttemptStart")();
+      return { session, responseText: "", aborted: false, steered: false, failure: "synthetic provider failure" } as any;
+    });
+    const id = spawn(); await settle(id);
+    expect(terminalProof()).toMatchObject({ promptDelivered: true, modelTurnCount: 1, resultProduced: false });
+  });
+
+  it("counts tool dispatch before execution completes", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      observation(opts, "onToolDispatch")();
+      throw new Error("interrupted after dispatch");
+    });
+    const id = spawn();
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)!.promise;
+    expect(terminalProof()).toMatchObject({ toolUseCount: 1, resultProduced: false, terminalStatus: "error" });
+  });
+
+  it("records prompt, result, and startup-effect observations without inferring from billing", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      observation(opts, "onStartupEffectsObserved")(false);
+      observation(opts, "onPromptDelivered")();
+      observation(opts, "onResultProduced")();
+      return { session, responseText: "result payload", aborted: false, steered: false } as any;
+    });
+    const id = spawn(); await settle(id);
+    expect(terminalProof()).toMatchObject({
+      promptDelivered: true,
+      modelTurnCount: 0,
+      toolUseCount: 0,
+      resultProduced: true,
+      startupEffectsAbsent: false,
+      terminalStatus: "completed",
+    });
+  });
+
+  it("emits explicit bound=false proof for a settled, fenced bind refusal", async () => {
+    adapter.refused.add("bind");
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      try {
+        await opts!.onSessionCreated?.(session);
+      } catch (error) {
+        observation(opts, "onSessionFenced")(true);
+        throw error;
+      }
+      return { session, responseText: "", aborted: false, steered: false };
+    });
+    const id = spawn();
+    await expect(manager.awaitStartup(id)).rejects.toThrow("refused");
+    expect(terminalProof()).toMatchObject({
+      schemaVersion: 2,
+      reservationId: "reservation-04",
+      childSessionId: "actual-child-session",
+      bound: false,
+      promptDelivered: false,
+      modelTurnCount: 0,
+      toolUseCount: 0,
+      resultProduced: false,
+      startupEffectsAbsent: false,
+      terminalStatus: "error",
+    });
+  });
+
+  it("keeps a no-extensions bindExtensions failure non-authorizing when clean startup was never confirmed", async () => {
+    session.bindExtensions = vi.fn(async () => { throw new Error("synthetic extension bind failure"); });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      try {
+        await session.bindExtensions();
+      } catch (error) {
+        observation(opts, "onSessionFenced")(true);
+        throw error;
+      }
+      observation(opts, "onStartupEffectsObserved")(true);
+      return { session, responseText: "", aborted: false, steered: false };
+    });
+
+    const id = spawn();
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)!.promise;
+
+    expect(session.bindExtensions).toHaveBeenCalledOnce();
+    expect(adapter.requests.finalize).toHaveLength(1);
+    expect(adapter.requests.finalize[0]).toMatchObject({
+      version: 2,
+      proof: { terminalStatus: "error", startupEffectsAbsent: false },
+    });
+    expect(JSON.stringify(adapter.requests.finalize[0])).not.toContain('"startupEffectsAbsent":true');
+  });
+
+  it("confirms no-extensions clean startup only after bindExtensions returns", async () => {
+    const binding = deferred<void>();
+    session.bindExtensions = vi.fn(() => binding.promise);
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      await session.bindExtensions();
+      observation(opts, "onStartupEffectsObserved")(true);
+      return { session, responseText: "", aborted: false, steered: false, failure: "synthetic post-bind failure" } as any;
+    });
+
+    const id = spawn();
+    await manager.awaitStartup(id);
+    await vi.waitFor(() => expect(session.bindExtensions).toHaveBeenCalledOnce());
+    const record = manager.getRecord(id)!;
+    expect(Reflect.get(manager, "workProofs").get(record).startupEffectsAbsent).toBe(false);
+    binding.resolve();
+    await record.promise;
+
+    expect(terminalProof()).toMatchObject({ startupEffectsAbsent: true, terminalStatus: "error" });
+  });
+
+  it.each(["aborted", "stopped"] as const)("keeps an actionable %s session on v1 until shutdown and disposal complete", async status => {
+    const run = deferred<any>();
+    const shutdown = deferred<void>();
+    const emit = vi.fn(() => shutdown.promise);
+    session.extensionRunner = { hasHandlers: (event: string) => event === "session_shutdown", emit };
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      return run.promise;
+    });
+
+    const id = spawn();
+    await manager.awaitStartup(id);
+    if (status === "stopped") manager.abort(id);
+    run.resolve({ session, responseText: "", aborted: status === "aborted", steered: false });
+    await vi.waitFor(() => expect(emit).toHaveBeenCalledOnce());
+
+    const record = manager.getRecord(id)!;
+    const pending = Reflect.get(manager, "workSnapshot").call(manager, record);
+    expect(pending).toMatchObject({ version: 1, status });
+    expect(pending).not.toHaveProperty("proof");
+    expect(session.dispose).not.toHaveBeenCalled();
+
+    shutdown.resolve();
+    await record.promise;
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(terminalProof()).toMatchObject({ terminalStatus: status });
+  });
+
+  it.each(["aborted", "stopped"] as const)("keeps %s on v1 when actionable-session disposal fails", async status => {
+    const run = deferred<any>();
+    session.dispose = vi.fn(() => { throw new Error("synthetic disposal failure"); });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _input, opts) => {
+      await opts!.onSessionCreated?.(session);
+      return run.promise;
+    });
+
+    const id = spawn();
+    await manager.awaitStartup(id);
+    if (status === "stopped") manager.abort(id);
+    run.resolve({ session, responseText: "", aborted: status === "aborted", steered: false });
+    await manager.getRecord(id)!.promise;
+
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(adapter.requests.finalize).toHaveLength(1);
+    expect(adapter.requests.finalize[0]).toMatchObject({ version: 1, status });
+    expect(adapter.requests.finalize[0]).not.toHaveProperty("proof");
   });
 });

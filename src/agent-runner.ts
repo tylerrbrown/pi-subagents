@@ -509,6 +509,14 @@ export interface RunOptions extends AgentCapabilityAdditions {
   onSessionCreated?: (session: AgentSession) => void | Promise<void>;
   /** Bound launches authorize the child before extension session_start handlers. */
   bindBeforeExtensions?: boolean;
+  /** Lifecycle observations are called before their corresponding side effect. */
+  onPromptDelivered?: () => void;
+  onModelAttemptStart?: () => void;
+  onToolDispatch?: () => void;
+  onResultProduced?: () => void;
+  onStartupEffectsObserved?: (absent: boolean) => void;
+  /** Reports whether a startup failure synchronously disposed the child. */
+  onSessionFenced?: (fenced: boolean) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /**
@@ -639,6 +647,18 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   if (sessionDir === "~" || sessionDir.startsWith("~/")) return resolve(homedir(), sessionDir.slice(2));
   if (isAbsolute(sessionDir)) return sessionDir;
   return resolve(cwd, sessionDir);
+}
+
+/** Observe extension startup as clean only after binding returns successfully. */
+export async function bindExtensionsWithStartupObservation(
+  session: AgentSession,
+  noExtensions: boolean,
+  observe: ((absent: boolean) => void) | undefined,
+  onError: (error: { extensionPath: string }) => void,
+): Promise<void> {
+  observe?.(false);
+  await session.bindExtensions({ onError });
+  if (noExtensions) observe?.(true);
 }
 
 export async function runAgent(
@@ -1040,23 +1060,28 @@ export async function runAgent(
       await options.onSessionCreated?.(session);
       if (options.signal?.aborted) throw new Error("Agent startup cancelled before prompt.");
     } catch (error) {
-      session.dispose();
+      try {
+        session.dispose();
+        options.onSessionFenced?.(true);
+      } catch { options.onSessionFenced?.(false); }
       throw error;
     }
   }
 
-  // Bind extensions so that session_start fires and extensions can initialize
-  // (e.g. loading credentials, setting up state). Tool gating already happened
-  // at session construction via the `tools:` allowlist above — no separate
-  // post-bind filter is needed. All ExtensionBindings fields are optional.
-  await session.bindExtensions({
-    onError: (err) => {
+  // Bind extensions so that session_start fires and extensions can initialize.
+  // Even with no configured extensions, clean startup is known only after this
+  // awaited boundary returns successfully.
+  await bindExtensionsWithStartupObservation(
+    session,
+    noExtensions,
+    options.onStartupEffectsObserved,
+    (err) => {
       options.onToolActivity?.({
         type: "end",
         toolName: `extension-error:${err.extensionPath}`,
       });
     },
-  });
+  );
 
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
@@ -1086,12 +1111,14 @@ export async function runAgent(
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "turn_start") options.onModelAttemptStart?.();
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
+          options.onPromptDelivered?.();
           session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
@@ -1104,15 +1131,18 @@ export async function runAgent(
     }
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       currentMessageText += event.assistantMessageEvent.delta;
+      if (event.assistantMessageEvent.delta.length > 0) options.onResultProduced?.();
       options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
     }
     if (event.type === "tool_execution_start") {
+      options.onToolDispatch?.();
       options.onToolActivity?.({ type: "start", toolName: event.toolName });
     }
     if (event.type === "tool_execution_end") {
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
+      if (Array.isArray(event.message.content) && extractText(event.message.content).length > 0) options.onResultProduced?.();
       const u = (event.message as any).usage;
       if (u) options.onAssistantUsage?.({
         input: u.input ?? 0,
@@ -1150,6 +1180,7 @@ export async function runAgent(
   const startLen = session.messages.length;
   let timedOut = false;
   try {
+    options.onPromptDelivered?.();
     const promptRun = session.prompt(effectivePrompt).then(() => false);
     try {
       timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
@@ -1188,6 +1219,10 @@ export async function resumeAgent(
     onTurnEnd?: (turnCount: number) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+    onPromptDelivered?: () => void;
+    onModelAttemptStart?: () => void;
+    onToolDispatch?: () => void;
+    onResultProduced?: () => void;
     signal?: AbortSignal;
     /** Wall-clock ceiling for this resume, in ms. 0/undefined = project default. */
     runDeadlineMs?: number;
@@ -1207,17 +1242,24 @@ export async function resumeAgent(
 
   let currentMessageText = "";
   let turnCount = 0;
-  const unsubEvents = (options.onToolActivity || options.onTextDelta || options.onTurnEnd || options.onAssistantUsage || options.onCompaction)
+  const unsubEvents = (options.onToolActivity || options.onTextDelta || options.onTurnEnd || options.onAssistantUsage || options.onCompaction
+    || options.onModelAttemptStart || options.onToolDispatch || options.onResultProduced)
     ? session.subscribe((event: AgentSessionEvent) => {
         if (event.type === "message_start" && event.message.role === "assistant") currentMessageText = "";
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
           currentMessageText += event.assistantMessageEvent.delta;
+          if (event.assistantMessageEvent.delta.length > 0) options.onResultProduced?.();
           options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
         }
+        if (event.type === "turn_start") options.onModelAttemptStart?.();
         if (event.type === "turn_end") options.onTurnEnd?.(++turnCount);
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
+        if (event.type === "tool_execution_start") {
+          options.onToolDispatch?.();
+          options.onToolActivity?.({ type: "start", toolName: event.toolName });
+        }
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
+          if (Array.isArray(event.message.content) && extractText(event.message.content).length > 0) options.onResultProduced?.();
           const u = (event.message as any).usage;
           if (u) options.onAssistantUsage?.({
             input: u.input ?? 0,
@@ -1235,6 +1277,7 @@ export async function resumeAgent(
 
   let timedOut = false;
   try {
+    options.onPromptDelivered?.();
     const promptRun = session.prompt(prompt).then(() => false);
     try {
       timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
