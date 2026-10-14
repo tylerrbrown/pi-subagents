@@ -19,9 +19,10 @@ import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getDefaultRunDeadlineMs, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setDefaultRunDeadlineMs, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultContextThresholds, getDefaultMaxTurns, getDefaultRunDeadlineMs, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveContextThresholds, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultContextThresholds, setDefaultMaxTurns, setDefaultRunDeadlineMs, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveEnabledType, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { resolveContextThresholds } from "./context-guard.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -148,11 +149,12 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /** Human-readable status label for agent completion. */
-function getStatusLabel(status: string, error?: string): string {
+function getStatusLabel(status: string, error?: string, contextAborted = false, contextSteered = false): string {
   switch (status) {
+    case "skipped": return "Skipped (no child run; lead may continue)";
     case "error": return `Error: ${error ?? "unknown"}`;
-    case "aborted": return "Aborted (max turns exceeded)";
-    case "steered": return "Wrapped up (turn limit)";
+    case "aborted": return contextAborted ? "Aborted (context ceiling)" : "Aborted (max turns exceeded)";
+    case "steered": return contextSteered ? "Wrapped up (context warning)" : "Wrapped up (turn limit)";
     case "stopped": return "Stopped";
     case "timeout": return "Timed out (wall-clock deadline)";
     default: return "Done";
@@ -211,7 +213,7 @@ function getRecordOutputFile(record: NotificationRecord): string | undefined {
 
 /** Format one complete, bounded Claude Code-style task notification. */
 function formatTaskNotification(record: NotificationRecord, showCost = false): string {
-  const status = getStatusLabel(record.status, record.error ? boundedText(record.error, 160) : undefined);
+  const status = getStatusLabel(record.status, record.error ? boundedText(record.error, 160) : undefined, record.contextAborted === true, record.contextSteered === true);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
   const contextPercent = isPersistedRecord(record) ? record.contextPercent : getSessionContextPercent(record.session);
@@ -232,7 +234,7 @@ function formatTaskNotification(record: NotificationRecord, showCost = false): s
     record.toolCallId ? `<tool-use-id>${boundedXmlText(record.toolCallId, 300)}</tool-use-id>` : null,
     getRecordOutputFile(record) ? `<output-file>${boundedXmlText(getRecordOutputFile(record)!, 500)}</output-file>` : null,
     `<status>${boundedXmlText(status, 400)}</status>`,
-    `<summary>Agent "${boundedXmlText(record.description, 400)}" ${record.status}${getStatusNote(record.status, stopReasonOf(record))}</summary>`,
+    `<summary>Agent "${boundedXmlText(record.description, 400)}" ${record.status}${getStatusNote(record.status, stopReasonOf(record), record.contextAborted === true, record.contextSteered === true)}</summary>`,
     `<result>${boundedXmlText(resultPreview, 1_200)}</result>`,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
@@ -242,7 +244,7 @@ function formatTaskNotification(record: NotificationRecord, showCost = false): s
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; contextAborted?: boolean; contextSteered?: boolean; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -260,6 +262,8 @@ function buildDetails(
     status: record.status as AgentDetails["status"],
     agentId: record.id,
     error: record.error,
+    contextAborted: record.contextAborted,
+    contextSteered: record.contextSteered,
     ...overrides,
   };
 }
@@ -339,8 +343,9 @@ export default function (pi: ExtensionAPI) {
 
       function renderOne(d: NotificationDetails): string {
         const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted" || d.status === "timeout";
-        const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        const icon = d.status === "skipped" ? theme.fg("dim", "-") : isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
         const statusText = isError ? d.status
+          : d.status === "skipped" ? "skipped (no child run)"
           : d.status === "steered" ? "completed (steered)"
           : "completed";
 
@@ -515,6 +520,9 @@ export default function (pi: ExtensionAPI) {
       lifetimeUsage: { ...record.lifetimeUsage },
       compactionCount: record.compactionCount,
       contextPercent: getSessionContextPercent(record.session),
+      contextGuard: record.contextGuard && { ...record.contextGuard },
+      contextAborted: record.contextAborted,
+      contextSteered: record.contextSteered,
       toolCallId: record.toolCallId,
       work: record.work,
       workLaunch: record.workLaunch && structuredClone(record.workLaunch),
@@ -767,7 +775,9 @@ export default function (pi: ExtensionAPI) {
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted" || record.status === "timeout";
     const eventData = buildEventData(record);
-    if (isError) {
+    if (record.status === "skipped") {
+      pi.events.emit("subagents:skipped", eventData);
+    } else if (isError) {
       pi.events.emit("subagents:failed", eventData);
     } else {
       pi.events.emit("subagents:completed", eventData);
@@ -888,6 +898,8 @@ export default function (pi: ExtensionAPI) {
     // Bypasses handle allocation, so a forged value would duplicate a live
     // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
     delete safeOptions.reclaim;
+    // Retained guard state is issued only by a tombstone this extension wrote.
+    delete safeOptions.contextGuardState;
     // Work recovery authority is minted only from this session's normalized
     // durable ledger. RPC/registry callers cannot forge predecessor proof.
     delete safeOptions.recovery;
@@ -911,7 +923,7 @@ export default function (pi: ExtensionAPI) {
     const head =
       `Agent: ${entry.id}\n` +
       `Type: ${getDisplayName(entry.type)} | Status: ${entry.status}` +
-      `${getStatusNote(entry.status, entry.stopReason)} | Tool uses: ${entry.toolUses} | ` +
+      `${getStatusNote(entry.status, entry.stopReason, entry.contextAborted === true, entry.contextSteered === true)} | Tool uses: ${entry.toolUses} | ` +
       `Duration: ${formatDuration(entry.startedAt, entry.completedAt)}\n` +
       `Description: ${entry.description}\n` +
       "(This agent's record was swept from memory; its final result is below. " +
@@ -1026,6 +1038,7 @@ export default function (pi: ExtensionAPI) {
         manager: {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
+          getRecord: (id) => manager.getRecord(id),
           abort: (id) => {
             const record = manager.getRecord(id);
             return !record?.parentAgentId && manager.abort(id, "rpc");
@@ -1203,6 +1216,7 @@ export default function (pi: ExtensionAPI) {
           invocationId: randomUUID(),
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
+          contextGuardState: entry.contextGuard,
           isBackground: true,
         });
         await manager.awaitStartup(id);
@@ -1504,7 +1518,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; runDeadlineMs?: number; toolCallId?: string; work?: WorkBinding; cwd?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; contextWarnPercent?: number; contextStopPercent?: number; runDeadlineMs?: number; toolCallId?: string; work?: WorkBinding; cwd?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1542,6 +1556,8 @@ export default function (pi: ExtensionAPI) {
       invocationId: opts.toolCallId ?? randomUUID(),
       toolCallId: opts.toolCallId,
       runDeadlineMs: opts.runDeadlineMs,
+      contextWarnPercent: opts.contextWarnPercent,
+      contextStopPercent: opts.contextStopPercent,
       onToolActivity: bgCallbacks.onToolActivity,
       onTextDelta: bgCallbacks.onTextDelta,
       onTurnEnd: bgCallbacks.onTurnEnd,
@@ -1636,6 +1652,7 @@ export default function (pi: ExtensionAPI) {
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setDefaultMaxTurns,
+      setContextThresholds: setDefaultContextThresholds,
       setGraceTurns,
       setRunDeadlineMs: setDefaultRunDeadlineMs,
       setWaitCeilingMs,
@@ -1854,6 +1871,8 @@ Terse command-style prompts produce shallow, generic work.
           minimum: 1,
         }),
       ),
+      context_warn_percent: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 100, description: "Context wrap-up threshold; default 30%. Omission enables automatic protection. Must be below context_stop_percent; resumes retain prior thresholds unless explicitly overridden." })),
+      context_stop_percent: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 100, description: "Context abort threshold; default 50%. Preserves available partial output, not task completion. Must exceed context_warn_percent; cannot reset a prior hard stop." })),
       deadline_ms: Type.Optional(
         Type.Number({
           description:
@@ -1956,6 +1975,7 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // ---- Background agent launched ----
+      if (details.status === "skipped") return new Text(text, 0, 0);
       if (details.status === "background") {
         return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
       }
@@ -1981,7 +2001,7 @@ Terse command-style prompts produce shallow, generic work.
             }
           }
         } else {
-          const doneText = isSteered ? "Wrapped up (turn limit)" : "Done";
+          const doneText = isSteered ? (details.contextSteered ? "Wrapped up (context warning)" : "Wrapped up (turn limit)") : "Done";
           line += "\n" + theme.fg("dim", `  ⎿  ${doneText}`);
         }
         return new Text(line, 0, 0);
@@ -2010,7 +2030,7 @@ Terse command-style prompts produce shallow, generic work.
       } else if (details.status === "timeout") {
         line += "\n" + theme.fg("error", "  ⎿  Timed out (wall-clock deadline; partial output may be incomplete)");
       } else {
-        line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
+        line += "\n" + theme.fg("warning", details.contextAborted ? "  ⎿  Aborted (context ceiling)" : "  ⎿  Aborted (max turns exceeded)");
       }
 
       return new Text(line, 0, 0);
@@ -2121,6 +2141,11 @@ Terse command-style prompts produce shallow, generic work.
 
       const modelDescription = model ? describeModel(model) : {};
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
+      try {
+        if (!params.resume) resolveEffectiveContextThresholds(resolvedConfig.contextWarnPercent, resolvedConfig.contextStopPercent);
+      } catch (err) {
+        return textResult(err instanceof Error ? err.message : String(err));
+      }
       const agentInvocation: AgentInvocation = {
         ...modelDescription,
         ...describeRequestedModel(params.model ?? resolvedConfig.modelInput, ctx.modelRegistry),
@@ -2192,6 +2217,8 @@ Terse command-style prompts produce shallow, generic work.
             model: params.model as string | undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
+            context_warn_percent: resolvedConfig.contextWarnPercent,
+            context_stop_percent: resolvedConfig.contextStopPercent,
             isolated: isolated,
             isolation: isolation,
             cwd: params.cwd,
@@ -2252,6 +2279,16 @@ Terse command-style prompts produce shallow, generic work.
             if (typeof resolved === "string") return textResult(`Cannot recover agent "${params.resume}": ${resolved}`);
             recoveryModel = resolved;
           }
+          const recoveryThresholds = resolveContextThresholds(
+            { warn: resolvedConfig.contextWarnPercent, stop: resolvedConfig.contextStopPercent },
+            predecessor.contextGuard && { warn: predecessor.contextGuard.warnPercent, stop: predecessor.contextGuard.stopPercent },
+            undefined,
+          );
+          const recoveryGuardOptions = {
+            contextWarnPercent: recoveryThresholds.warn,
+            contextStopPercent: recoveryThresholds.stop,
+            contextGuardState: predecessor.contextGuard,
+          };
           const recoveryInvocation: AgentInvocation = { ...posture, runInBackground: runInBackground };
           const recoveryOutputTranscript = getAgentConfig(predecessor.type)?.outputTranscript ?? getOutputTranscriptDefault();
           const { state: recoveryState, callbacks: recoveryCallbacks } = createActivityTracker(posture.maxTurns);
@@ -2267,6 +2304,7 @@ Terse command-style prompts produce shallow, generic work.
               cwd: predecessor.workLaunch!.cwd,
               work: predecessor.work!,
               recovery,
+              ...recoveryGuardOptions,
               toolCallId,
               description: predecessor.description,
               model: recoveryModel,
@@ -2287,6 +2325,7 @@ Terse command-style prompts produce shallow, generic work.
             const successor = manager.getRecord(successorId);
             if (successor && recoveryOutputTranscript) attachTranscript(successor, successorId);
             await manager.awaitStartup(successorId);
+            if (successor?.status === "skipped") return textResult(successor.result ?? "Check skipped; no child ran.", buildDetails(detailBaseFor(successor), successor));
             agentActivity.set(successorId, recoveryState);
             widget.ensureTimer();
             widget.update();
@@ -2306,6 +2345,7 @@ Terse command-style prompts produce shallow, generic work.
             cwd: predecessor.workLaunch!.cwd,
             work: predecessor.work!,
             recovery,
+            ...recoveryGuardOptions,
             toolCallId,
             description: predecessor.description,
             model: recoveryModel,
@@ -2337,7 +2377,7 @@ Terse command-style prompts produce shallow, generic work.
             return textResult(`Agent failed: ${recovered.error}${getFailureNote(recovered.failureKind)}${partialOutputSuffix(recovered)}`);
           }
           if (recovered.status === "timeout") return textResult(`Agent timed out (wall-clock deadline).${partialOutputSuffix(recovered)}`);
-          return textResult(recovered.result?.trim() || "No output.");
+          return textResult(`Agent ${recovered.status}${getForegroundOutcomeNote(recovered.status, recovered.stopReason, recovered.contextAborted === true, recovered.contextSteered === true)}.\n\n${recovered.result?.trim() || "No output."}`);
         }
         // A detached resume hands control back while the record stays
         // "running", so nothing stops the model from resuming the same agent
@@ -2355,6 +2395,17 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
 
+        // Validate against the retained pair before any requested-posture or
+        // transcript mutation. A partial override must not use fresh defaults.
+        try {
+          resolveContextThresholds(
+            { warn: resolvedConfig.contextWarnPercent, stop: resolvedConfig.contextStopPercent },
+            existing.contextGuard && { warn: existing.contextGuard.warnPercent, stop: existing.contextGuard.stopPercent },
+            undefined,
+          );
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err));
+        }
         // A resume cannot change session settings, but retain what an accepted
         // call asked so any effective/requested difference remains visible.
         existing.invocation ??= {};
@@ -2370,6 +2421,8 @@ Terse command-style prompts produce shallow, generic work.
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
             maxTurns: effectiveMaxTurns,
+            contextWarnPercent: resolvedConfig.contextWarnPercent,
+            contextStopPercent: resolvedConfig.contextStopPercent,
             runDeadlineMs: params.deadline_ms,
             toolCallId,
             work,
@@ -2397,6 +2450,8 @@ Terse command-style prompts produce shallow, generic work.
           cwd: params.cwd,
           toolCallId,
           runDeadlineMs: params.deadline_ms,
+          contextWarnPercent: resolvedConfig.contextWarnPercent,
+          contextStopPercent: resolvedConfig.contextStopPercent,
         });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
@@ -2416,7 +2471,7 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(`Agent timed out (wall-clock deadline).${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
         }
         return textResult(
-          record.result?.trim() || "No output.",
+          `Agent ${record.status}${getForegroundOutcomeNote(record.status, record.stopReason, record.contextAborted === true, record.contextSteered === true)}.\n\n${record.result?.trim() || "No output."}`,
           buildDetails(detailBaseFor(record), record),
         );
       }
@@ -2449,6 +2504,8 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          contextWarnPercent: resolvedConfig.contextWarnPercent,
+          contextStopPercent: resolvedConfig.contextStopPercent,
           runDeadlineMs: params.deadline_ms as number | undefined,
           isolated,
           inheritContext,
@@ -2473,6 +2530,11 @@ Terse command-style prompts produce shallow, generic work.
 
         // The copy is asynchronous; preserve the tool-error contract on failure.
         await manager.awaitStartup(id);
+
+        if (record?.status === "skipped") {
+          record.resultConsumed = true;
+          return textResult(record.result ?? "Check skipped; no child ran.", buildDetails(detailBaseFor(record), record));
+        }
 
         if (joinMode == null || joinMode === 'async') {
           // Foreground/no join mode or explicit async — not part of any batch
@@ -2587,6 +2649,8 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          contextWarnPercent: resolvedConfig.contextWarnPercent,
+          contextStopPercent: resolvedConfig.contextStopPercent,
           runDeadlineMs: params.deadline_ms as number | undefined,
           isolated,
           inheritContext,
@@ -2622,6 +2686,8 @@ Terse command-style prompts produce shallow, generic work.
 
       const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
 
+      if (record.status === "skipped") return textResult(record.result ?? "Check skipped; no child ran.", details);
+
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
         return textResult(`${fallbackNote}Agent failed: ${record.error}${getFailureNote(record.failureKind)}${partialOutputSuffix(record)}`, details);
@@ -2638,7 +2704,7 @@ Terse command-style prompts produce shallow, generic work.
         if (costText) statsParts.push(costText);
       }
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status, record.stopReason)}.\n\n` +
+        `${fallbackNote}Agent ${record.status} in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status, record.stopReason, record.contextAborted === true, record.contextSteered === true)}.\n\n` +
         (record.result?.trim() || "No output."),
         details,
       );
@@ -2776,7 +2842,7 @@ Terse command-style prompts produce shallow, generic work.
 
       let output =
         `Agent: ${record.id}\n` +
-        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status, stopReasonOf(record))} | ${statsParts.join(" | ")}\n` +
+        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status, stopReasonOf(record), record.contextAborted === true, record.contextSteered === true)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
       if (record.status === "running" || record.status === "queued") {
@@ -3045,6 +3111,10 @@ Terse command-style prompts produce shallow, generic work.
 
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
     if (!record.session) {
+      if (record.status === "skipped") {
+        ctx.ui.notify("Check skipped. No child ran or verification passed; the lead may continue other work.", "info");
+        return;
+      }
       ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no session available.`, "info");
       return;
     }
@@ -3100,6 +3170,8 @@ Definitions are read-only in /agents.`,
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
+      contextWarnPercent: getDefaultContextThresholds().warn,
+      contextStopPercent: getDefaultContextThresholds().stop,
       graceTurns: getGraceTurns(),
       // 0 = unlimited, same convention as defaultMaxTurns above.
       runDeadlineMs: getDefaultRunDeadlineMs() ?? 0,

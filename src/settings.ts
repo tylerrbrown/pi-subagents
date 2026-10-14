@@ -18,6 +18,9 @@ export interface SubagentsSettings {
    * `/agents` → Settings input prompt explicitly says "0 = unlimited".
    */
   defaultMaxTurns?: number;
+  /** Context guard defaults. Omitted activates the built-in 30% warning / 50% stop. */
+  contextWarnPercent?: number;
+  contextStopPercent?: number;
   graceTurns?: number;
   /**
    * Wall-clock ceiling on one agent RUN, in milliseconds. `0` or omitted =
@@ -272,6 +275,7 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
+  setContextThresholds?: (warn: number | undefined, stop: number | undefined) => void;
   setGraceTurns: (n: number) => void;
   setRunDeadlineMs: (n: number | undefined) => void;
   setWaitCeilingMs: (n: number | undefined) => void;
@@ -332,6 +336,12 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.defaultMaxTurns as number) <= MAX_TURNS_CEILING
   ) {
     out.defaultMaxTurns = r.defaultMaxTurns as number;
+  }
+  if (Number.isFinite(r.contextWarnPercent) && (r.contextWarnPercent as number) > 0 && (r.contextWarnPercent as number) <= 100) {
+    out.contextWarnPercent = r.contextWarnPercent as number;
+  }
+  if (Number.isFinite(r.contextStopPercent) && (r.contextStopPercent as number) > 0 && (r.contextStopPercent as number) <= 100) {
+    out.contextStopPercent = r.contextStopPercent as number;
   }
   if (
     Number.isInteger(r.graceTurns) &&
@@ -456,6 +466,15 @@ export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
   for (const scope of projectReadScopes(cwd)) {
     Object.assign(settings, readSettingsFile(projectPath(scope)));
   }
+  // Settings scopes merge field-wise, so validate the final pair only after
+  // global/ancestor/project precedence is complete. Invalid hand edits fail
+  // safe to built-ins instead of taking extension startup down.
+  const warn = settings.contextWarnPercent ?? 30;
+  const stop = settings.contextStopPercent ?? 50;
+  if (warn >= stop) {
+    delete settings.contextWarnPercent;
+    delete settings.contextStopPercent;
+  }
   return settings;
 }
 
@@ -479,6 +498,9 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
 export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers): void {
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
+  if (s.contextWarnPercent !== undefined || s.contextStopPercent !== undefined) {
+    appliers.setContextThresholds?.(s.contextWarnPercent, s.contextStopPercent);
+  }
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.runDeadlineMs === "number") appliers.setRunDeadlineMs(s.runDeadlineMs);
   if (typeof s.waitCeilingMs === "number") appliers.setWaitCeilingMs(s.waitCeilingMs);

@@ -40,8 +40,8 @@ function formatRecord(record, position) {
     // leads — appended, it would look like part of the child's own output.
     const text = record.result?.trim() || record.error?.trim() || "No output.";
     const note = position === "inline"
-        ? getForegroundOutcomeNote(record.status)
-        : getStatusNote(record.status);
+        ? getForegroundOutcomeNote(record.status, record.stopReason, record.contextAborted === true, record.contextSteered === true)
+        : getStatusNote(record.status, record.stopReason, record.contextAborted === true, record.contextSteered === true);
     return note ? `Nested agent${note}.\n\n${text}` : text;
 }
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
@@ -238,6 +238,9 @@ export function createNestedSubagentTools(context) {
                     // asynchronously inside runAgent, so the file is attached in time.
                     attachTranscript(id);
                     await context.manager.awaitStartup(id);
+                    const record = context.manager.getRecord(id);
+                    if (record?.status === "skipped")
+                        return textResult(formatRecord(record, "inline"));
                     return textResult(`Nested agent started in background. Agent ID: ${id}`);
                 }
                 const { record } = await context.manager.spawnAndWait(context.pi, ctx, resolvedType, params.prompt, { ...options, signal }, attachTranscript);

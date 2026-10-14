@@ -4,6 +4,7 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { ContextGuardState } from "./context-guard.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { WorkBinding, WorkLaunch } from "./work-lifecycle.js";
 
@@ -20,7 +21,7 @@ export type SubagentType = string;
  * which is the only one of the three an operator can fix by raising a number.
  */
 export type AgentStatus =
-  | "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error";
+  | "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error" | "skipped";
 
 /** How a failed run failed, for the parent's benefit. */
 export type RunFailureKind = "overload" | "other";
@@ -173,6 +174,10 @@ export interface AgentTombstone {
   status: AgentStatus;
   /** Who or what ended it, when that wasn't a clean completion. */
   stopReason?: StopReason;
+  contextGuard?: ContextGuardState;
+  contextAborted?: boolean;
+  /** This run received the context guard's wrap-up warning. */
+  contextSteered?: boolean;
   /**
    * The run's final output. Kept so a result collected after eviction returns
    * the work instead of `Agent not found` — the failure that made every sibling
@@ -222,6 +227,12 @@ export interface AgentRecord {
   stopReason?: StopReason;
   /** Set when `status === "error"`: whether the provider was overloaded or the run itself failed. */
   failureKind?: RunFailureKind;
+  /** Context guard state retained through compaction and resume. */
+  contextGuard?: ContextGuardState;
+  /** A hard context ceiling ended this run; partial output remains available. */
+  contextAborted?: boolean;
+  /** This run received the context guard's wrap-up warning. */
+  contextSteered?: boolean;
   result?: string;
   error?: string;
   toolUses: number;
@@ -362,6 +373,8 @@ export interface ScheduledSubagent {
   model?: string;
   thinking?: ThinkingLevel;
   max_turns?: number;
+  context_warn_percent?: number;
+  context_stop_percent?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
 
@@ -370,7 +383,7 @@ export interface ScheduledSubagent {
   /** ISO timestamp. */
   createdAt: string;
   lastRun?: string;
-  lastStatus?: "success" | "error" | "running";
+  lastStatus?: "success" | "error" | "running" | "skipped";
   /** Refreshed on every fire and on store load. */
   nextRun?: string;
   runCount: number;

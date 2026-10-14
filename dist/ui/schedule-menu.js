@@ -31,6 +31,8 @@ function relTime(iso, now = Date.now()) {
 }
 /** One-line status icon. */
 function statusIcon(j) {
+    if (j.lastStatus === "skipped")
+        return "- skipped (no child run)";
     if (!j.enabled)
         return "✗";
     if (j.lastStatus === "error")

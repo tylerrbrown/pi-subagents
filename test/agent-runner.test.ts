@@ -1,6 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withSyntheticEnvironment } from "./helpers/work-adapter.js";
 
@@ -45,12 +46,13 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
 
     async reload() {
-      // Mirror the real loader: `noExtensions: true` zeros out the discovered set
-      // entirely. Otherwise tests pre-register the extensions a path should
-      // resolve to; an unregistered path simply yields no extension (a failed load).
+      // noExtensions disables discovery, not explicit additionalExtensionPaths.
+      // Tests pre-register the paths that resolve; unknown paths do not load.
       if (this.opts.noExtensions) {
-        loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
-        return;
+        loaderExtensionsRef.current = { ...loaderExtensionsRef.current,
+          extensions: loaderExtensionsRef.current.extensions.filter(entry =>
+            (this.opts.additionalExtensionPaths ?? []).includes(entry.path)),
+        };
       }
       if (this.opts.extensionsOverride) {
         loaderExtensionsRef.current = this.opts.extensionsOverride(loaderExtensionsRef.current);
@@ -132,6 +134,7 @@ import {
   resumeAgent,
   runAgent,
   SUBAGENT_TOOL_NAMES,
+  setDefaultContextThresholds,
   setDefaultMaxTurns,
   setGraceTurns,
   setRememberAgents,
@@ -196,6 +199,25 @@ const ctx = {
 
 const pi = {} as any;
 
+function workRunnerFixture(session: ReturnType<typeof createSession>["session"]) {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "work-runner-unit-")));
+  execFileSync("git", ["init", "--quiet", cwd], { windowsHide: true, stdio: "pipe" });
+  const compiled = join(cwd, ".pi", "extensions-dist");
+  mkdirSync(compiled, { recursive: true });
+  const guard = join(compiled, "work-agent-binding.js");
+  copyFileSync(resolve(homedir(), "SynologyDrive/Claude/.pi/extensions-dist/work-agent-binding.js"), guard);
+  withExtensions({ [guard]: [] });
+  let bound = false;
+  Object.assign(session, { sessionManager: {
+    getSessionId: () => "work-fixture-child",
+    getBranch: () => bound ? [{ type: "custom", customType: "work-bound-session",
+      data: { schemaVersion: 1, childSessionId: "work-fixture-child", caseHandle: "fixture-case",
+        executionId: "fixture-execution", assignmentId: "fixture-assignment", launchKey: "fixture-launch" } }] : [],
+  } });
+  return { cwd, guard, bind: () => { bound = true; },
+    cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
+}
+
 beforeEach(() => {
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
@@ -206,6 +228,7 @@ beforeEach(() => {
   // The setting is process-global; a test that flips it must not leak the
   // flip into the next one.
   setRememberAgents(true);
+  setDefaultContextThresholds(undefined, undefined);
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
@@ -213,6 +236,33 @@ beforeEach(() => {
   vi.mocked(preloadSkills).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
+});
+
+describe("agent-runner context guard", () => {
+  it("refuses a fresh child before its first model prompt at the hard context ceiling", async () => {
+    const { session } = createSession("unused");
+    (session as any).getSessionStats = vi.fn(() => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: 50 } }));
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.contextAborted).toBe(true);
+    expect(result.responseText).toBe("");
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("refuses a resumed child from its persisted hard-stop state before prompting", async () => {
+    const { session } = createSession("unused");
+    (session as any).getSessionStats = vi.fn(() => ({ tokens: { input: 0, output: 0, cacheWrite: 0 }, contextUsage: { percent: null } }));
+
+    const result = await resumeAgent(session as any, "continue", {
+      contextGuardState: { warnPercent: 30, stopPercent: 50, warned: false, peakPercent: 55, stopped: true },
+    });
+
+    expect(result.contextAborted).toBe(true);
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
 });
 
 describe("agent-runner final output capture", () => {
@@ -227,51 +277,59 @@ describe("agent-runner final output capture", () => {
 
   it("forwards exact caller cwd to child constructors without global cwd/environment writes", async () => {
     const { session } = createSession("done");
+    const fixture = workRunnerFixture(session);
     createAgentSession.mockResolvedValue({ session });
     const original = process.cwd();
-    const cwd = `${original}/.`;
+    const cwd = `${fixture.cwd}/.`;
     const chdir = vi.spyOn(process, "chdir");
     try {
       await withSyntheticEnvironment(async writes => {
-        await runAgent(ctx, "Explore", "go", { pi, cwd, bindBeforeExtensions: true, onSessionCreated: async () => {} });
+        await runAgent(ctx, "Explore", "go", { pi, cwd, bindBeforeExtensions: true, onSessionCreated: async () => { fixture.bind(); } });
         expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
         expect(defaultResourceLoaderCtor).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
+        expect(defaultResourceLoaderCtor).toHaveBeenCalledWith(expect.objectContaining({ additionalExtensionPaths: [fixture.guard] }));
         expect(sessionManagerCreate.mock.calls[0][0]).toBe(cwd);
         expect(process.cwd()).toBe(original);
         expect(chdir).not.toHaveBeenCalled();
         expect(writes).not.toHaveBeenCalled();
       });
-    } finally { chdir.mockRestore(); }
+    } finally { chdir.mockRestore(); fixture.cleanup(); }
   });
 
   it("awaits Work binding before extension initialization or prompt execution", async () => {
     const { session } = createSession("BOUND");
+    const fixture = workRunnerFixture(session);
     createAgentSession.mockResolvedValue({ session });
     let authorize!: () => void;
     const binding = new Promise<void>(resolve => { authorize = resolve; });
-    const onSessionCreated = vi.fn(() => binding);
-    const running = runAgent(ctx, "Explore", "go", { pi, bindBeforeExtensions: true, onSessionCreated });
-    await vi.waitFor(() => expect(onSessionCreated).toHaveBeenCalledWith(session));
-    expect(session.bindExtensions).not.toHaveBeenCalled();
-    expect(session.prompt).not.toHaveBeenCalled();
-    authorize();
-    await running;
-    expect(session.bindExtensions).toHaveBeenCalledOnce();
-    expect(session.prompt).toHaveBeenCalledOnce();
+    const onSessionCreated = vi.fn(async () => { await binding; fixture.bind(); });
+    try {
+      const running = runAgent(ctx, "Explore", "go", { pi, cwd: fixture.cwd, bindBeforeExtensions: true, onSessionCreated });
+      await vi.waitFor(() => expect(onSessionCreated).toHaveBeenCalledWith(session));
+      expect(session.bindExtensions).not.toHaveBeenCalled();
+      expect(session.prompt).not.toHaveBeenCalled();
+      authorize();
+      await running;
+      expect(session.bindExtensions).toHaveBeenCalledOnce();
+      expect(session.prompt).toHaveBeenCalledOnce();
+    } finally { fixture.cleanup(); }
   });
 
   it("disposes a child whose Work bind fails without initializing extensions or prompting", async () => {
     const { session } = createSession("NEVER");
+    const fixture = workRunnerFixture(session);
     const dispose = vi.fn();
     Object.assign(session, { dispose });
     createAgentSession.mockResolvedValue({ session });
-    await expect(runAgent(ctx, "Explore", "go", {
-      pi, bindBeforeExtensions: true,
-      onSessionCreated: async () => { throw new Error("binding refused"); },
-    })).rejects.toThrow("binding refused");
-    expect(dispose).toHaveBeenCalledOnce();
-    expect(session.bindExtensions).not.toHaveBeenCalled();
-    expect(session.prompt).not.toHaveBeenCalled();
+    try {
+      await expect(runAgent(ctx, "Explore", "go", {
+        pi, cwd: fixture.cwd, bindBeforeExtensions: true,
+        onSessionCreated: async () => { throw new Error("binding refused"); },
+      })).rejects.toThrow("binding refused");
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(session.bindExtensions).not.toHaveBeenCalled();
+      expect(session.prompt).not.toHaveBeenCalled();
+    } finally { fixture.cleanup(); }
   });
 
   it("binds extensions before prompting", async () => {

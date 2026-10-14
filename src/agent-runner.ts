@@ -2,7 +2,7 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
@@ -20,13 +20,16 @@ import {
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
+import { ContextGuard, type ContextGuardState, type ContextThresholds, getContextGuardDefaults, resolveContextThresholds, setContextGuardDefaults } from "./context-guard.js";
+import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { projectReadScopes } from "./project-scope.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { AgentCapabilityAdditions, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentCapabilityAdditions, AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 
 /**
@@ -159,6 +162,46 @@ export function parseExtensionsSpec(
     names.add(extensionCanonicalName(abs));
   }
   return { names, paths, wildcard };
+}
+
+/** Fixed security floor from Git's canonical checkout, never a model-supplied path. */
+function boundWorkGuardPath(cwd: string): string {
+  const root = projectReadScopes(cwd)[0];
+  const gitEntry = join(root, ".git");
+  const readPointer = (path: string): string => {
+    if (statSync(path).size > 8192) throw new Error("Work Git identity pointer is oversized.");
+    return readFileSync(path, "utf8").trim();
+  };
+  let commonGitDir = gitEntry;
+  if (statSync(gitEntry).isFile()) {
+    const pointer = /^gitdir: (.+)$/.exec(readPointer(gitEntry));
+    if (!pointer) throw new Error("Work Git identity pointer is invalid.");
+    const gitDir = resolve(root, pointer[1]);
+    commonGitDir = resolve(gitDir, readPointer(join(gitDir, "commondir")));
+  }
+  commonGitDir = realpathSync(commonGitDir);
+  if (basename(commonGitDir) !== ".git" || !statSync(commonGitDir).isDirectory()) throw new Error("Work canonical Git identity is invalid.");
+  const expected = join(dirname(commonGitDir), ".pi", "extensions-dist", "work-agent-binding.js");
+  const canonical = realpathSync(expected);
+  if (canonical !== expected || !statSync(canonical).isFile()) throw new Error("Work guard must be the canonical compiled entry.");
+  return canonical;
+}
+
+/** Refresh shared root definitions only after the manager admits this Work launch. */
+export function workBoundAgentConfig(cwd: string, selected: AgentConfig | undefined, bound: boolean): AgentConfig | undefined {
+  if (!bound || !selected?.sourcePath) return selected;
+  const root = projectReadScopes(cwd)[0];
+  const source = resolve(selected.sourcePath);
+  if (dirname(source) !== resolve(root, ".claude", "agents")) return selected;
+  const canonicalRoot = dirname(dirname(dirname(boundWorkGuardPath(cwd))));
+  const expected = resolve(canonicalRoot, ".claude", "agents", basename(source));
+  if (source === expected || !existsSync(expected)) return selected;
+  if (realpathSync(expected) !== expected) throw new Error("Work shared agent definition must be canonical.");
+  const replacement = loadCustomAgents(canonicalRoot, true).get(selected.name);
+  if (!replacement || resolve(replacement.sourcePath ?? "") !== expected || replacement.enabled === false) {
+    throw new Error("Work shared agent definition identity changed or is disabled.");
+  }
+  return replacement;
 }
 
 /**
@@ -301,6 +344,16 @@ export function installExtensionToolScope(
 
 /** Default max turns. undefined = unlimited (no turn limit). */
 let defaultMaxTurns: number | undefined;
+/** Project defaults for context warning and hard-stop thresholds. */
+export function setDefaultContextThresholds(warn: number | undefined, stop: number | undefined): void {
+  setContextGuardDefaults(warn, stop);
+}
+export function getDefaultContextThresholds(): ContextThresholds {
+  return getContextGuardDefaults();
+}
+export function resolveEffectiveContextThresholds(warn?: number, stop?: number): ContextThresholds {
+  return resolveContextThresholds({ warn, stop }, undefined, undefined);
+}
 
 /** Normalize max turns. undefined or 0 = unlimited, otherwise minimum 1. */
 export function normalizeMaxTurns(n: number | undefined): number | undefined {
@@ -457,6 +510,12 @@ export interface RunOptions extends AgentCapabilityAdditions {
   agentId?: string;
   model?: Model<any>;
   maxTurns?: number;
+  /** Per-dispatch context guard overrides; omitted values use project defaults. */
+  contextWarnPercent?: number;
+  contextStopPercent?: number;
+  /** Persisted guard state from the owning record, retained across compaction/resume. */
+  contextGuardState?: ContextGuardState;
+  onContextGuardChange?: (state: ContextGuardState) => void;
   /** Wall-clock ceiling for this run, in ms. 0/undefined = fall back to the project default. */
   runDeadlineMs?: number;
   signal?: AbortSignal;
@@ -551,6 +610,11 @@ export interface RunResult {
   aborted: boolean;
   /** True if the run's wall-clock deadline elapsed and aborted it. */
   timedOut: boolean;
+  /** True when the context hard ceiling stopped the run. */
+  contextAborted: boolean;
+  /** True when this run received the context guard's wrap-up warning. */
+  contextSteered: boolean;
+  contextGuardState: ContextGuardState;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
   steered: boolean;
   /**
@@ -667,14 +731,14 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
-  const config = getConfig(type);
-  const agentConfig = getAgentConfig(type);
-
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
   // Filesystem work happens in effectiveCwd; config discovery in configCwd.
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
   const configCwd = options.configCwd ?? effectiveCwd;
+  const selected = getAgentConfig(type);
+  const agentConfig = workBoundAgentConfig(configCwd, selected, !!options.bindBeforeExtensions);
+  const config = agentConfig ?? getConfig(type);
 
   const env = await detectEnv(options.pi, effectiveCwd);
 
@@ -715,7 +779,7 @@ export async function runAgent(
     }
   }
 
-  let toolNames = unique([...getToolNamesForType(type), ...addedBuiltinTools]);
+  let toolNames = unique([...(agentConfig?.builtinToolNames ?? getToolNamesForType(type)), ...addedBuiltinTools]);
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
@@ -779,6 +843,7 @@ export async function runAgent(
     options.isolated ? [] : [...(agentConfig?.extSelectors ?? []), ...addedExtSelectors],
   );
   const noExtensions = extensions === false;
+  const requiredWorkGuard = options.bindBeforeExtensions ? boundWorkGuardPath(configCwd) : undefined;
 
   const extensionsSpec = Array.isArray(extensions)
     ? parseExtensionsSpec(extensions, configCwd)
@@ -794,20 +859,24 @@ export async function runAgent(
   // It's only needed when we're neither loading everything without excludes
   // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
   const loadAll = extensions === true || extensionsSpec?.wildcard === true;
-  const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
+  const additionalExtensionPaths = requiredWorkGuard
+    ? [...(extensionsSpec?.paths ?? []), requiredWorkGuard]
+    : extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
   // Pre-filter discovered set, captured by the override — the exclude-typo warning
   // must compare against this, not the surviving set (absence from survivors is
   // an exclude *succeeding*).
   let discoveredNames: Set<string> | undefined;
   const extensionsOverride: ((base: LoadExtensionsResult) => LoadExtensionsResult) | undefined =
-    noExtensions || (loadAll && !hasExcludes)
+    !requiredWorkGuard && (noExtensions || (loadAll && !hasExcludes))
       ? undefined
       : (base) => {
           discoveredNames = new Set(base.extensions.flatMap((e) => extensionCanonicalNames(e.path)));
           return {
             ...base,
             extensions: base.extensions.filter((e) => {
+              if (requiredWorkGuard && resolve(e.path) === requiredWorkGuard) return true;
               const canons = extensionCanonicalNames(e.path);
+              if (requiredWorkGuard && (noExtensions || canons.includes("work-agent-binding"))) return false;
               if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
               return loadAll || canons.some((n) => keepNames.has(n));
             }),
@@ -828,6 +897,9 @@ export async function runAgent(
     appendSystemPromptOverride: () => [],
   });
   await runInChildSessionContext(() => loader.reload());
+  if (requiredWorkGuard && loader.getExtensions().extensions.filter(e => resolve(e.path) === requiredWorkGuard).length !== 1) {
+    throw new Error("Work bound-session guard did not load exactly once.");
+  }
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -1058,6 +1130,11 @@ export async function runAgent(
   if (options.bindBeforeExtensions) {
     try {
       await options.onSessionCreated?.(session);
+      const sessionId = session.sessionManager.getSessionId();
+      const markers = session.sessionManager.getBranch().filter(entry => entry.type === "custom"
+        && entry.customType === "work-bound-session" && entry.data && typeof entry.data === "object"
+        && "childSessionId" in entry.data && entry.data.childSessionId === sessionId);
+      if (markers.length !== 1) throw new Error("Work bound-session identity marker is missing or ambiguous.");
       if (options.signal?.aborted) throw new Error("Agent startup cancelled before prompt.");
     } catch (error) {
       try {
@@ -1073,7 +1150,7 @@ export async function runAgent(
   // awaited boundary returns successfully.
   await bindExtensionsWithStartupObservation(
     session,
-    noExtensions,
+    noExtensions && !requiredWorkGuard,
     options.onStartupEffectsObserved,
     (err) => {
       options.onToolActivity?.({
@@ -1103,6 +1180,36 @@ export async function runAgent(
   if (!options.bindBeforeExtensions) await options.onSessionCreated?.(session);
   if (options.bindBeforeExtensions && options.signal?.aborted) throw new Error("Agent startup cancelled before prompt.");
 
+  // Context is session-window utilization, never a lifetime-token substitute.
+  // The guard state is copied back to the manager after every observation so a
+  // compaction or a later resume cannot reset a warning or evade a hard stop.
+  const contextGuard = new ContextGuard(
+    resolveEffectiveContextThresholds(options.contextWarnPercent, options.contextStopPercent),
+    options.contextGuardState,
+  );
+  let contextAborted = false;
+  let contextSteered = false;
+  let contextAbortIssued = false;
+  const checkContext = (): boolean => {
+    const action = contextGuard.observeSession(session);
+    options.onContextGuardChange?.(contextGuard.state);
+    if (action.action === "stop") {
+      contextAborted = true;
+      if (!contextAbortIssued) {
+        contextAbortIssued = true;
+        session.abort();
+      }
+      return true;
+    }
+    if (action.action === "warn") {
+      // Deliberately one-shot. This is a warning, not a second turn-limit
+      // instruction, and a jump to stop never reaches this branch.
+      contextSteered = true;
+      void session.steer(`Context utilization reached ${Math.round(action.percent)}%. Finish the current bounded operation safely; provide final findings, checks, and unfinished work; start no new work.`);
+    }
+    return false;
+  };
+
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
@@ -1111,15 +1218,22 @@ export async function runAgent(
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "turn_start") options.onModelAttemptStart?.();
+    if (event.type === "turn_start") {
+      // Pi emits turn_start before the next model attempt; this is the last
+      // supported boundary at which an existing hard state can prevent it.
+      if (!checkContext()) options.onModelAttemptStart?.();
+    }
     if (event.type === "turn_end") {
+      const contextStopped = checkContext();
       turnCount++;
       options.onTurnEnd?.(turnCount);
-      if (maxTurns != null) {
+      if (!contextStopped && maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
           options.onPromptDelivered?.();
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          if (!contextGuard.state.warned) {
+            session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          }
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();
@@ -1142,6 +1256,9 @@ export async function runAgent(
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
+      // message_end is the finalized assistant response boundary. Tool results
+      // settle before turn_end, where the same guard checks again.
+      checkContext();
       if (Array.isArray(event.message.content) && extractText(event.message.content).length > 0) options.onResultProduced?.();
       const u = (event.message as any).usage;
       if (u) options.onAssistantUsage?.({
@@ -1180,15 +1297,19 @@ export async function runAgent(
   const startLen = session.messages.length;
   let timedOut = false;
   try {
-    options.onPromptDelivered?.();
-    const promptRun = session.prompt(effectivePrompt).then(() => false);
-    try {
-      timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
-    } catch (error) {
-      if (!deadline.timedOut()) throw error;
-      timedOut = true;
+    // Refuse before the first model call when a resumed record already crossed
+    // the ceiling, or when the newly-created session reports an initial value.
+    if (!checkContext()) {
+      options.onPromptDelivered?.();
+      const promptRun = session.prompt(effectivePrompt).then(() => false);
+      try {
+        timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
+      } catch (error) {
+        if (!deadline.timedOut()) throw error;
+        timedOut = true;
+      }
+      if (timedOut) void promptRun.catch(() => {});
     }
-    if (timedOut) void promptRun.catch(() => {});
   } finally {
     unsubTurns();
     collector.unsubscribe();
@@ -1202,7 +1323,10 @@ export async function runAgent(
     session,
     aborted,
     timedOut,
-    steered: softLimitReached,
+    contextAborted,
+    contextSteered,
+    contextGuardState: contextGuard.state,
+    steered: softLimitReached || contextSteered,
     failure: finalTurnError(session, startLen),
   };
 }
@@ -1223,11 +1347,15 @@ export async function resumeAgent(
     onModelAttemptStart?: () => void;
     onToolDispatch?: () => void;
     onResultProduced?: () => void;
+    contextWarnPercent?: number;
+    contextStopPercent?: number;
+    contextGuardState?: ContextGuardState;
+    onContextGuardChange?: (state: ContextGuardState) => void;
     signal?: AbortSignal;
     /** Wall-clock ceiling for this resume, in ms. 0/undefined = project default. */
     runDeadlineMs?: number;
   } = {},
-): Promise<{ text: string; failure?: string; timedOut: boolean }> {
+): Promise<{ text: string; failure?: string; timedOut: boolean; contextAborted: boolean; contextSteered: boolean; steered: boolean; contextGuardState: ContextGuardState }> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
@@ -1240,25 +1368,57 @@ export async function resumeAgent(
     () => session.abort(),
   );
 
+  const contextGuard = new ContextGuard(resolveContextThresholds(
+    { warn: options.contextWarnPercent, stop: options.contextStopPercent },
+    options.contextGuardState && { warn: options.contextGuardState.warnPercent, stop: options.contextGuardState.stopPercent },
+    undefined,
+  ), options.contextGuardState);
+  let contextAborted = false;
+  let contextSteered = false;
+  let contextAbortIssued = false;
+  const checkContext = (): boolean => {
+    const action = contextGuard.observeSession(session);
+    options.onContextGuardChange?.(contextGuard.state);
+    if (action.action === "stop") {
+      contextAborted = true;
+      if (!contextAbortIssued) {
+        contextAbortIssued = true;
+        session.abort();
+      }
+      return true;
+    }
+    if (action.action === "warn") {
+      contextSteered = true;
+      void session.steer(`Context utilization reached ${Math.round(action.percent)}%. Finish the current bounded operation safely; provide final findings, checks, and unfinished work; start no new work.`);
+    }
+    return false;
+  };
+
   let currentMessageText = "";
   let turnCount = 0;
-  const unsubEvents = (options.onToolActivity || options.onTextDelta || options.onTurnEnd || options.onAssistantUsage || options.onCompaction
-    || options.onModelAttemptStart || options.onToolDispatch || options.onResultProduced)
-    ? session.subscribe((event: AgentSessionEvent) => {
+  // The context guard itself needs every turn boundary, even when this direct
+  // caller requested no other observation callbacks.
+  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
         if (event.type === "message_start" && event.message.role === "assistant") currentMessageText = "";
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
           currentMessageText += event.assistantMessageEvent.delta;
           if (event.assistantMessageEvent.delta.length > 0) options.onResultProduced?.();
           options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
         }
-        if (event.type === "turn_start") options.onModelAttemptStart?.();
-        if (event.type === "turn_end") options.onTurnEnd?.(++turnCount);
+        if (event.type === "turn_start") {
+          if (!checkContext()) options.onModelAttemptStart?.();
+        }
+        if (event.type === "turn_end") {
+          checkContext();
+          options.onTurnEnd?.(++turnCount);
+        }
         if (event.type === "tool_execution_start") {
           options.onToolDispatch?.();
           options.onToolActivity?.({ type: "start", toolName: event.toolName });
         }
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
+          checkContext();
           if (Array.isArray(event.message.content) && extractText(event.message.content).length > 0) options.onResultProduced?.();
           const u = (event.message as any).usage;
           if (u) options.onAssistantUsage?.({
@@ -1272,20 +1432,21 @@ export async function resumeAgent(
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
         }
-      })
-    : () => {};
+      });
 
   let timedOut = false;
   try {
-    options.onPromptDelivered?.();
-    const promptRun = session.prompt(prompt).then(() => false);
-    try {
-      timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
-    } catch (error) {
-      if (!deadline.timedOut()) throw error;
-      timedOut = true;
+    if (!checkContext()) {
+      options.onPromptDelivered?.();
+      const promptRun = session.prompt(prompt).then(() => false);
+      try {
+        timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
+      } catch (error) {
+        if (!deadline.timedOut()) throw error;
+        timedOut = true;
+      }
+      if (timedOut) void promptRun.catch(() => {});
     }
-    if (timedOut) void promptRun.catch(() => {});
   } finally {
     collector.unsubscribe();
     unsubEvents();
@@ -1297,6 +1458,10 @@ export async function resumeAgent(
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     failure: finalTurnError(session, startLen),
     timedOut,
+    contextAborted,
+    contextSteered,
+    steered: contextSteered,
+    contextGuardState: contextGuard.state,
   };
 }
 

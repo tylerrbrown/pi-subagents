@@ -11,6 +11,8 @@
 
 import type { SpawnOptions } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import type { AgentRecord } from "./types.js";
+import { validateWorkSkipped } from "./work-lifecycle.js";
 
 export type RpcSpawnOptions = Omit<SpawnOptions, "model"> & { model?: SpawnOptions["model"] | string };
 
@@ -32,6 +34,7 @@ export const PROTOCOL_VERSION = 2;
 export interface SpawnCapable {
   spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
   awaitStartup(id: string): Promise<void>;
+  getRecord?(id: string): AgentRecord | undefined;
   abort(id: string): boolean;
 }
 
@@ -116,6 +119,10 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
 
       const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
       await manager.awaitStartup(id);
+      const record = manager.getRecord?.(id);
+      if (record?.status === "skipped" && record.workLaunch) {
+        return validateWorkSkipped(JSON.parse(record.result ?? "null"), record.workLaunch);
+      }
       return { id };
     },
   );

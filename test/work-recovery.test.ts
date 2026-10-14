@@ -220,6 +220,45 @@ describe("durable terminal-proof transport", () => {
     }
   });
 
+  it.each(["deadline_exceeded", "indeterminate", "upgrade_required"])("keeps %s pending until fresh exact reconciliation after restart", async code => {
+    const first = workAdapter();
+    first.held.add("reconcile");
+    first.events.on("subagents:work:reconcile", request => first.events.emit(
+      `subagents:work:reconcile:reply:${request.requestId}`,
+      { success: false, error: { code, retryable: false, action: code === "upgrade_required" ? "upgrade" : "retry_exact_read" } },
+    ));
+    const original = new AgentManager();
+    const restarted = new AgentManager();
+    const next = workAdapter();
+    next.held.add("reconcile");
+    next.events.on("subagents:work:reconcile", request => next.events.emit(
+      `subagents:work:reconcile:reply:${request.requestId}`,
+      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.payload.terminalSnapshotDigest } },
+    ));
+    try {
+      await original.reconcileWork(first.pi, [retainedV2()]);
+      expect(first.requests.reconcile).toHaveLength(1);
+      expect(first.entries).toHaveLength(0);
+      await original.dispose();
+      await restarted.reconcileWork(next.pi, [retainedV2(), ...first.entries]);
+      expect(next.requests.reconcile).toHaveLength(1);
+      expect(next.requests.reconcile[0].proof).toEqual(replayProof);
+      expect(next.entries).toContainEqual({ customType: "subagents:work-reconcile-ack", data: {
+        version: 1, protocolVersion: 2, launchKey: replayLaunchKey,
+        snapshotDigest: lifecycle.workTerminalProofDigest(replayProof),
+        bindingDigest: lifecycle.workBindingDigest(work),
+      } });
+      for (const adapter of [first, next]) {
+        expect(adapter.requests.reserve).toHaveLength(0);
+        expect(adapter.requests.bind).toHaveLength(0);
+      }
+      expect(runAgent).not.toHaveBeenCalled();
+    } finally {
+      await original.dispose();
+      await restarted.dispose();
+    }
+  });
+
   it("bounds replay concurrency and never duplicates an in-flight terminal proof", async () => {
     const adapter = workAdapter();
     adapter.held.add("reconcile");

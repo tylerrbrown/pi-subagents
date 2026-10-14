@@ -19,16 +19,22 @@ import type { AgentRecord, RunFailureKind, StopReason } from "./types.js";
  * turn limit was hit) — the parent should treat human intervention differently
  * from a budget cutoff.
  */
-export function getStatusNote(status: string, stopReason?: StopReason): string {
+export function getStatusNote(status: string, stopReason?: StopReason, contextAborted = false, contextSteered = false): string {
   switch (status) {
+    case "skipped":
+      return " (check skipped; no child ran and no verification passed; the lead may continue other work)";
     case "stopped":
       return ` (${stoppedBy(stopReason)} before completion — output is partial; the task was NOT finished)`;
     case "timeout":
       return " (TIMED OUT at its wall-clock deadline — output is partial; the task was NOT finished)";
     case "aborted":
-      return " (aborted — hit the turn limit before completion; output may be incomplete)";
+      return contextAborted
+        ? " (aborted at the context ceiling — output is partial; the task was NOT finished)"
+        : " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
-      return " (wrapped up at the turn limit — output may be partial)";
+      return contextSteered
+        ? " (wrapped up at the context warning — output may be partial)"
+        : " (wrapped up at the turn limit — output may be partial)";
     default:
       return "";
   }
@@ -68,16 +74,22 @@ export function getStatusNote(status: string, stopReason?: StopReason): string {
  * behavior) and adding an instruction (which can) are not equally safe bets.
  * Don't add either back without a way to measure it.
  */
-export function getForegroundOutcomeNote(status: string, stopReason?: StopReason): string {
+export function getForegroundOutcomeNote(status: string, stopReason?: StopReason, contextAborted = false, contextSteered = false): string {
   switch (status) {
+    case "skipped":
+      return " (check skipped; no child ran and no verification passed; the lead may continue other work)";
     case "stopped":
       return ` (${stoppedBy(stopReason)} — everything the agent produced is above; the task is unfinished)`;
     case "timeout":
       return " (TIMED OUT at its wall-clock deadline — everything the agent produced is above; the task is unfinished)";
     case "aborted":
-      return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
+      return contextAborted
+        ? " (aborted at the context ceiling — everything the agent produced is above; the task is unfinished)"
+        : " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
     case "steered":
-      return " (wrapped up at the turn limit — everything the agent produced is above; the task may be unfinished)";
+      return contextSteered
+        ? " (wrapped up at the context warning — everything the agent produced is above; the task may be unfinished)"
+        : " (wrapped up at the turn limit — everything the agent produced is above; the task may be unfinished)";
     default:
       return "";
   }

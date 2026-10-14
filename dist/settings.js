@@ -37,6 +37,12 @@ function sanitize(raw) {
         r.defaultMaxTurns <= MAX_TURNS_CEILING) {
         out.defaultMaxTurns = r.defaultMaxTurns;
     }
+    if (Number.isFinite(r.contextWarnPercent) && r.contextWarnPercent > 0 && r.contextWarnPercent <= 100) {
+        out.contextWarnPercent = r.contextWarnPercent;
+    }
+    if (Number.isFinite(r.contextStopPercent) && r.contextStopPercent > 0 && r.contextStopPercent <= 100) {
+        out.contextStopPercent = r.contextStopPercent;
+    }
     if (Number.isInteger(r.graceTurns) &&
         r.graceTurns >= 1 &&
         r.graceTurns <= GRACE_TURNS_CEILING) {
@@ -152,6 +158,15 @@ export function loadSettings(cwd = process.cwd()) {
     for (const scope of projectReadScopes(cwd)) {
         Object.assign(settings, readSettingsFile(projectPath(scope)));
     }
+    // Settings scopes merge field-wise, so validate the final pair only after
+    // global/ancestor/project precedence is complete. Invalid hand edits fail
+    // safe to built-ins instead of taking extension startup down.
+    const warn = settings.contextWarnPercent ?? 30;
+    const stop = settings.contextStopPercent ?? 50;
+    if (warn >= stop) {
+        delete settings.contextWarnPercent;
+        delete settings.contextStopPercent;
+    }
     return settings;
 }
 /**
@@ -176,6 +191,9 @@ export function applySettings(s, appliers) {
         appliers.setMaxConcurrent(s.maxConcurrent);
     if (typeof s.defaultMaxTurns === "number")
         appliers.setDefaultMaxTurns(s.defaultMaxTurns);
+    if (s.contextWarnPercent !== undefined || s.contextStopPercent !== undefined) {
+        appliers.setContextThresholds?.(s.contextWarnPercent, s.contextStopPercent);
+    }
     if (typeof s.graceTurns === "number")
         appliers.setGraceTurns(s.graceTurns);
     if (typeof s.runDeadlineMs === "number")

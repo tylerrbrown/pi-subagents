@@ -10,6 +10,14 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 <img width="600" alt="pi-color-badges-white" src="https://github.com/user-attachments/assets/555dcae4-333e-4ff0-b420-7b3369c018a4" />
 
 
+## Context guard
+
+Every child automatically receives a one-shot wrap-up steer at **30%** context and is aborted at **50%**. The Lead need not supply parameters. Override a dispatch with `context_warn_percent` and `context_stop_percent`; both accept percentages satisfying `0 < warn < stop <= 100`. Persist defaults as `contextWarnPercent` and `contextStopPercent` in project/global `subagents.json`.
+
+Fresh and resumed runs enforce the guard. Resume retains prior thresholds unless explicitly overridden; warning, peak, and terminal-stop state survive compaction and reopen. A prior hard stop cannot be cleared by an override. Context-triggered results name the warning or ceiling separately from turn limits; abort retains available output but marks the task unfinished and does not roll back files or external actions.
+
+Checks run at session event boundaries, so one response or tool result can overshoot the ceiling. If Pi cannot report context utilization, enforcement is unavailable for that observation—not zero utilization. Turn and deadline safeguards remain active.
+
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native

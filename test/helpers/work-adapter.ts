@@ -28,7 +28,7 @@ export function workAdapter() {
     });
   }
   for (const action of Object.keys(requests)) events.on(`subagents:work:${action}`, request => {
-    requests[action].push(request);
+    requests[action].push({ ...request.payload, requestId: request.requestId });
     if (!held.has(action)) reply(action, request, !refused.has(action));
   });
   const entries: any[] = [];
@@ -57,7 +57,7 @@ export async function withSyntheticEnvironment<T>(run: (writes: ReturnType<typeo
   finally { Object.defineProperty(process, "env", original); }
 }
 export function childSession() {
-  return { sessionManager: { getSessionId: () => "actual-child-session" },
+  return { sessionManager: { getSessionId: () => "actual-child-session", appendCustomEntry: vi.fn() },
     dispose: vi.fn(), abort: vi.fn(async () => {}), steer: vi.fn(async () => {}),
   } as any;
 }

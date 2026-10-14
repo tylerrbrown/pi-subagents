@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Automatic child context guard.** Fresh and resumed children receive one wrap-up steer at 30% context and abort at 50%, with validated per-dispatch and persisted-default overrides. Context state survives compaction and reopen; available partial output is retained and context outcomes are distinguished from turn limits.
 - **Aligned agent status columns.** The widget and FleetView render unique handle → description → model/effort/thinking → metrics, with shared column starts across running agents. The unique handle replaces the redundant display-name/prompt-mode label in these compact rows; prompt mode remains visible in the conversation viewer and Agent tool result.
 - **Live idle age for running agents.** The widget and FleetView now show both total elapsed time and time since the latest text, tool, or turn progress, so a provider stall is visibly different from an agent that is still producing work.
 - **Wall-clock deadlines on agent runs** (`runDeadlineMs`, per-call `deadline_ms`). The turn budget was never a time budget: a run stalled on an overloaded provider burns no turns, so `max_turns` never fired for it and the run held its caller for as long as the provider took. A run that exceeds its deadline ends in a new `timeout` status with its partial output intact — not `aborted` (the turn budget was never spent) and not `stopped` (nobody intervened). Unlimited by default; `/agents → Settings → Run deadline` sets it in seconds.

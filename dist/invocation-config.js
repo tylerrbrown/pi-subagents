@@ -76,6 +76,8 @@ export function resolveAgentInvocationConfig(agentConfig, params, opts) {
         modelFromParams: agentConfig?.model == null && params.model != null,
         thinking: (agentConfig?.thinking ?? params.thinking),
         maxTurns: agentConfig?.maxTurns ?? params.max_turns,
+        contextWarnPercent: params.context_warn_percent,
+        contextStopPercent: params.context_stop_percent,
         inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
         runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
         isolated: agentConfig?.isolated ?? params.isolated ?? false,

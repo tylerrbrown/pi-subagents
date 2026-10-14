@@ -71,7 +71,7 @@ export interface AgentDetails {
   toolUses: number;
   tokens: string;
   durationMs: number;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error" | "background";
+  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error" | "background" | "skipped";
   /** Human-readable description of what the agent is currently doing. */
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
@@ -88,6 +88,8 @@ export interface AgentDetails {
   cost?: number;
   agentId?: string;
   error?: string;
+  contextAborted?: boolean;
+  contextSteered?: boolean;
 }
 
 // ---- Formatting helpers ----
@@ -510,12 +512,15 @@ export class AgentWidget {
   ): string {
     let icon: string;
     let statusText: string;
-    if (a.status === "completed") {
+    if (a.status === "skipped") {
+      icon = theme.fg("dim", "-");
+      statusText = theme.fg("dim", " skipped (no child run)");
+    } else if (a.status === "completed") {
       icon = theme.fg("success", "✓");
       statusText = "";
     } else if (a.status === "steered") {
       icon = theme.fg("warning", "✓");
-      statusText = theme.fg("warning", " (turn limit)");
+      statusText = theme.fg("warning", a.contextSteered ? " (context warning)" : " (turn limit)");
     } else if (a.status === "stopped") {
       icon = theme.fg("dim", "■");
       statusText = theme.fg("dim", " stopped");
@@ -529,7 +534,7 @@ export class AgentWidget {
     } else {
       // aborted
       icon = theme.fg("error", "✗");
-      statusText = theme.fg("warning", " aborted");
+      statusText = theme.fg("warning", a.contextAborted ? " aborted (context ceiling)" : " aborted");
     }
 
     const name = renderAgentRecordName(a, theme, { fallbackColor: "dim" }, widths.name);
@@ -592,11 +597,12 @@ export class AgentWidget {
     const postureWidth = Math.max(0, ...columnRecords.map(a => visibleWidth(formatAgentPosture(a))));
     const finishedStatusWidth = (record: AgentRecord): number => {
       let status = "";
-      if (record.status === "steered") status = " (turn limit)";
+      if (record.status === "skipped") status = " skipped (no child run)";
+      else if (record.status === "steered") status = record.contextSteered ? " (context warning)" : " (turn limit)";
       else if (record.status === "stopped") status = " stopped";
       else if (record.status === "timeout") status = " timed out";
       else if (record.status === "error") status = ` error${record.error ? `: ${record.error.slice(0, 60)}` : ""}`;
-      else if (record.status === "aborted") status = " aborted";
+      else if (record.status === "aborted") status = record.contextAborted ? " aborted (context ceiling)" : " aborted";
       return visibleWidth(status);
     };
     const metricWidth = Math.max(0, ...columnRecords.map(record =>

@@ -14,6 +14,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
+import { type ContextGuardState, resolveContextThresholds } from "./context-guard.js";
 import { syncEffectiveInvocation } from "./invocation-truth.js";
 import { assignHandle, handleBase, isReservedHandle } from "./mention.js";
 import { describeModel, describeRequestedModel, resolveModel } from "./model-resolver.js";
@@ -21,7 +22,7 @@ import { foldWorkReconcileLedger, WORK_RECONCILE_CHECKPOINT_VERSION, workReconci
 import { classifyRunFailure } from "./status-note.js";
 import type { AgentCapabilityAdditions, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, StopReason, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
-import { assertWorkString, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, type WorkBinding, type WorkRecovery, type WorkSnapshot, type WorkSnapshotV2, type WorkTerminalProof, workLaunchKey, workTerminalProofDigest } from "./work-lifecycle.js";
+import { assertWorkString, requestWork, requestWorkReply, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, validateWorkSkipped, type WorkBinding, type WorkRecovery, type WorkSnapshot, type WorkSnapshotV2, type WorkTerminalProof, workBindingDigest, workLaunchKey, workTerminalProofDigest } from "./work-lifecycle.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeCleanupResult, } from "./worktree.js";
 
 type WorkRun = Readonly<{
@@ -151,6 +152,11 @@ export interface SpawnOptions extends AgentCapabilityAdditions {
   /** Raw model spelling retained by RPC before resolving its Model object. */
   requestedModel?: string;
   maxTurns?: number;
+  /** Per-dispatch context guard thresholds. */
+  contextWarnPercent?: number;
+  contextStopPercent?: number;
+  /** Internal persisted state when reopening an evicted session. */
+  contextGuardState?: ContextGuardState;
   /** Wall-clock ceiling for this run, in ms. Omitted = project default. */
   runDeadlineMs?: number;
   isolated?: boolean;
@@ -217,6 +223,9 @@ export interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /** Per-dispatch context guard thresholds. Omitted values retain this session's thresholds. */
+  contextWarnPercent?: number;
+  contextStopPercent?: number;
   /** Wall-clock ceiling for this resumed run, in ms. Omitted = project default. */
   runDeadlineMs?: number;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
@@ -437,32 +446,14 @@ export class AgentManager {
       protocolVersion: 2,
       launchKey: envelope.launch.launchKey,
       snapshotDigest: envelope.terminalSnapshotDigest,
+      bindingDigest: workBindingDigest(envelope.launch.work),
       ...(recovery && { recovery }),
     });
   }
 
   /** Terminal transport preserves allowlisted typed refusals; the legacy helper intentionally does not. */
   private requestWorkTerminal(action: "finalize" | "reconcile", payload: WorkSnapshot | (WorkSnapshotV2 & { terminalSnapshotDigest: string })): Promise<{ success: true; data: unknown } | { success: false; error: unknown }> {
-    const events = this.pi!.events;
-    const requestId = randomUUID();
-    const channel = `subagents:work:${action}`;
-    return new Promise((resolve, reject) => {
-      let unsubscribe = () => {};
-      const timer = setTimeout(() => { unsubscribe(); reject(new Error(`Work ${action} adapter did not reply.`)); }, 5000);
-      const finish = (error?: Error, value?: { success: true; data: unknown } | { success: false; error: unknown }) => {
-        clearTimeout(timer);
-        unsubscribe();
-        if (error) reject(error); else resolve(value!);
-      };
-      try {
-        unsubscribe = events.on(`${channel}:reply:${requestId}`, raw => {
-          const response = raw as { success?: unknown; data?: unknown; error?: unknown } | null;
-          if (response?.success === true) finish(undefined, { success: true, data: response.data });
-          else finish(undefined, { success: false, error: response?.error });
-        });
-        events.emit(channel, { ...JSON.parse(JSON.stringify(payload)), requestId });
-      } catch { finish(new Error(`Work ${action} adapter unavailable.`)); }
-    });
+    return requestWorkReply(this.pi!.events, action, payload);
   }
 
   private durableWorkAck(reply: unknown, envelope: WorkSnapshotV2 & { terminalSnapshotDigest: string }): { recovery?: WorkRecovery } | undefined {
@@ -489,6 +480,7 @@ export class AgentManager {
   }
 
   private finalizeWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<void> {
+    if (record.status === "skipped") return Promise.resolve();
     if (!this.ownsWorkRun(record, run)) return Promise.resolve();
     const launch = run?.launch ?? record.workLaunch;
     if (!launch || !this.pi) return Promise.resolve();
@@ -509,6 +501,7 @@ export class AgentManager {
   }
 
   private async reconcileSnapshot(snapshot: WorkSnapshot, ledger: ReturnType<typeof foldWorkReconcileLedger>): Promise<void> {
+    if (snapshot.version === 1 && snapshot.status === "skipped") return;
     const envelope = this.terminalEnvelope(snapshot);
     if (envelope.version !== 2 || !("terminalSnapshotDigest" in envelope)) {
       // V1 remains visible to old adapters for migration diagnostics only. It can
@@ -516,7 +509,10 @@ export class AgentManager {
       try { await this.requestWorkTerminal("reconcile", envelope); } catch { /* diagnostic-only */ }
       return;
     }
-    const key = workReconcileCheckpointKey(2, envelope.launch.launchKey, envelope.terminalSnapshotDigest);
+    const bindingDigest = workBindingDigest(envelope.launch.work);
+    const key = workReconcileCheckpointKey(2, envelope.launch.launchKey, envelope.terminalSnapshotDigest, bindingDigest);
+    // Old checkpoints lacked binding identity: one authoritative revalidation
+    // upgrades them. Changing or removing a selector cannot reuse that proof.
     if (ledger.acknowledged.has(key) || ledger.quarantined.has(key)) return;
 
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -531,12 +527,15 @@ export class AgentManager {
       }
       const refusal = this.typedWorkRefusal(response.success ? response.data : response.error);
       if (!refusal) return;
+      // Transport refusal is not a semantic verdict on this proof. Keep the
+      // retained snapshot pending for a fresh exact read, without immediate retry.
+      if (!response.success && ["deadline_exceeded", "indeterminate", "upgrade_required"].includes(refusal.code)) return;
       if (refusal.retryable) {
         if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 25 * (2 ** attempt)));
         continue;
       }
       const failureDigest = createHash("sha256").update(JSON.stringify([
-        2, envelope.launch.launchKey, envelope.terminalSnapshotDigest, refusal.code, refusal.action,
+        2, envelope.launch.launchKey, envelope.terminalSnapshotDigest, bindingDigest, refusal.code, refusal.action,
       ])).digest("hex");
       if (!ledger.diagnostics.has(failureDigest)) {
         this.pi!.appendEntry("subagents:work-reconcile-diagnostic", {
@@ -544,6 +543,7 @@ export class AgentManager {
           protocolVersion: 2,
           launchKey: envelope.launch.launchKey,
           snapshotDigest: envelope.terminalSnapshotDigest,
+          bindingDigest,
           failureDigest,
           code: refusal.code,
           action: refusal.action,
@@ -575,16 +575,26 @@ export class AgentManager {
     for (const task of workers) await task;
   }
 
-  private async reserveWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<void> {
+  private async reserveWork(record: AgentRecord, run = this.workRuns.get(record)): Promise<boolean> {
     this.assertWorkRun(record, run);
     const launch = run?.launch ?? record.workLaunch;
-    if (!launch) return;
+    if (!launch) return true;
     this.persistWork(record);
     const reservation = await requestWork(this.pi!.events, "reserve", launch);
     this.assertWorkRun(record, run, false);
+    if (reservation && typeof reservation === "object" && "status" in reservation && reservation.status === "skipped") {
+      const skipped = validateWorkSkipped(reservation, launch);
+      this.assertWorkRun(record, run);
+      record.status = "skipped";
+      record.result = JSON.stringify(skipped);
+      completeRecord(record);
+      try { this.persistWork(record); } catch { /* Work already durably recorded this no-run decision. */ }
+      return false;
+    }
     launch.reservation = validateWorkReservation(reservation);
     this.persistWork(record);
     this.assertWorkRun(record, run);
+    return true;
   }
 
   private async bindWork(record: AgentRecord, session: AgentSession, run = this.workRuns.get(record)): Promise<void> {
@@ -602,6 +612,11 @@ export class AgentManager {
     await requestWork(this.pi!.events, "bind", launch);
     this.assertWorkRun(record, run);
     launch.bound = true;
+    session.sessionManager.appendCustomEntry("work-bound-session", {
+      schemaVersion: 1, childSessionId, caseHandle: launch.work.case,
+      executionId: launch.work.execution, assignmentId: launch.reservation.reservationId,
+      launchKey: launch.launchKey,
+    });
     this.persistWork(record);
     if (record.pendingSteers?.length) {
       for (const message of record.pendingSteers) {
@@ -759,6 +774,11 @@ export class AgentManager {
       ...options.invocation,
     };
     invocation.requestedThinking ??= thinking;
+    const contextThresholds = resolveContextThresholds(
+      { warn: options.contextWarnPercent, stop: options.contextStopPercent },
+      options.contextGuardState && { warn: options.contextGuardState.warnPercent, stop: options.contextGuardState.stopPercent },
+      undefined,
+    );
     const record: AgentRecord = {
       id,
       type,
@@ -777,6 +797,7 @@ export class AgentManager {
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
+      contextGuard: options.contextGuardState ?? { warnPercent: contextThresholds.warn, stopPercent: contextThresholds.stop, warned: false, peakPercent: null, stopped: false },
       // Raw tri-state (not coerced to a boolean): true = background, false =
       // foreground (has an inline tool-result surface), undefined = caller never
       // declared it (e.g. a cross-extension RPC spawn). The widget's background-
@@ -797,8 +818,8 @@ export class AgentManager {
       assertWorkString(options.cwd ?? ctx.cwd, "cwd", 4096);
       record.workLaunch = {
         launchKey: workLaunchKey(parentSessionId, invocationId), parentSessionId, invocationId,
-        agentId: id, agentType: type, agentName: options.name, description: options.description,
-        cwd: options.cwd ?? ctx.cwd, work, bound: false, recovery,
+        agentId: id, agentType: type, ...(options.name !== undefined && { agentName: options.name }), description: options.description,
+        cwd: options.cwd ?? ctx.cwd, work, bound: false, ...(recovery !== undefined && { recovery }),
       };
       this.resetWorkProof(record);
       if (this.workLaunches.has(record.workLaunch.launchKey)) {
@@ -920,7 +941,16 @@ export class AgentManager {
     let cleanupCopy: (() => Promise<WorktreeCleanupResult>) | undefined;
     let preservationFailure: string | undefined;
     try {
-      if (record.workLaunch) await this.reserveWork(record);
+      if (record.workLaunch && !await this.reserveWork(record)) {
+        detach();
+        this.releaseBackgroundSlot(record);
+        record.promise = Promise.resolve(record.result ?? "");
+        if (!options.isBackground) record.resultConsumed = true;
+        try { this.onComplete?.(record); } catch { /* Skip reporting cannot block the queue. */ }
+        this.pendingWorkStarts.delete(record);
+        this.drainQueue();
+        return;
+      }
       if (record.status === "running" && options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
         const wt = await createWorktree(pi, baseCwd, id);
         if (!wt) {
@@ -976,6 +1006,10 @@ export class AgentManager {
         agentId: id,
         model: options.model,
         maxTurns: options.maxTurns,
+        contextWarnPercent: options.contextWarnPercent ?? record.contextGuard?.warnPercent,
+        contextStopPercent: options.contextStopPercent ?? record.contextGuard?.stopPercent,
+        contextGuardState: record.contextGuard,
+        onContextGuardChange: (state) => { record.contextGuard = { ...state }; },
         runDeadlineMs: options.runDeadlineMs,
         isolated: options.isolated,
         inheritContext: options.inheritContext,
@@ -1055,7 +1089,7 @@ export class AgentManager {
           boundReady?.();
         },
       })
-        .then(async ({ responseText, session, aborted, timedOut, steered, failure }) => {
+        .then(async ({ responseText, session, aborted, timedOut, contextAborted, contextSteered, steered, failure }) => {
           syncEffectiveInvocation(record, session);
           record.result = responseText;
           record.session = session;
@@ -1093,6 +1127,9 @@ export class AgentManager {
             if (timedOut) {
               record.status = "timeout";
               record.stopReason = "timeout";
+            } else if (contextAborted) {
+              record.status = "aborted";
+              record.contextAborted = true;
             } else if (aborted) {
               record.status = "aborted";
             } else if (failure) {
@@ -1104,7 +1141,8 @@ export class AgentManager {
               record.error = preservationFailure;
               record.failureKind = classifyRunFailure(preservationFailure);
             } else {
-              record.status = steered ? "steered" : "completed";
+              record.status = steered || contextSteered ? "steered" : "completed";
+              record.contextSteered = contextSteered || undefined;
             }
           }
           if (!timedOut && record.status === "error") {
@@ -1269,6 +1307,11 @@ export class AgentManager {
     // mode: direct manager callers must leave the live run untouched.
     if (record.status === "running" || record.status === "queued"
       || this.workRuns.has(record) || this.pendingWorkStarts.has(record)) return undefined;
+    resolveContextThresholds(
+      { warn: options?.contextWarnPercent, stop: options?.contextStopPercent },
+      record.contextGuard && { warn: record.contextGuard.warnPercent, stop: record.contextGuard.stopPercent },
+      undefined,
+    );
     const requestedWork = validateWorkBinding(options?.work);
     if (requestedWork && !record.workLaunch) throw new Error("Cannot add Work binding to an unbound session; start a fresh agent.");
     const priorBackgroundState = record.workLaunch && options?.isBackground ? {
@@ -1294,7 +1337,8 @@ export class AgentManager {
       const launchKey = workLaunchKey(record.workLaunch.parentSessionId, invocationId);
       if (this.workLaunches.has(launchKey)) throw new Error("Work invocation already launched.");
       this.workLaunches.add(launchKey);
-      record.workLaunch = { ...record.workLaunch, invocationId, launchKey, reservation: undefined, bound: false };
+      record.workLaunch = { ...record.workLaunch, invocationId, launchKey, bound: false };
+      delete record.workLaunch.reservation;
       this.resetWorkProof(record);
       // A resumed session has already run extension startup and is actionable.
       const proof = this.workProofs.get(record)!;
@@ -1319,6 +1363,8 @@ export class AgentManager {
       record.result = undefined;
       record.error = undefined;
       record.failureKind = undefined;
+      record.contextAborted = undefined;
+      record.contextSteered = undefined;
       record.completedAt = undefined;
       record.status = "queued";
       try {
@@ -1353,6 +1399,8 @@ export class AgentManager {
     record.result = undefined;
     record.error = undefined;
     record.failureKind = undefined;
+    record.contextAborted = undefined;
+    record.contextSteered = undefined;
 
     const abortBoundResume = () => this.abort(id);
     if (record.workLaunch && signal) {
@@ -1362,13 +1410,21 @@ export class AgentManager {
     let resumeStarted = false;
     try {
       if (workRun) {
-        await this.reserveWork(record, workRun);
+        if (!await this.reserveWork(record, workRun)) {
+          signal?.removeEventListener("abort", abortBoundResume);
+          this.workRuns.delete(record);
+          return record;
+        }
         await this.bindWork(record, record.session, workRun);
         this.assertWorkRun(record, workRun);
       }
       resumeStarted = true;
-      const { text, failure, timedOut } = await resumeAgent(record.session, prompt, {
+      const { text, failure, timedOut, contextAborted, contextSteered } = await resumeAgent(record.session, prompt, {
         ...this.workObservationCallbacks(record),
+        contextWarnPercent: options?.contextWarnPercent,
+        contextStopPercent: options?.contextStopPercent,
+        contextGuardState: record.contextGuard,
+        onContextGuardChange: (state) => { record.contextGuard = { ...state }; },
         onToolActivity: (activity) => {
           record.lastProgressAt = Date.now();
           if (activity.type === "end") record.toolUses++;
@@ -1404,8 +1460,12 @@ export class AgentManager {
       if (timedOut) {
         record.status = "timeout";
         record.stopReason = "timeout";
+      } else if (contextAborted) {
+        record.status = "aborted";
+        record.contextAborted = true;
       } else {
-        record.status = failure ? "error" : "completed";
+        record.status = failure ? "error" : contextSteered ? "steered" : "completed";
+        record.contextSteered = contextSteered || undefined;
         if (failure) {
           record.error = failure;
           record.failureKind = classifyRunFailure(failure);
@@ -1526,6 +1586,10 @@ export class AgentManager {
       resumeStarted = true;
       return resumeAgent(session, prompt, {
       ...this.workObservationCallbacks(record),
+      contextWarnPercent: options.contextWarnPercent,
+      contextStopPercent: options.contextStopPercent,
+      contextGuardState: record.contextGuard,
+      onContextGuardChange: (state) => { record.contextGuard = { ...state }; },
       onToolActivity: (activity) => {
         record.lastProgressAt = Date.now();
         if (activity.type === "end") record.toolUses++;
@@ -1556,10 +1620,16 @@ export class AgentManager {
       });
     };
     const authorizedRun = workRun
-      ? this.reserveWork(record, workRun).then(() => this.bindWork(record, session, workRun)).then(run)
+      ? this.reserveWork(record, workRun).then(async admitted => {
+        if (!admitted) return undefined;
+        await this.bindWork(record, session, workRun);
+        return run();
+      })
       : run();
     const promise = authorizedRun
-      .then(async ({ text, failure, timedOut }) => {
+      .then(async result => {
+        if (result === undefined && record.status === "skipped") { settle(); return record.result ?? ""; }
+        const { text, failure, timedOut, contextAborted, contextSteered } = result!;
         if (!this.ownsWorkRun(record, workRun)) return "";
         syncEffectiveInvocation(record, session);
         // Don't overwrite status if externally stopped via abort().
@@ -1570,8 +1640,12 @@ export class AgentManager {
           if (timedOut) {
             record.status = "timeout";
             record.stopReason = "timeout";
+          } else if (contextAborted) {
+            record.status = "aborted";
+            record.contextAborted = true;
           } else {
-            record.status = failure ? "error" : "completed";
+            record.status = failure ? "error" : contextSteered ? "steered" : "completed";
+            record.contextSteered = contextSteered || undefined;
             if (failure) {
               record.error = failure;
               record.failureKind = classifyRunFailure(failure);
@@ -1809,6 +1883,9 @@ export class AgentManager {
       // memory bound, not an expiry of the answer.
       status: record.status,
       stopReason: record.stopReason,
+      contextGuard: record.contextGuard && { ...record.contextGuard },
+      contextAborted: record.contextAborted,
+      contextSteered: record.contextSteered,
       result: record.result,
       error: record.error,
       toolUses: record.toolUses,

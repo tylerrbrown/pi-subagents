@@ -1,3 +1,4 @@
+import type { ContextGuardState } from "./context-guard.js";
 import type { AgentInvocation } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import { retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, type WorkBinding, type WorkLaunch, type WorkRecovery } from "./work-lifecycle.js";
@@ -30,7 +31,7 @@ export const MAX_CAPTURE_CHARS = 5_000_000;
 const MAX_CAPTURED_RECORD_CHARS = 8_000_000;
 const MAX_COUNT = 1_000_000_000;
 
-export type PersistedAgentStatus = "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error";
+export type PersistedAgentStatus = "completed" | "steered" | "aborted" | "stopped" | "timeout" | "error" | "skipped";
 
 export interface PersistedAgentSnapshot {
   version: typeof SUBAGENT_RECORD_VERSION;
@@ -47,6 +48,9 @@ export interface PersistedAgentSnapshot {
   lifetimeUsage: LifetimeUsage;
   compactionCount: number;
   contextPercent: number | null;
+  contextGuard?: ContextGuardState;
+  contextAborted?: boolean;
+  contextSteered?: boolean;
   toolCallId?: string;
   work?: WorkBinding;
   workLaunch?: WorkLaunch;
@@ -106,7 +110,7 @@ function count(value: unknown): value is number {
 }
 
 function isTerminalStatus(value: unknown): value is PersistedAgentStatus {
-  return value === "completed" || value === "steered" || value === "aborted" || value === "stopped" || value === "timeout" || value === "error";
+  return value === "completed" || value === "steered" || value === "aborted" || value === "stopped" || value === "timeout" || value === "error" || value === "skipped";
 }
 
 function normalizeHandle(value: unknown): string | undefined | false {
@@ -143,6 +147,21 @@ function normalizeInvocation(value: unknown): AgentInvocation | undefined | fals
     ...(value.inheritContext !== undefined && { inheritContext: value.inheritContext as boolean }),
     ...(value.runInBackground !== undefined && { runInBackground: value.runInBackground as boolean }),
     ...(value.isolation !== undefined && { isolation: value.isolation as AgentInvocation["isolation"] }),
+  };
+}
+
+function normalizeContextGuard(value: unknown): ContextGuardState | undefined {
+  if (!isObject(value)
+    || !finiteNonnegative(value.warnPercent, 100) || value.warnPercent <= 0
+    || !finiteNonnegative(value.stopPercent, 100) || value.stopPercent <= value.warnPercent
+    || typeof value.warned !== "boolean" || typeof value.stopped !== "boolean"
+    || (value.peakPercent !== null && !finiteNonnegative(value.peakPercent, 100))) return undefined;
+  return {
+    warnPercent: value.warnPercent,
+    stopPercent: value.stopPercent,
+    warned: value.warned,
+    stopped: value.stopped,
+    peakPercent: value.peakPercent as number | null,
   };
 }
 
@@ -208,10 +227,14 @@ function normalizeRecord(data: unknown): PersistedAgentRecord | undefined {
   const alias = normalizeHandle(data.handles.alias);
   const usage = normalizeUsage(data.lifetimeUsage, true);
   const invocation = normalizeInvocation(data.invocation);
+  const contextGuard = data.contextGuard === undefined ? undefined : normalizeContextGuard(data.contextGuard);
   if (handle === false || alias === false || invocation === false || !usage
+    || (data.contextGuard !== undefined && !contextGuard)
     || !count(data.toolUses)
     || !count(data.compactionCount)
     || (data.contextPercent !== null && !finiteNonnegative(data.contextPercent, 100))
+    || (data.contextAborted !== undefined && typeof data.contextAborted !== "boolean")
+    || (data.contextSteered !== undefined && typeof data.contextSteered !== "boolean")
     || !optionalBoundedString(data.toolCallId, MAX_TOOL_CALL_ID_CHARS)
     || (data.isBackground !== undefined && typeof data.isBackground !== "boolean")
     || !optionalBoundedString(data.output.file, MAX_PATH_CHARS)
@@ -250,6 +273,9 @@ function normalizeRecord(data: unknown): PersistedAgentRecord | undefined {
     lifetimeUsage: usage,
     compactionCount: data.compactionCount,
     contextPercent: data.contextPercent,
+    contextGuard,
+    contextAborted: data.contextAborted as boolean | undefined,
+    contextSteered: data.contextSteered as boolean | undefined,
     toolCallId: data.toolCallId,
     invocation,
     isBackground: data.isBackground,
@@ -276,9 +302,11 @@ export function foldWorkReconcileLedger(branch: readonly unknown[]): WorkReconci
       || !boundedString(entry.data.launchKey, 512, false)
       || !boundedString(entry.data.snapshotDigest, 64, false)
       || !/^[0-9a-f]{64}$/.test(entry.data.snapshotDigest)) continue;
-    const key = workReconcileKey(2, entry.data.launchKey, entry.data.snapshotDigest);
+    if (entry.data.bindingDigest !== undefined && (!boundedString(entry.data.bindingDigest, 64, false)
+      || !/^[0-9a-f]{64}$/.test(entry.data.bindingDigest))) continue;
+    const key = workReconcileCheckpointKey(2, entry.data.launchKey, entry.data.snapshotDigest, entry.data.bindingDigest as string | undefined);
     if (entry.customType === "subagents:work-reconcile-ack") {
-      if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "recovery"].includes(field))) continue;
+      if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "bindingDigest", "recovery"].includes(field))) continue;
       if (entry.data.recovery !== undefined) {
         try {
           const recovery = validateWorkRecovery(entry.data.recovery);
@@ -288,7 +316,7 @@ export function foldWorkReconcileLedger(branch: readonly unknown[]): WorkReconci
       }
       state.acknowledged.add(key);
     } else if (entry.customType === "subagents:work-reconcile-diagnostic") {
-      if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "failureDigest", "code", "action"].includes(field))
+      if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "bindingDigest", "failureDigest", "code", "action"].includes(field))
         || !boundedString(entry.data.failureDigest, 64, false) || !/^[0-9a-f]{64}$/.test(entry.data.failureDigest)
         || !boundedString(entry.data.code, 128, false) || !boundedString(entry.data.action, 128, false)) continue;
       state.quarantined.set(key, entry.data.failureDigest);
@@ -298,8 +326,8 @@ export function foldWorkReconcileLedger(branch: readonly unknown[]): WorkReconci
   return state;
 }
 
-export function workReconcileCheckpointKey(protocolVersion: number, launchKey: string, snapshotDigest: string): string {
-  return workReconcileKey(protocolVersion, launchKey, snapshotDigest);
+export function workReconcileCheckpointKey(protocolVersion: number, launchKey: string, snapshotDigest: string, bindingDigest?: string): string {
+  return workReconcileKey(protocolVersion, launchKey, snapshotDigest) + (bindingDigest === undefined ? "" : `:${bindingDigest}`);
 }
 
 /**

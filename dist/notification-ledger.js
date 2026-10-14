@@ -37,7 +37,7 @@ function count(value) {
     return finiteNonnegative(value, MAX_COUNT) && Number.isInteger(value);
 }
 function isTerminalStatus(value) {
-    return value === "completed" || value === "steered" || value === "aborted" || value === "stopped" || value === "timeout" || value === "error";
+    return value === "completed" || value === "steered" || value === "aborted" || value === "stopped" || value === "timeout" || value === "error" || value === "skipped";
 }
 function normalizeHandle(value) {
     if (value === undefined)
@@ -78,6 +78,21 @@ function normalizeInvocation(value) {
         ...(value.inheritContext !== undefined && { inheritContext: value.inheritContext }),
         ...(value.runInBackground !== undefined && { runInBackground: value.runInBackground }),
         ...(value.isolation !== undefined && { isolation: value.isolation }),
+    };
+}
+function normalizeContextGuard(value) {
+    if (!isObject(value)
+        || !finiteNonnegative(value.warnPercent, 100) || value.warnPercent <= 0
+        || !finiteNonnegative(value.stopPercent, 100) || value.stopPercent <= value.warnPercent
+        || typeof value.warned !== "boolean" || typeof value.stopped !== "boolean"
+        || (value.peakPercent !== null && !finiteNonnegative(value.peakPercent, 100)))
+        return undefined;
+    return {
+        warnPercent: value.warnPercent,
+        stopPercent: value.stopPercent,
+        warned: value.warned,
+        stopped: value.stopped,
+        peakPercent: value.peakPercent,
     };
 }
 function normalizeUsage(value, required) {
@@ -147,10 +162,14 @@ function normalizeRecord(data) {
     const alias = normalizeHandle(data.handles.alias);
     const usage = normalizeUsage(data.lifetimeUsage, true);
     const invocation = normalizeInvocation(data.invocation);
+    const contextGuard = data.contextGuard === undefined ? undefined : normalizeContextGuard(data.contextGuard);
     if (handle === false || alias === false || invocation === false || !usage
+        || (data.contextGuard !== undefined && !contextGuard)
         || !count(data.toolUses)
         || !count(data.compactionCount)
         || (data.contextPercent !== null && !finiteNonnegative(data.contextPercent, 100))
+        || (data.contextAborted !== undefined && typeof data.contextAborted !== "boolean")
+        || (data.contextSteered !== undefined && typeof data.contextSteered !== "boolean")
         || !optionalBoundedString(data.toolCallId, MAX_TOOL_CALL_ID_CHARS)
         || (data.isBackground !== undefined && typeof data.isBackground !== "boolean")
         || !optionalBoundedString(data.output.file, MAX_PATH_CHARS)
@@ -193,6 +212,9 @@ function normalizeRecord(data) {
         lifetimeUsage: usage,
         compactionCount: data.compactionCount,
         contextPercent: data.contextPercent,
+        contextGuard,
+        contextAborted: data.contextAborted,
+        contextSteered: data.contextSteered,
         toolCallId: data.toolCallId,
         invocation,
         isBackground: data.isBackground,
@@ -219,9 +241,12 @@ export function foldWorkReconcileLedger(branch) {
             || !boundedString(entry.data.snapshotDigest, 64, false)
             || !/^[0-9a-f]{64}$/.test(entry.data.snapshotDigest))
             continue;
-        const key = workReconcileKey(2, entry.data.launchKey, entry.data.snapshotDigest);
+        if (entry.data.bindingDigest !== undefined && (!boundedString(entry.data.bindingDigest, 64, false)
+            || !/^[0-9a-f]{64}$/.test(entry.data.bindingDigest)))
+            continue;
+        const key = workReconcileCheckpointKey(2, entry.data.launchKey, entry.data.snapshotDigest, entry.data.bindingDigest);
         if (entry.customType === "subagents:work-reconcile-ack") {
-            if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "recovery"].includes(field)))
+            if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "bindingDigest", "recovery"].includes(field)))
                 continue;
             if (entry.data.recovery !== undefined) {
                 try {
@@ -237,7 +262,7 @@ export function foldWorkReconcileLedger(branch) {
             state.acknowledged.add(key);
         }
         else if (entry.customType === "subagents:work-reconcile-diagnostic") {
-            if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "failureDigest", "code", "action"].includes(field))
+            if (Object.keys(entry.data).some(field => !["version", "protocolVersion", "launchKey", "snapshotDigest", "bindingDigest", "failureDigest", "code", "action"].includes(field))
                 || !boundedString(entry.data.failureDigest, 64, false) || !/^[0-9a-f]{64}$/.test(entry.data.failureDigest)
                 || !boundedString(entry.data.code, 128, false) || !boundedString(entry.data.action, 128, false))
                 continue;
@@ -247,8 +272,8 @@ export function foldWorkReconcileLedger(branch) {
     }
     return state;
 }
-export function workReconcileCheckpointKey(protocolVersion, launchKey, snapshotDigest) {
-    return workReconcileKey(protocolVersion, launchKey, snapshotDigest);
+export function workReconcileCheckpointKey(protocolVersion, launchKey, snapshotDigest, bindingDigest) {
+    return workReconcileKey(protocolVersion, launchKey, snapshotDigest) + (bindingDigest === undefined ? "" : `:${bindingDigest}`);
 }
 /**
  * A retained v1 record cannot mint successor authority. S04 will persist and

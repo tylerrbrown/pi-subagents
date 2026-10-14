@@ -32,6 +32,7 @@ function relTime(iso: string | undefined, now = Date.now()): string {
 
 /** One-line status icon. */
 function statusIcon(j: ScheduledSubagent): string {
+  if (j.lastStatus === "skipped") return "- skipped (no child run)";
   if (!j.enabled) return "✗";
   if (j.lastStatus === "error") return "!";
   if (j.lastStatus === "running") return "⋯";

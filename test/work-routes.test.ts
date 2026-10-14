@@ -16,6 +16,7 @@ import { registerAgents } from "../src/agent-types.js";
 import { registerRpcHandlers } from "../src/cross-extension-rpc.js";
 import subagentsExtension from "../src/index.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
+import { foldNotificationLedger } from "../src/notification-ledger.js";
 import { SubagentScheduler } from "../src/schedule.js";
 import * as lifecycle from "../src/work-lifecycle.js";
 import { makePi, textOf } from "./helpers/boot-extension.js";
@@ -62,6 +63,118 @@ async function assertBoundary(start: () => Promise<any>) {
   return result;
 }
 describe("Work binding through consumer routes", () => {
+  it("writes an exact bound-child marker only after Work bind before child extensions", async () => {
+    const child = childSession();
+    adapter.held.add("bind");
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      expect(options!.bindBeforeExtensions).toBe(true);
+      await options!.onSessionCreated?.(child);
+      expect(child.sessionManager.appendCustomEntry).toHaveBeenCalledOnce();
+      return { session: child, responseText: "done", aborted: false, steered: false };
+    });
+    const agent = boot();
+    const pending = agent.execute("marker-call", { ...params, run_in_background: false }, undefined, undefined, workContext());
+    await vi.waitFor(() => expect(adapter.requests.bind).toHaveLength(1));
+    expect(child.sessionManager.appendCustomEntry).not.toHaveBeenCalled();
+    adapter.reply("bind", adapter.requests.bind[0]);
+    await pending;
+    expect(child.sessionManager.appendCustomEntry).toHaveBeenCalledWith("work-bound-session", {
+      schemaVersion: 1, childSessionId: "actual-child-session", caseHandle: work.case,
+      executionId: work.execution, assignmentId: "reservation-04", launchKey: adapter.requests.bind[0].launchKey,
+    });
+  });
+  function skipReservations() {
+    adapter.held.add("reserve");
+    adapter.events.on("subagents:work:reserve", request => {
+      adapter.events.emit(`subagents:work:reserve:reply:${request.requestId}`, { success: true, data: {
+        status: "skipped", reason: "review_budget_exhausted", action: "lead_continue", run_started: false,
+        case_uid: "00000000-0000-4000-8000-000000000001", execution_id: work.execution,
+        launch_key: request.payload.launchKey, slice_ids: ["S02"], advisories: [],
+      } });
+    });
+  }
+  it("RPC returns the nonfatal skip instead of a started child identifier", async () => {
+    skipReservations();
+    registerRpcHandlers({ events: adapter.events, pi: adapter.pi, getCtx: workContext, manager });
+    const reply = new Promise<any>(resolve => adapter.events.on("subagents:rpc:spawn:reply:skip-rpc", resolve));
+    adapter.events.emit("subagents:rpc:spawn", { requestId: "skip-rpc", type: "general-purpose", prompt: "private", options: { description: "test", work } });
+    expect(await reply).toMatchObject({ success: true, data: { status: "skipped", run_started: false, action: "lead_continue" } });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+  it("the agent picker distinguishes a skipped check from an expired child", async () => {
+    skipReservations();
+    const host = makePi(); Object.assign(host.pi, adapter.pi); subagentsExtension(host.pi);
+    shutdown = async () => { await host.lifecycle.get("session_shutdown")?.({}, workContext()); };
+    await host.tools.get("Agent").execute("skip-picker", { ...params, run_in_background: false }, undefined, undefined, workContext());
+    const command = host.pi.registerCommand.mock.calls.find(([name]: [string]) => name === "agents")[1];
+    const ctx = workContext();
+    ctx.ui.select = vi.fn().mockImplementationOnce(async (_title, rows) => rows[0])
+      .mockImplementationOnce(async (_title, rows) => rows[0]).mockResolvedValue(undefined);
+    await command.handler("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("skipped"), "info");
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("expired"), "info");
+  });
+  it("scheduled skip is neither a successful run nor an error", async () => {
+    vi.useFakeTimers(); skipReservations();
+    const jobs = new Map<string, any>();
+    const store = { list: () => [...jobs.values()], hasName: () => false,
+      add: (job: any) => jobs.set(job.id, job), get: (id: string) => jobs.get(id),
+      update: (id: string, patch: any) => { const job = { ...jobs.get(id), ...patch }; jobs.set(id, job); return job; },
+    } as any;
+    scheduler.start(adapter.pi, workContext(), manager, store);
+    const job = scheduler.addJob({ ...params, name: "skip", schedule: "+1s" });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(jobs.get(job.id)).toMatchObject({ lastStatus: "skipped", runCount: 0, occurrenceCount: 1 });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("nested reports a skipped check without a started child (background=%s)", async background => {
+    const [agent] = createNestedSubagentTools({ manager, pi: adapter.pi, parentAgentId: "owner", depth: 1, maxSubagentDepth: 3, allowedSubagents: "all", configCwd: process.cwd() });
+    adapter.held.add("reserve");
+    adapter.events.on("subagents:work:reserve", request => {
+      adapter.events.emit(`subagents:work:reserve:reply:${request.requestId}`, { success: true, data: {
+        status: "skipped", reason: "review_budget_exhausted", action: "lead_continue", run_started: false,
+        case_uid: "00000000-0000-4000-8000-000000000001", execution_id: work.execution,
+        launch_key: request.payload.launchKey, slice_ids: ["S02"], advisories: [],
+      } });
+    });
+    const result = await agent.execute("skip-nested", { ...params, run_in_background: background }, undefined, undefined, workContext());
+    expect(textOf(result)).toContain('"status":"skipped"');
+    expect(textOf(result)).not.toContain("started in background");
+    expect(result.isError).not.toBe(true);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("Agent reports nonfatal skipped checks without claiming a child started (background=%s)", async background => {
+    const agent = boot(); adapter.held.add("reserve");
+    adapter.events.on("subagents:work:reserve", request => {
+      adapter.events.emit(`subagents:work:reserve:reply:${request.requestId}`, { success: true, data: {
+        status: "skipped", reason: "review_budget_exhausted", action: "lead_continue", run_started: false,
+        case_uid: "00000000-0000-4000-8000-000000000001", execution_id: work.execution,
+        launch_key: request.payload.launchKey, slice_ids: ["S02"], advisories: [],
+      } });
+    });
+    const completed = vi.fn(); adapter.events.on("subagents:completed", completed);
+    const result = await agent.execute("skip-public-tool", { ...params, run_in_background: background }, undefined, undefined, workContext());
+    expect(textOf(result)).toContain('"status":"skipped"');
+    expect(textOf(result)).not.toMatch(/Agent (completed|started)/);
+    expect(result.details.status).toBe("skipped");
+    expect(result.isError).not.toBe(true);
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    expect(adapter.entries.some(entry => entry.customType === "subagents:record" && entry.data.status === "skipped")).toBe(true);
+    const restored = [...foldNotificationLedger(adapter.entries).records.values()];
+    expect(restored).toHaveLength(1);
+    expect(restored[0].status).toBe("skipped");
+    expect(JSON.parse(restored[0].result!)).toMatchObject({ status: "skipped", run_started: false });
+  });
+  it("Agent tool accepts an explicit slice selector and carries it into reservation", async () => {
+    const agent = boot();
+    const selected = { ...work, selectedSliceIds: ["S02"] };
+    expect(Value.Check(agent.parameters.properties.work, selected)).toBe(true);
+    expect(Value.Check(agent.parameters.properties.work, { ...work, selectedSliceIds: ["\u{10000}".repeat(256)] })).toBe(true);
+    await agent.execute("selected-tool-call", { ...params, work: selected, run_in_background: false }, undefined, undefined, workContext());
+    expect(adapter.requests.reserve[0].work.selectedSliceIds).toEqual(["S02"]);
+    expect(adapter.requests.bind[0].work.selectedSliceIds).toEqual(["S02"]);
+  });
   it.each([false, true])("Agent run_in_background=%s shares reserve/bind boundary and exact cwd", async background => {
     const agent = boot();
     const cwd = `${process.cwd()}/.`;
@@ -424,6 +537,7 @@ describe("Work recovery replay route", () => {
           protocolVersion: 2,
           launchKey: recoveryLaunchKey,
           snapshotDigest: recoveryDescriptor.expectedTerminalSnapshotDigest,
+          bindingDigest: lifecycle.workBindingDigest(work),
           recovery: recoveryDescriptor,
         },
       }]);

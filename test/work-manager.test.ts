@@ -6,7 +6,7 @@ vi.mock("../src/worktree.js", () => ({ createWorktree: vi.fn(), cleanupWorktree:
 import { AgentManager } from "../src/agent-manager.js";
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { workRecoveryDescriptor } from "../src/notification-ledger.js";
-import { workTerminalProofDigest } from "../src/work-lifecycle.js";
+import { workBindingDigest, workTerminalProofDigest } from "../src/work-lifecycle.js";
 import { childSession, deferred, withSyntheticEnvironment, work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
 let manager: AgentManager;
@@ -58,8 +58,24 @@ describe("Work manager launch boundary", () => {
     vi.useFakeTimers(); adapter.held.add("reserve");
     const id = spawn();
     const failure = expect(manager.awaitStartup(id)).rejects.toThrow("did not reply");
-    await vi.advanceTimersByTimeAsync(5000); await failure;
+    await vi.advanceTimersByTimeAsync(65000); await failure;
     expect(runAgent).not.toHaveBeenCalled();
+    expect(adapter.requests.finalize).toHaveLength(1);
+  });
+  it.each(["reserve", "bind"])("late %s success cannot deliver a prompt or start a replacement", async action => {
+    vi.useFakeTimers();
+    adapter.held.add(action);
+    const id = spawn();
+    const startup = manager.awaitStartup(id).catch(error => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(adapter.requests[action]).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(60000);
+    adapter.reply(action, adapter.requests[action][0]);
+    expect(await startup).toEqual(expect.objectContaining({ message: expect.stringContaining("indeterminate") }));
+    await manager.getRecord(id)!.promise;
+    expect(prompt).not.toHaveBeenCalled();
+    expect(runAgent).toHaveBeenCalledTimes(action === "reserve" ? 0 : 1);
+    expect(adapter.requests.reserve).toHaveLength(1);
     expect(adapter.requests.finalize).toHaveLength(1);
   });
   it.each([
@@ -128,7 +144,7 @@ describe("Work manager launch boundary", () => {
     adapter.held.add("finalize");
     adapter.events.on("subagents:work:finalize", request => adapter.events.emit(
       `subagents:work:finalize:reply:${request.requestId}`,
-      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.terminalSnapshotDigest } },
+      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.payload.terminalSnapshotDigest } },
     ));
     const id = spawn(); await settle(id);
     const request = adapter.requests.finalize[0];
@@ -137,6 +153,7 @@ describe("Work manager launch boundary", () => {
     expect(adapter.entries).toContainEqual({ customType: "subagents:work-reconcile-ack", data: {
       version: 1, protocolVersion: 2, launchKey: request.launch.launchKey,
       snapshotDigest: request.terminalSnapshotDigest,
+      bindingDigest: workBindingDigest(request.launch.work),
     } });
   });
 
@@ -145,12 +162,12 @@ describe("Work manager launch boundary", () => {
     adapter.events.on("subagents:work:finalize", request => adapter.events.emit(
       `subagents:work:finalize:reply:${request.requestId}`,
       { success: false, error: shape === "already_applied"
-        ? { status: "already_applied", terminalSnapshotDigest: request.terminalSnapshotDigest }
+        ? { status: "already_applied", terminalSnapshotDigest: request.payload.terminalSnapshotDigest }
         : {
-            predecessorAssignmentId: request.proof.reservationId,
-            predecessorLaunchKey: request.launch.launchKey,
+            predecessorAssignmentId: request.payload.proof.reservationId,
+            predecessorLaunchKey: request.payload.launch.launchKey,
             recoveryAuthorizationId: "must-not-persist",
-            expectedTerminalSnapshotDigest: request.terminalSnapshotDigest,
+            expectedTerminalSnapshotDigest: request.payload.terminalSnapshotDigest,
           } },
     ));
     const id = spawn(); await settle(id);
@@ -189,7 +206,7 @@ describe("Work manager launch boundary", () => {
     adapter.held.add("finalize");
     adapter.events.on("subagents:work:finalize", request => adapter.events.emit(
       `subagents:work:finalize:reply:${request.requestId}`,
-      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.terminalSnapshotDigest } },
+      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.payload.terminalSnapshotDigest } },
     ));
     const id = spawn(); await settle(id); await manager.dispose();
     manager = new AgentManager();

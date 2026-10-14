@@ -9,13 +9,142 @@ vi.mock("../src/agent-runner.js", async importOriginal => ({
 vi.mock("../src/worktree.js", () => ({ createWorktree: vi.fn(), cleanupWorktree: vi.fn(), pruneWorktrees: vi.fn(), isWorktreeIsolationEnabled: () => true }));
 
 import { AgentManager } from "../src/agent-manager.js";
-import { bindExtensionsWithStartupObservation, runAgent } from "../src/agent-runner.js";
-import { canonicalWorkTerminalProofBytes, requestWork, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, validateWorkTerminalProof, workLaunchKey, workTerminalProofDigest } from "../src/work-lifecycle.js";
+import { bindExtensionsWithStartupObservation, resumeAgent, runAgent } from "../src/agent-runner.js";
+import { canonicalWorkTerminalProofBytes, requestWork, requestWorkReply, retainedWorkSnapshots, validateWorkBinding, validateWorkRecovery, validateWorkReservation, validateWorkTerminalProof, workBindingDigest, workLaunchKey, workTerminalProofDigest } from "../src/work-lifecycle.js";
 import { childSession, deferred, work, workAdapter, workContext } from "./helpers/work-adapter.js";
 
 const launch = { launchKey: workLaunchKey("parent", "call"), parentSessionId: "parent", invocationId: "call", agentId: "agent", agentType: "general-purpose", description: "test", cwd: process.cwd(), work };
 afterEach(() => vi.useRealTimers());
 describe("Work wire protocol", () => {
+  it("snapshots and canonicalizes explicit selected slices without adding absent optional fields", () => {
+    const selectedSliceIds = ["S02", "S01"];
+    const binding = validateWorkBinding({ ...work, selectedSliceIds })!;
+    expect(binding.selectedSliceIds).toEqual(["S01", "S02"]);
+    selectedSliceIds.push("S03");
+    expect(binding.selectedSliceIds).toEqual(["S01", "S02"]);
+    expect(validateWorkBinding(work)).not.toHaveProperty("selectedSliceIds");
+    expect(validateWorkBinding({ ...work, selectedSliceIds: ["\u{10000}".repeat(256), "\ue000"] })?.selectedSliceIds)
+      .toEqual(["\ue000", "\u{10000}".repeat(256)]);
+  });
+  it.each([[], [""], [" S01"], ["S01 "], ["S01\n"], ["S01", "S01"], [42],
+    ["x".repeat(257)], Array.from({ length: 129 }, (_, index) => `S${index}`), null])(
+    "rejects malformed selected slices %#", selectedSliceIds => {
+      expect(() => validateWorkBinding({ ...work, selectedSliceIds })).toThrow();
+    },
+  );
+  it("carries selected slices through real manager launch, resume, persistence and reconciliation", async () => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const session = childSession();
+    const selectedSliceIds = ["S02"];
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await options.onSessionCreated?.(session);
+      return { session, responseText: "", aborted: false, timedOut: false, steered: false };
+    });
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "resumed" });
+    try {
+      const id = manager.spawn(adapter.pi, workContext(), "verifier", "prompt", {
+        description: "test", invocationId: "selected-slice-launch", work: { ...work, selectedSliceIds },
+      });
+      selectedSliceIds.push("S01");
+      await manager.awaitStartup(id);
+      await manager.getRecord(id)?.promise;
+      expect(adapter.requests.reserve[0].work.selectedSliceIds).toEqual(["S02"]);
+      expect(adapter.requests.bind[0].work.selectedSliceIds).toEqual(["S02"]);
+      expect(adapter.entries[0].data.launch).not.toHaveProperty("recovery");
+      expect(adapter.entries[0].data.launch).not.toHaveProperty("agentName");
+      await expect(manager.resume(id, "next", undefined, {
+        toolCallId: "changed-slices", work: { ...work, selectedSliceIds: ["S01"] },
+      })).rejects.toThrow("Cannot change");
+      await expect(manager.resume(id, "next", undefined, {
+        toolCallId: "removed-slices", work,
+      })).rejects.toThrow("Cannot change");
+      expect(() => manager.spawn(adapter.pi, workContext(), "verifier", "prompt", {
+        description: "test", invocationId: "selected-slice-launch", work: { ...work, selectedSliceIds: ["S01"] },
+      })).toThrow("already launched");
+      expect(adapter.requests.reserve).toHaveLength(1);
+      await manager.resume(id, "next", undefined, { toolCallId: "same-slices" });
+      expect(adapter.requests.reserve[1].work.selectedSliceIds).toEqual(["S02"]);
+      await manager.reconcileWork(adapter.pi, adapter.entries);
+      expect(adapter.requests.reconcile.every(request => request.launch.work.selectedSliceIds.join() === "S02")).toBe(true);
+      expect(retainedWorkSnapshots(adapter.entries).every(snapshot => snapshot.launch.work.selectedSliceIds?.join() === "S02")).toBe(true);
+    } finally { await manager.dispose(); }
+  });
+  it("revalidates a retained selector against Work even with a matching legacy ACK", async () => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const selectedLaunch = { ...launch, work: { ...work, selectedSliceIds: ["S02"] },
+      reservation: { reservationId: "assignment-selected" }, childSessionId: "child-selected", bound: true };
+    const proof = {
+      schemaVersion: 2 as const, reservationId: "assignment-selected", launchKey: launch.launchKey,
+      childSessionId: "child-selected", bound: true, promptDelivered: false, modelTurnCount: 0,
+      toolUseCount: 0, resultProduced: false, terminalStatus: "completed" as const, startupEffectsAbsent: false,
+    };
+    const branch = [
+      { customType: "subagents:work-record", data: { version: 2, launch: selectedLaunch, proof } },
+      { customType: "subagents:work-reconcile-ack", data: { version: 1, protocolVersion: 2,
+        launchKey: launch.launchKey, snapshotDigest: workTerminalProofDigest(proof) } },
+    ];
+    adapter.refused.add("reconcile");
+    try {
+      await manager.reconcileWork(adapter.pi, branch);
+      expect(adapter.requests.reconcile).toHaveLength(1);
+      expect(adapter.requests.reconcile[0].launch.work.selectedSliceIds).toEqual(["S02"]);
+      expect(adapter.entries.filter(entry => entry.customType === "subagents:work-reconcile-ack")).toHaveLength(0);
+    } finally { await manager.dispose(); }
+  });
+  it.each(["changed", "removed"])("does not reuse an ACK after selected slices are %s", async change => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const originalWork = { ...work, selectedSliceIds: ["S02"] };
+    const changedWork = change === "removed" ? work : { ...work, selectedSliceIds: ["S01"] };
+    const selectedLaunch = { ...launch, work: changedWork,
+      reservation: { reservationId: "assignment-selected" }, childSessionId: "child-selected", bound: true };
+    const proof = {
+      schemaVersion: 2 as const, reservationId: "assignment-selected", launchKey: launch.launchKey,
+      childSessionId: "child-selected", bound: true, promptDelivered: false, modelTurnCount: 0,
+      toolUseCount: 0, resultProduced: false, terminalStatus: "completed" as const, startupEffectsAbsent: false,
+    };
+    const branch = [
+      { customType: "subagents:work-record", data: { version: 2, launch: selectedLaunch, proof } },
+      { customType: "subagents:work-reconcile-ack", data: { version: 1, protocolVersion: 2,
+        launchKey: launch.launchKey, snapshotDigest: workTerminalProofDigest(proof), bindingDigest: workBindingDigest(originalWork) } },
+    ];
+    adapter.refused.add("reconcile");
+    try {
+      await manager.reconcileWork(adapter.pi, branch);
+      expect(adapter.requests.reconcile).toHaveLength(1);
+      expect(adapter.entries.filter(entry => entry.customType === "subagents:work-reconcile-ack")).toHaveLength(0);
+    } finally { await manager.dispose(); }
+  });
+  it("revalidates a legacy ACK once and then reuses its binding-bound replacement", async () => {
+    const adapter = workAdapter();
+    const manager = new AgentManager(undefined, 1);
+    const retainedLaunch = { ...launch, reservation: { reservationId: "assignment-old" }, childSessionId: "child-old", bound: true };
+    const proof = {
+      schemaVersion: 2 as const, reservationId: "assignment-old", launchKey: launch.launchKey,
+      childSessionId: "child-old", bound: true, promptDelivered: false, modelTurnCount: 0,
+      toolUseCount: 0, resultProduced: false, terminalStatus: "completed" as const, startupEffectsAbsent: false,
+    };
+    const branch = [
+      { customType: "subagents:work-record", data: { version: 2, launch: retainedLaunch, proof } },
+      { customType: "subagents:work-reconcile-ack", data: { version: 1, protocolVersion: 2,
+        launchKey: launch.launchKey, snapshotDigest: workTerminalProofDigest(proof) } },
+    ];
+    adapter.held.add("reconcile");
+    adapter.events.on("subagents:work:reconcile", request => adapter.events.emit(
+      `subagents:work:reconcile:reply:${request.requestId}`,
+      { success: true, data: { status: "already_applied", terminalSnapshotDigest: request.payload.terminalSnapshotDigest } },
+    ));
+    try {
+      await manager.reconcileWork(adapter.pi, branch);
+      expect(adapter.requests.reconcile).toHaveLength(1);
+      expect(adapter.entries[0].data.bindingDigest).toBe(workBindingDigest(work));
+      await manager.reconcileWork(adapter.pi, [...branch, ...adapter.entries]);
+      expect(adapter.requests.reconcile).toHaveLength(1);
+      expect(adapter.requests.reconcile[0].launch.work).not.toHaveProperty("selectedSliceIds");
+    } finally { await manager.dispose(); }
+  });
   it.each(["reserve", "bind", "finalize", "reconcile"] as const)("handles synchronous %s replies and detaches payloads", async action => {
     const adapter = workAdapter();
     const payload = action === "reserve" || action === "bind" ? launch : { version: 1 as const, launch, status: "completed" as const };
@@ -31,13 +160,63 @@ describe("Work wire protocol", () => {
     const result = requestWork(adapter.events, "reserve", launch);
     const failure = expect(result).rejects.toThrow("did not reply");
     adapter.events.emit("subagents:work:reserve:reply:wrong-id", { success: true });
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(65000);
     await failure;
+  });
+  it("sends the bounded v3 envelope and accepts a slow reply before its deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100000);
+    const adapter = workAdapter();
+    adapter.held.add("reserve");
+    const sent: unknown[] = [];
+    adapter.events.on("subagents:work:reserve", request => sent.push(request));
+    const result = requestWork(adapter.events, "reserve", launch);
+    const outcome = result.then(value => ({ value }), error => ({ error }));
+    expect(sent[0]).toEqual({ requestId: expect.any(String), protocolVersion: 3, deadlineAt: 160000, payload: launch });
+    await vi.advanceTimersByTimeAsync(6000);
+    adapter.reply("reserve", adapter.requests.reserve[0]);
+    expect(await outcome).toEqual({ value: { reservationId: "reservation-04" } });
+  });
+  it("does not accept success at the mutation deadline even during caller grace", async () => {
+    vi.useFakeTimers();
+    const adapter = workAdapter();
+    adapter.held.add("bind");
+    const outcome = requestWork(adapter.events, "bind", launch).catch(error => error);
+    await vi.advanceTimersByTimeAsync(60000);
+    adapter.reply("bind", adapter.requests.bind[0]);
+    expect(await outcome).toEqual(expect.objectContaining({ message: expect.stringContaining("indeterminate") }));
+    expect(vi.getTimerCount()).toBe(0);
   });
   it("does not expose arbitrary adapter error bodies", async () => {
     const adapter = workAdapter();
     adapter.refused.add("bind");
     await expect(requestWork(adapter.events, "bind", launch)).rejects.toThrow("Work bind adapter refused the request.");
+  });
+  it.each(["reserve", "bind", "finalize", "reconcile"] as const)("bounds %s watchdog and ignores late success without retry", async action => {
+    vi.useFakeTimers();
+    const adapter = workAdapter();
+    adapter.held.add(action);
+    const outcome = requestWorkReply(adapter.events, action, launch).catch(error => error);
+    await vi.advanceTimersByTimeAsync(64999);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const failure = await outcome;
+    expect(failure).toEqual(expect.objectContaining({ message: expect.stringContaining("indeterminate") }));
+    adapter.reply(action, adapter.requests[action][0]);
+    expect(await outcome).toBe(failure);
+    expect(adapter.requests[action]).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("preserves typed terminal failure during reply grace without treating it as success", async () => {
+    vi.useFakeTimers();
+    const adapter = workAdapter();
+    adapter.held.add("finalize");
+    const outcome = requestWorkReply(adapter.events, "finalize", launch);
+    await vi.advanceTimersByTimeAsync(61000);
+    const error = { code: "indeterminate", retryable: false, action: "retry_exact_read" };
+    adapter.events.emit(`subagents:work:finalize:reply:${adapter.requests.finalize[0].requestId}`, { success: false, error });
+    expect(await outcome).toEqual({ success: false, error });
+    expect(vi.getTimerCount()).toBe(0);
   });
   it.each([
     null, [], {}, { ...work, extra: true }, { ...work, case: " " },

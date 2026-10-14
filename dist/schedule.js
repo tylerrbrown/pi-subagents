@@ -18,6 +18,7 @@ import { Cron } from "croner";
 import { nanoid } from "nanoid";
 import { assertValidSpawnCwd } from "./agent-manager.js";
 import { resolveSpawnType } from "./agent-types.js";
+import { resolveContextThresholds } from "./context-guard.js";
 import { resolveModel } from "./model-resolver.js";
 import { validateWorkBinding } from "./work-lifecycle.js";
 export class SubagentScheduler {
@@ -65,6 +66,7 @@ export class SubagentScheduler {
     buildJob(input) {
         const detected = SubagentScheduler.detectSchedule(input.schedule);
         assertValidSpawnCwd(input.cwd);
+        resolveContextThresholds({ warn: input.context_warn_percent, stop: input.context_stop_percent }, undefined, undefined);
         const work = validateWorkBinding(input.work);
         if (work && input.isolation === "worktree")
             throw new Error("Work binding cannot be combined with Agent worktree isolation.");
@@ -82,6 +84,8 @@ export class SubagentScheduler {
             model: input.model,
             thinking: input.thinking,
             max_turns: input.max_turns,
+            context_warn_percent: input.context_warn_percent,
+            context_stop_percent: input.context_stop_percent,
             isolated: input.isolated,
             isolation: input.isolation,
             enabled: true,
@@ -119,6 +123,7 @@ export class SubagentScheduler {
         if (existing) {
             const candidate = { ...existing, ...patch };
             assertValidSpawnCwd(candidate.cwd);
+            resolveContextThresholds({ warn: candidate.context_warn_percent, stop: candidate.context_stop_percent }, undefined, undefined);
             const work = validateWorkBinding(candidate.work);
             if (work && candidate.isolation === "worktree")
                 throw new Error("Work binding cannot be combined with Agent worktree isolation.");
@@ -157,6 +162,7 @@ export class SubagentScheduler {
         if (!store)
             return;
         try {
+            resolveContextThresholds({ warn: job.context_warn_percent, stop: job.context_stop_percent }, undefined, undefined);
             if (job.scheduleType === "interval" && job.intervalMs) {
                 const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
                 this.intervals.set(job.id, t);
@@ -251,6 +257,8 @@ export class SubagentScheduler {
                 bypassQueue: true,
                 model: resolvedModel,
                 maxTurns: job.max_turns,
+                contextWarnPercent: job.context_warn_percent,
+                contextStopPercent: job.context_stop_percent,
                 isolated: job.isolated,
                 thinkingLevel: job.thinking,
                 isolation: job.isolation,
@@ -269,7 +277,7 @@ export class SubagentScheduler {
             store.update(id, {
                 lastRun: new Date().toISOString(),
                 lastStatus: status,
-                runCount: (current?.runCount ?? 0) + 1,
+                runCount: (current?.runCount ?? 0) + (status === "skipped" ? 0 : 1),
                 nextRun: next,
             });
         };
@@ -282,7 +290,7 @@ export class SubagentScheduler {
             .then(() => {
             const r = manager.getRecord(agentId);
             const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped" || r?.status === "timeout";
-            finalize(failed ? "error" : "success");
+            finalize(r?.status === "skipped" ? "skipped" : failed ? "error" : "success");
         })
             .catch(() => finalize("error"));
     }

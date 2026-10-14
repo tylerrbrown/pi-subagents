@@ -9,6 +9,7 @@
  *   error   → { success: false, error: string }
  */
 import { resolveModel } from "./model-resolver.js";
+import { validateWorkSkipped } from "./work-lifecycle.js";
 /** RPC protocol version — bumped when the envelope or method contracts change. */
 export const PROTOCOL_VERSION = 2;
 /**
@@ -70,6 +71,10 @@ export function registerRpcHandlers(deps) {
         }
         const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
         await manager.awaitStartup(id);
+        const record = manager.getRecord?.(id);
+        if (record?.status === "skipped" && record.workLaunch) {
+            return validateWorkSkipped(JSON.parse(record.result ?? "null"), record.workLaunch);
+        }
         return { id };
     });
     const unsubStop = handleRpc(events, "subagents:rpc:stop", ({ agentId }) => {
