@@ -24,12 +24,12 @@
     "autonomous"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.81.0",
-    "@earendil-works/pi-coding-agent": ">=0.81.0",
-    "@earendil-works/pi-tui": ">=0.81.0"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.49",
     "croner": "^10.0.1",
     "nanoid": "^5.1.16"
   },
@@ -49,6 +49,7 @@
     "@earendil-works/pi-ai": "0.84.2",
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@earendil-works/pi-tui": "0.84.2",
+    "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.5.0",
     "@vitest/coverage-istanbul": "^4.1.10",
     "typescript": "^6.0.0",
