@@ -6,7 +6,7 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import type { ResumeOptions } from "./agent-manager.js";
 import {
@@ -83,7 +83,7 @@ export interface NestedAgentManager {
     prompt: string,
     options: NestedSpawnOptions,
   ): string;
-  /** Same-tick startup await; worktree failures reject here. */
+  /** Resolves once the spawned agent is running; rejects on a startup failure. */
   awaitStartup(id: string): Promise<void>;
   spawnAndWait(
     pi: ExtensionAPI,

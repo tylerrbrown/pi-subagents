@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -71,6 +71,14 @@ export function resolveAgentInvocationConfig(agentConfig, params, opts) {
     // a value. Everything downstream then sees "worktree" or nothing at all.
     const requested = agentConfig?.isolation ?? params.isolation;
     const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
+    const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
+        && agentConfig.thinking !== params.thinking
+        ? params.thinking
+        : undefined;
+    const overriddenModel = agentConfig?.model != null && params.model != null
+        && agentConfig.model !== params.model
+        ? params.model
+        : undefined;
     return {
         modelInput: agentConfig?.model ?? params.model,
         modelFromParams: agentConfig?.model == null && params.model != null,
@@ -85,6 +93,12 @@ export function resolveAgentInvocationConfig(agentConfig, params, opts) {
         tools: params.tools,
         skills: params.skills,
         extensions: params.extensions,
+        // Undefined rather than an empty object when nothing was overridden: callers
+        // spread this into the invocation snapshot, and an always-present key would
+        // put `requestedThinking: undefined` on every record.
+        overridden: overriddenThinking || overriddenModel
+            ? { thinking: overriddenThinking, model: overriddenModel }
+            : undefined,
     };
 }
 export function resolveJoinMode(defaultJoinMode, runInBackground) {

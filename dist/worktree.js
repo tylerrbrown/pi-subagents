@@ -31,22 +31,6 @@ export function setWorktreeIsolationEnabled(enabled) {
 export function isWorktreeIsolationEnabled() {
     return worktreeIsolationEnabled;
 }
-/**
- * Run git and return its trimmed stdout, throwing on failure so callers keep
- * the try/catch control flow `execFileSync` gave them.
- *
- * `pi.exec` never rejects — it reports failure in the result — and a command
- * killed by its timeout comes back as `killed` with an exit code of 0, so both
- * have to be checked to reproduce `execFileSync`'s "throws on anything but a
- * clean exit".
- */
-async function git(pi, cwd, args, timeout) {
-    const result = await pi.exec("git", args, { cwd, timeout });
-    if (result.killed || result.code !== 0) {
-        throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
-    }
-    return result.stdout.trim();
-}
 /** Convert Git's slash-separated repo prefix to a contained host path. */
 function safeRepoSubdir(prefix) {
     if (!prefix)
@@ -65,6 +49,22 @@ function safeRepoSubdir(prefix) {
 export function isPathContained(root, candidate) {
     const rel = relative(resolve(root), resolve(candidate));
     return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+/**
+ * Run git and return its trimmed stdout, throwing on failure so callers keep
+ * the try/catch control flow `execFileSync` gave them.
+ *
+ * `pi.exec` never rejects — it reports failure in the result — and a command
+ * killed by its timeout comes back as `killed` with an exit code of 0, so both
+ * have to be checked to reproduce `execFileSync`'s "throws on anything but a
+ * clean exit".
+ */
+async function git(pi, cwd, args, timeout) {
+    const result = await pi.exec("git", args, { cwd, timeout });
+    if (result.killed || result.code !== 0) {
+        throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
+    }
+    return result.stdout.trim();
 }
 /**
  * Create a temporary git worktree for an agent.

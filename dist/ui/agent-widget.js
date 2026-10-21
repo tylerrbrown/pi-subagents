@@ -6,6 +6,7 @@
  */
 import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentNameLabel } from "../agent-color.js";
+import { isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import { hasModelMismatch } from "../invocation-truth.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
@@ -215,7 +216,13 @@ export function getPromptModeLabel(type) {
     const config = getConfig(type);
     return config.promptMode === "append" ? "twin" : undefined;
 }
-/** Mode label is not included — callers add it where they want it. */
+/**
+ * Mode label is not included — callers add it where they want it.
+ *
+ * Both model forms come back so each surface can pick by width; the
+ * "(asked X)" annotation is applied here rather than by callers, so a value the
+ * spawn did not honor cannot be rendered as though it had been (#182).
+ */
 export function buildInvocationTags(invocation) {
     const tags = [];
     if (!invocation)
@@ -238,6 +245,7 @@ export function buildInvocationTags(invocation) {
     const modelName = invocation.modelName;
     return {
         modelName: modelName && hasModelMismatch(invocation) ? `${modelName} (asked ${invocation.requestedModel})` : modelName,
+        modelId: invocation.modelId && hasModelMismatch(invocation) ? `${invocation.modelId} (asked ${invocation.requestedModel})` : invocation.modelId,
         tags,
     };
 }
@@ -279,6 +287,7 @@ export class AgentWidget {
     agentActivity;
     mode;
     showCost;
+    showModel;
     uiCtx;
     widgetFrame = 0;
     widgetInterval;
@@ -304,11 +313,20 @@ export class AgentWidget {
      * estimated cost beside their token count. Defaults to off — the extension
      * supplies the user's `showCost` setting.
      */
-    showCost = () => false) {
+    showCost = () => false, 
+    /**
+     * Read live at render time, like `mode`. Whether running agents name the
+     * model driving them and the thinking level it is running at. Defaults to
+     * off — the extension supplies the user's `showModel` setting — because the
+     * row is already dense and the same pair is on the tool result and in the
+     * conversation viewer unconditionally.
+     */
+    showModel = () => false) {
         this.manager = manager;
         this.agentActivity = agentActivity;
         this.mode = mode;
         this.showCost = showCost;
+        this.showModel = showModel;
     }
     /**
      * Agents eligible for the widget, per the current `WidgetMode`:
@@ -322,7 +340,7 @@ export class AgentWidget {
      *   - `all`: every agent.
      */
     widgetAgents() {
-        const all = this.manager.listAgents().filter(a => !a.parentAgentId);
+        const all = this.manager.listAgents().filter(isTopLevelAgent);
         switch (this.mode()) {
             case "off": return [];
             case "background": return all.filter(a => a.isBackground !== false);
@@ -460,10 +478,14 @@ export class AgentWidget {
             getAgentMetricParts(record, this.agentActivity.get(record.id), theme, this.showCost(), renderedAt),
         ]));
         const metricColumns = getAgentMetricWidths([...metricParts.values()]);
-        const metrics = new Map([...metricParts].map(([id, parts]) => [
-            id,
-            formatAgentMetrics(parts, metricColumns),
-        ]));
+        const metrics = new Map(columnRecords.map(record => {
+            const parts = metricParts.get(record.id);
+            const { modelName, tags } = buildInvocationTags(record.invocation);
+            const model = this.showModel()
+                ? [modelName, tags.find(tag => tag.startsWith("thinking: "))].filter(Boolean).join(" · ")
+                : "";
+            return [record.id, [model, formatAgentMetrics(parts, metricColumns)].filter(Boolean).join(" · ")];
+        }));
         const nameWidth = Math.max(0, ...columnRecords.map(agentRecordNameWidth));
         const postureWidth = Math.max(0, ...columnRecords.map(a => visibleWidth(formatAgentPosture(a))));
         const finishedStatusWidth = (record) => {

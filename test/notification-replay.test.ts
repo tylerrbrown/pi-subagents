@@ -162,6 +162,8 @@ function makeHarness(seed: CapturedEntry[] = [], idleInitially = false, sessionI
   };
 
   const piShape = {
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     registerMessageRenderer: vi.fn(),
     registerEntryRenderer: vi.fn(),
     registerMarkdownTransformer: vi.fn(),

@@ -30,7 +30,6 @@ function makeFaithfulManager(initialStatus = "completed") {
   return {
     records,
     initialStatus,
-    awaitStartup: vi.fn(async () => {}),
     spawn: vi.fn(function (this: any) {
       const id = "agent-" + Math.random().toString(36).slice(2, 10);
       let resolve!: () => void;
@@ -40,6 +39,7 @@ function makeFaithfulManager(initialStatus = "completed") {
       queueMicrotask(() => records.get(id)?.resolve());
       return id;
     }),
+    awaitStartup: vi.fn(async () => {}),
     getRecord: vi.fn(function (this: any, id: string) {
       return records.get(id);
     }),

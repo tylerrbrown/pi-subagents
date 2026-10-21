@@ -35,6 +35,14 @@ Your working directory is an isolated git worktree copy of ${extras.worktreeBase
 Work only inside it — never in ${extras.worktreeBase}, even if other instructions name that path as your working directory.
 </worktree_isolation>`
         : "";
+    // The script, not a person, reads what this child returns — see
+    // `PromptExtras.workflowChild` for why only workflow children get this.
+    const workflowBlock = extras?.workflowChild
+        ? `\n\n<workflow_child>
+Your final message IS the return value of this task. A workflow script captures it and passes it to the next stage; no person reads it.
+Return only the answer, in exactly the shape the prompt asks for — no preamble, no summary of what you did, no offer to continue.
+</workflow_child>`
+        : "";
     // Build optional extras suffix
     const extraSections = [];
     if (extras?.memoryBlock) {
@@ -68,7 +76,7 @@ You are operating as a sub-agent invoked to handle a specific task.
         // placed verbatim (no wrapper tag) so it forms an identical byte prefix
         // with the parent session, maximising KV cache hits. The <active_agent>
         // tag and env block vary per call and are placed after the cached prefix.
-        return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + customSection + extrasSuffix;
+        return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
     }
     // "replace" mode — minimum specialist floor + env header + config prompt
     const replaceHeader = `You are a pi coding agent sub-agent.
@@ -85,7 +93,7 @@ You have been invoked to handle a specific task autonomously.
 </specialist_floor>
 
 ${envBlock}`;
-    return activeAgentTag + replaceHeader + worktreeBlock + "\n\n" + config.systemPrompt + extrasSuffix;
+    return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
 }
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */
 const genericBase = `# Role

@@ -7,7 +7,7 @@
 
 import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type AgentNameStyle, hasAgentBadge, renderAgentNameLabel } from "../agent-color.js";
-import type { AgentManager } from "../agent-manager.js";
+import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import { hasModelMismatch } from "../invocation-truth.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
@@ -76,7 +76,9 @@ export interface AgentDetails {
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
   spinnerFrame?: number;
-  /** Short model name if different from parent (e.g. "haiku", "sonnet"). */
+  /** Show the ctrl+b hint on this running foreground call's row — one row per batch. */
+  backgroundHint?: boolean;
+  /** Short label for the model the run used, e.g. "haiku 4.5". */
   modelName?: string;
   /** Notable config tags (e.g. ["thinking: high", "isolated"]). */
   tags?: string[];
@@ -332,10 +334,16 @@ export function getPromptModeLabel(type: SubagentType): string | undefined {
   return config.promptMode === "append" ? "twin" : undefined;
 }
 
-/** Mode label is not included — callers add it where they want it. */
+/**
+ * Mode label is not included — callers add it where they want it.
+ *
+ * Both model forms come back so each surface can pick by width; the
+ * "(asked X)" annotation is applied here rather than by callers, so a value the
+ * spawn did not honor cannot be rendered as though it had been (#182).
+ */
 export function buildInvocationTags(
   invocation: AgentInvocation | undefined,
-): { modelName?: string; tags: string[] } {
+): { modelName?: string; modelId?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
   if (invocation.thinking) {
@@ -351,6 +359,7 @@ export function buildInvocationTags(
   const modelName = invocation.modelName;
   return {
     modelName: modelName && hasModelMismatch(invocation) ? `${modelName} (asked ${invocation.requestedModel})` : modelName,
+    modelId: invocation.modelId && hasModelMismatch(invocation) ? `${invocation.modelId} (asked ${invocation.requestedModel})` : invocation.modelId,
     tags,
   };
 }
@@ -423,6 +432,14 @@ export class AgentWidget {
      * supplies the user's `showCost` setting.
      */
     private showCost: () => boolean = () => false,
+    /**
+     * Read live at render time, like `mode`. Whether running agents name the
+     * model driving them and the thinking level it is running at. Defaults to
+     * off — the extension supplies the user's `showModel` setting — because the
+     * row is already dense and the same pair is on the tool result and in the
+     * conversation viewer unconditionally.
+     */
+    private showModel: () => boolean = () => false,
   ) {}
 
   /**
@@ -437,7 +454,7 @@ export class AgentWidget {
    *   - `all`: every agent.
    */
   private widgetAgents() {
-    const all = this.manager.listAgents().filter(a => !a.parentAgentId);
+    const all = this.manager.listAgents().filter(isTopLevelAgent);
     switch (this.mode()) {
       case "off": return [];
       case "background": return all.filter(a => a.isBackground !== false);
@@ -589,10 +606,14 @@ export class AgentWidget {
       getAgentMetricParts(record, this.agentActivity.get(record.id), theme, this.showCost(), renderedAt),
     ]));
     const metricColumns = getAgentMetricWidths([...metricParts.values()]);
-    const metrics = new Map([...metricParts].map(([id, parts]) => [
-      id,
-      formatAgentMetrics(parts, metricColumns),
-    ]));
+    const metrics = new Map(columnRecords.map(record => {
+      const parts = metricParts.get(record.id)!;
+      const { modelName, tags } = buildInvocationTags(record.invocation);
+      const model = this.showModel()
+        ? [modelName, tags.find(tag => tag.startsWith("thinking: "))].filter(Boolean).join(" · ")
+        : "";
+      return [record.id, [model, formatAgentMetrics(parts, metricColumns)].filter(Boolean).join(" · ")];
+    }));
     const nameWidth = Math.max(0, ...columnRecords.map(agentRecordNameWidth));
     const postureWidth = Math.max(0, ...columnRecords.map(a => visibleWidth(formatAgentPosture(a))));
     const finishedStatusWidth = (record: AgentRecord): number => {

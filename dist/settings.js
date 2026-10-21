@@ -9,8 +9,8 @@ import { NO_FALLBACK } from "./agent-types.js";
 import { projectReadScopes } from "./project-scope.js";
 const VALID_JOIN_MODES = new Set(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES = new Set(["full", "compact", "custom"]);
-const VALID_VIEWER_MARKDOWN_MODES = new Set(["off", "assistant", "all"]);
 const VALID_WIDGET_MODES = new Set(["all", "background", "off"]);
+const VALID_VIEWER_MARKDOWN_MODES = new Set(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES = new Set(["model", "direct", "off"]);
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -21,6 +21,27 @@ const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
 /** 24h. Past this a "deadline" is indistinguishable from none, and reads as a typo. */
 const DEADLINE_MS_CEILING = 24 * 60 * 60_000;
+/**
+ * Normalize a package gate: a boolean passes through, an array is trimmed to its
+ * non-empty string entries, a bare string becomes a one-entry allowlist, and
+ * anything else is dropped.
+ *
+ * The two coercions exist for the same reason: this setting's default is `true`,
+ * so *dropping* a malformed value silently admits every package — the opposite
+ * of what someone narrowing the gate meant. So an array that trims to empty is
+ * kept as `[]` (matching nothing, like `false`) rather than dropped, and
+ * `"my-package"` — the obvious typo for a one-entry list — is read as
+ * `["my-package"]` rather than widened to everything.
+ */
+function sanitizePackageGate(val) {
+    if (typeof val === "boolean")
+        return val;
+    if (typeof val === "string")
+        return val.trim() ? [val.trim()] : [];
+    if (!Array.isArray(val))
+        return undefined;
+    return val.filter((e) => typeof e === "string").map(e => e.trim()).filter(Boolean);
+}
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw) {
     if (!raw || typeof raw !== "object")
@@ -31,6 +52,13 @@ function sanitize(raw) {
         r.maxConcurrent >= 1 &&
         r.maxConcurrent <= MAX_CONCURRENT_CEILING) {
         out.maxConcurrent = r.maxConcurrent;
+    }
+    // Floor 0, not 1 like maxConcurrent above: 0 is the documented "unlimited"
+    // value and the default, so dropping it would silently be unrepresentable.
+    if (Number.isInteger(r.maxConcurrentForeground) &&
+        r.maxConcurrentForeground >= 0 &&
+        r.maxConcurrentForeground <= MAX_CONCURRENT_CEILING) {
+        out.maxConcurrentForeground = r.maxConcurrentForeground;
     }
     if (Number.isInteger(r.defaultMaxTurns) &&
         r.defaultMaxTurns >= 0 &&
@@ -113,9 +141,21 @@ function sanitize(raw) {
     if (typeof r.showCost === "boolean") {
         out.showCost = r.showCost;
     }
+    if (typeof r.showModel === "boolean") {
+        out.showModel = r.showModel;
+    }
     if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
         out.viewerMarkdown = r.viewerMarkdown;
     }
+    if (typeof r.workflowsEnabled === "boolean") {
+        out.workflowsEnabled = r.workflowsEnabled;
+    }
+    const packageAgents = sanitizePackageGate(r.packageAgents);
+    if (packageAgents !== undefined)
+        out.packageAgents = packageAgents;
+    const packageWorkflows = sanitizePackageGate(r.packageWorkflows);
+    if (packageWorkflows !== undefined)
+        out.packageWorkflows = packageWorkflows;
     if (r.fallbackSubagent === false) {
         // The only non-string spelling worth accepting: a boolean would otherwise be
         // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -189,6 +229,9 @@ export function saveSettings(s, cwd = process.cwd()) {
 export function applySettings(s, appliers) {
     if (typeof s.maxConcurrent === "number")
         appliers.setMaxConcurrent(s.maxConcurrent);
+    if (typeof s.maxConcurrentForeground === "number") {
+        appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
+    }
     if (typeof s.defaultMaxTurns === "number")
         appliers.setDefaultMaxTurns(s.defaultMaxTurns);
     if (s.contextWarnPercent !== undefined || s.contextStopPercent !== undefined) {
@@ -224,8 +267,6 @@ export function applySettings(s, appliers) {
         appliers.setAgentMentions(s.agentMentions);
     if (typeof s.rememberAgents === "boolean")
         appliers.setRememberAgents(s.rememberAgents);
-    if (s.viewerMarkdown)
-        appliers.setViewerMarkdown(s.viewerMarkdown);
     if (s.widgetMode)
         appliers.setWidgetMode(s.widgetMode);
     if (typeof s.outputTranscript === "boolean")
@@ -236,6 +277,16 @@ export function applySettings(s, appliers) {
         appliers.setReportUsage(s.reportUsage);
     if (typeof s.showCost === "boolean")
         appliers.setShowCost(s.showCost);
+    if (typeof s.showModel === "boolean")
+        appliers.setShowModel(s.showModel);
+    if (s.viewerMarkdown)
+        appliers.setViewerMarkdown(s.viewerMarkdown);
+    if (typeof s.workflowsEnabled === "boolean")
+        appliers.setWorkflowsEnabled(s.workflowsEnabled);
+    if (s.packageAgents !== undefined)
+        appliers.setPackageAgents(s.packageAgents);
+    if (s.packageWorkflows !== undefined)
+        appliers.setPackageWorkflows(s.packageWorkflows);
 }
 /**
  * Format the user-facing toast for a settings mutation. Pure function —

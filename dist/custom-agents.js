@@ -1,10 +1,11 @@
 /**
  * custom-agents.ts — Load user-defined agents within the nearest Git worktree.
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, buildAgentRegistry } from "./agent-types.js";
+import { isPackageResourceExcluded, MAX_PACKAGE_RESOURCE_BYTES, packageAgentDirs, packageAgentFiles, } from "./package-resources.js";
 import { projectReadScopes } from "./project-scope.js";
 /**
  * The one thing a declared `name:` may not contain, matching Claude Code
@@ -25,14 +26,27 @@ const RESERVED_IN_TYPE = ":";
  * Closer directories override inherited definitions with the same type name.
  * Any name is allowed — names matching defaults (e.g. "Explore") override them.
  *
+ * Package agents load *first*, so everything the user or project wrote outranks
+ * them. That is what makes them safe to adopt: a package can offer a `reviewer`,
+ * and a `.pi/agents/reviewer.md` silently takes it back. It mirrors pi's own
+ * resource precedence, where package-provided skills rank below every user and
+ * project one, and Claude Code's, where a plugin agent is the lowest tier.
+ *
  * An agent's type comes from its frontmatter `name:`, falling back to the
  * filename — Claude Code's rule, where "the filename doesn't have to match".
  * Because the type is now declared rather than derived from a unique path, two
  * files can claim the same one; the later load wins, as it always has for a
  * filename clash, and `warnSkippedOverride` reports the substitution.
  */
-export function loadCustomAgents(cwd, strict = false) {
+export function loadCustomAgents(cwd, strict = false, opts = {}) {
+    const pkgDirs = opts.packageDirs ?? packageAgentDirs(cwd);
+    const pkgFiles = opts.packageFiles ?? packageAgentFiles(cwd);
+    const excluded = opts.packageExcluded ?? (path => isPackageResourceExcluded(path, cwd, "agents"));
     const agents = new Map();
+    for (const dir of pkgDirs)
+        loadFromDir(dir, agents, "package", strict, excluded);
+    for (const file of pkgFiles)
+        loadOneFile(file, agents, "package", strict);
     for (const scope of projectReadScopes(cwd)) {
         loadFromDir(join(scope, ".claude", "agents"), agents, "project", strict);
     }
@@ -41,8 +55,8 @@ export function loadCustomAgents(cwd, strict = false) {
     warnedThisLoad = new Set();
     return agents;
 }
-/** Load agent configs from a directory into the map. */
-function loadFromDir(dir, agents, source, strict) {
+/** Load agent configs from a directory into the map, skipping any `excluded` path. */
+function loadFromDir(dir, agents, source, strict, excluded) {
     if (!existsSync(dir))
         return;
     let files;
@@ -53,68 +67,111 @@ function loadFromDir(dir, agents, source, strict) {
         return;
     }
     for (const file of files) {
-        const filenameType = basename(file, ".md");
         const path = join(dir, file);
-        const parsed = readAgentFile(path, strict);
-        if (!parsed) {
-            warnSkippedOverride(filenameType, agents);
+        if (excluded?.(path))
             continue;
-        }
-        const { frontmatter: fm, body } = parsed;
-        // Claude Code's rule: `name:` IS the agent type, and the filename need not
-        // match. Absent, the filename stands in — Claude Code requires the field,
-        // but most files here predate it and must keep loading.
-        const declared = str(fm.name)?.trim();
-        if (declared?.includes(RESERVED_IN_TYPE)) {
-            // Refusing beats silently substituting: the file would otherwise load
-            // under its filename, so `Agent({subagent_type})` would succeed against
-            // an agent whose declared identity nothing honoured.
-            warnIfNew(`Agent file ${path} declares name "${declared}", which contains "${RESERVED_IN_TYPE}" — reserved for `
-                + "plugin-scoped identifiers. Rename it, or move the label to `display_name:`. Skipping.");
-            // No `warnSkippedOverride`: this file would have registered under its
-            // *declared* name, which nothing else can hold (a colon keeps it out of
-            // the registry), so it shadowed nothing. Passing the filename instead
-            // would report a substitution of an unrelated agent that never happened.
-            continue;
-        }
-        // `||`, not `??`: a quoted empty or all-whitespace `name:` would otherwise
-        // register the agent under the empty type — unspawnable, and it takes the
-        // filename-derived one down with it.
-        const name = declared || filenameType;
-        const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
-        agents.set(name, {
-            name,
-            aliases: csvListOptional(fm.aliases),
-            // Only `display_name` now: `name` is the type, and `getConfig` already
-            // falls back to the type when no label is set — so a Claude Code file
-            // with `name: code-reviewer` still badges as "code-reviewer".
-            displayName: str(fm.display_name),
-            color: str(fm.color),
-            description: str(fm.description) ?? name,
-            builtinToolNames,
-            extSelectors,
-            disallowedTools: csvListOptional(fm.disallowed_tools),
-            extensions: inheritField(fm.extensions ?? fm.inherit_extensions, false),
-            excludeExtensions: csvListOptional(fm.exclude_extensions),
-            skills: inheritField(fm.skills ?? fm.inherit_skills, false),
-            model: str(fm.model),
-            thinking: str(fm.thinking),
-            maxTurns: nonNegativeInt(fm.max_turns),
-            persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
-            outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
-            sessionDir: str(fm.session_dir),
-            allowedSubagents: parseAllowedSubagents(fm.allowed_subagents),
-            systemPrompt: body.trim(),
-            promptMode: fm.prompt_mode === "append" ? "append" : "replace",
-            inheritContext: fm.inherit_context != null ? fm.inherit_context === true : undefined,
-            runInBackground: fm.run_in_background != null ? fm.run_in_background === true : undefined,
-            isolated: fm.isolated != null ? fm.isolated === true : undefined,
-            memory: parseMemory(fm.memory),
-            isolation: parseIsolation(fm.isolation),
-            enabled: fm.enabled !== false, // default true; explicitly false disables
-            source,
-            sourcePath: path,
-        });
+        loadOneFile(path, agents, source, strict);
+    }
+}
+/**
+ * Load one agent file into the map.
+ *
+ * Split out of `loadFromDir` because a package manifest may name an individual
+ * `.md` rather than a directory, and because the size guard below has to apply
+ * to both paths.
+ */
+function loadOneFile(path, agents, source, strict) {
+    const filenameType = basename(path, ".md");
+    // Package files are third-party content read on every `Agent` call, so a
+    // pathological one is skipped rather than pulled into the session. Claude
+    // Code applies the same 1 MB ceiling to plugin-provided agents. Local files
+    // are the user's own and stay unbounded, as they always have been.
+    if (source === "package" && !withinSizeLimit(path)) {
+        warnIfNew(`Skipping package agent ${path}: not a regular file, or larger than ${MAX_PACKAGE_RESOURCE_BYTES} bytes.`);
+        return;
+    }
+    // `strict` is deliberately not passed for a package file. Failing activation
+    // over a broken agent file is right for a checked-in `.pi/agents/` — the point
+    // is that a repo's own file cannot silently fall through to a same-named one
+    // elsewhere. A file inside a third-party package is not the user's to fix, and
+    // one bad `.md` in any installed package would otherwise stop pi from
+    // starting at all. Warn and skip, as for a non-strict local file.
+    const parsed = readAgentFile(path, strict && source !== "package");
+    if (!parsed) {
+        warnSkippedOverride(filenameType, agents);
+        return;
+    }
+    const { frontmatter: fm, body } = parsed;
+    // Claude Code's rule: `name:` IS the agent type, and the filename need not
+    // match. Absent, the filename stands in — Claude Code requires the field,
+    // but most files here predate it and must keep loading.
+    const declared = str(fm.name)?.trim();
+    if (declared?.includes(RESERVED_IN_TYPE)) {
+        // Refusing beats silently substituting: the file would otherwise load
+        // under its filename, so `Agent({subagent_type})` would succeed against
+        // an agent whose declared identity nothing honoured.
+        warnIfNew(`Agent file ${path} declares name "${declared}", which contains "${RESERVED_IN_TYPE}" — reserved for `
+            + "plugin-scoped identifiers. Rename it, or move the label to `display_name:`. Skipping.");
+        // No `warnSkippedOverride`: this file would have registered under its
+        // *declared* name, which nothing else can hold (a colon keeps it out of
+        // the registry), so it shadowed nothing. Passing the filename instead
+        // would report a substitution of an unrelated agent that never happened.
+        return;
+    }
+    // `||`, not `??`: a quoted empty or all-whitespace `name:` would otherwise
+    // register the agent under the empty type — unspawnable, and it takes the
+    // filename-derived one down with it.
+    const name = declared || filenameType;
+    const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
+    agents.set(name, {
+        name,
+        aliases: csvListOptional(fm.aliases),
+        // Only `display_name` now: `name` is the type, and `getConfig` already
+        // falls back to the type when no label is set — so a Claude Code file
+        // with `name: code-reviewer` still badges as "code-reviewer".
+        displayName: str(fm.display_name),
+        color: str(fm.color),
+        description: str(fm.description) ?? name,
+        builtinToolNames,
+        extSelectors,
+        disallowedTools: csvListOptional(fm.disallowed_tools),
+        extensions: inheritField(fm.extensions ?? fm.inherit_extensions, false),
+        excludeExtensions: csvListOptional(fm.exclude_extensions),
+        skills: inheritField(fm.skills ?? fm.inherit_skills, false),
+        model: str(fm.model),
+        thinking: str(fm.thinking),
+        maxTurns: nonNegativeInt(fm.max_turns),
+        persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
+        outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
+        sessionDir: str(fm.session_dir),
+        allowedSubagents: parseAllowedSubagents(fm.allowed_subagents),
+        systemPrompt: body.trim(),
+        promptMode: fm.prompt_mode === "append" ? "append" : "replace",
+        inheritContext: fm.inherit_context != null ? fm.inherit_context === true : undefined,
+        runInBackground: fm.run_in_background != null ? fm.run_in_background === true : undefined,
+        isolated: fm.isolated != null ? fm.isolated === true : undefined,
+        memory: parseMemory(fm.memory),
+        isolation: parseIsolation(fm.isolation),
+        enabled: fm.enabled !== false, // default true; explicitly false disables
+        source,
+        sourcePath: path,
+    });
+}
+/**
+ * True when `path` is a regular file within the package-resource size ceiling.
+ *
+ * Only applied to package-provided files: they arrive from a third party and are
+ * re-read on every `Agent` call, so a 500 MB `.md` — or a fifo that never ends —
+ * must not be reachable from a spawn. A stat failure counts as "not within",
+ * because the alternative is reading something we could not describe.
+ */
+function withinSizeLimit(path) {
+    try {
+        const stat = statSync(path);
+        return stat.isFile() && stat.size <= MAX_PACKAGE_RESOURCE_BYTES;
+    }
+    catch {
+        return false;
     }
 }
 /**
@@ -129,9 +186,27 @@ function loadFromDir(dir, agents, source, strict) {
  * Under `strict` the same failure rethrows, still naming the path, so callers
  * that opted into failing closed stop rather than run a substituted agent.
  */
+/**
+ * Parse an agent file's frontmatter, tolerating a leading UTF-8 BOM.
+ *
+ * Editors across the Windows/CJK world write UTF-8 with a BOM by default, and
+ * pi's parser did not look past one before 0.84.3: the fence never matched, so
+ * the frontmatter came back empty and the *whole file* — YAML and all — became
+ * the body. An agent authored that way silently lost every field. `tools: none`
+ * going missing is the sharp edge: the agent registers with the default
+ * toolset rather than none, which is a wider grant than its author wrote.
+ *
+ * Stripped here rather than detected per pi version, because this is the only
+ * place agent files are read and the BOM is a file-encoding artifact, not
+ * content — normalising it at the boundary keeps one behaviour across the whole
+ * supported peer range instead of forking on what happens to be installed.
+ */
+export function parseAgentFrontmatter(content) {
+    return parseFrontmatter(content.startsWith("\uFEFF") ? content.slice(1) : content);
+}
 function readAgentFile(path, strict) {
     try {
-        return parseFrontmatter(readFileSync(path, "utf-8"));
+        return parseAgentFrontmatter(readFileSync(path, "utf-8"));
     }
     catch (err) {
         const reason = err instanceof Error ? err.message : String(err);

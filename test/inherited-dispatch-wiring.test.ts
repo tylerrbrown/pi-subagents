@@ -41,6 +41,7 @@ for (const background of [false, true]) {
   it(`real nested-CWD Agent refuses unknown type before spawn (background=${background})`, async () => {
     const tools = new Map<string, any>();
     subagentsExtension({
+      registerEntryRenderer: vi.fn(), registerFlag: vi.fn(),
       registerMessageRenderer: vi.fn(), registerTool: (tool: any) => tools.set(tool.name, tool),
       registerCommand: vi.fn(), on: vi.fn(), events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
       appendEntry: vi.fn(), sendMessage: vi.fn(),

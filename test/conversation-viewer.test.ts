@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRecord } from "../src/types.js";
+import type { ViewerBackgroundAction } from "../src/ui/conversation-viewer.js";
 
 // ── Mock wrapTextWithAnsi ──────────────────────────────────────────────
 // We need to control what wrapTextWithAnsi returns to simulate the
@@ -35,7 +36,6 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
         return super.render(width);
       }
     },
-
     wrapTextWithAnsi: (...args: [string, number]) => {
       if (wrapOverride) return wrapOverride(...args);
       return original.wrapTextWithAnsi(...args);
@@ -99,6 +99,51 @@ beforeEach(() => {
   markdownConstructions = 0;
   markdownRenderCalls = 0;
   markdownThrows = false;
+});
+
+describe("ConversationViewer invocation line", () => {
+  /** The `↳` metadata row for a record, or "" when the viewer renders none. */
+  function invocationLine(invocation: AgentRecord["invocation"]): string {
+    const viewer = new ConversationViewer(
+      mockTui(30, 200), mockSession([]), mockRecord({ invocation }), undefined,
+      { fg: (_c: string, t: string) => t, bold: (t: string) => t } as any,
+      vi.fn(),
+    );
+    // The row arrives inside the overlay's frame, padded out to the right
+    // border; what is under test is the metadata it carries.
+    const row = viewer.render(200).find(l => l.includes("↳"));
+    return row ? row.slice(row.indexOf("↳")).replace(/\s*│\s*$/, "") : "";
+  }
+
+  // The canonical id, not the short label the widget uses: this overlay is
+  // opened to inspect one agent and has the width to disambiguate providers.
+  it("names the model with its provider", () => {
+    expect(invocationLine({
+      modelName: "sonnet 4.6",
+      modelId: "anthropic/claude-sonnet-4-6",
+      thinking: "high",
+      maxTurns: 60,
+    })).toBe("↳ anthropic/claude-sonnet-4-6 · thinking: high · max turns: 60");
+  });
+
+  it("falls back to the short label when no canonical id was captured", () => {
+    expect(invocationLine({ modelName: "sonnet 4.6", thinking: "high" }))
+      .toBe("↳ sonnet 4.6 · thinking: high");
+  });
+
+  it("discloses a model and level the run did not honor", () => {
+    expect(invocationLine({
+      modelName: "haiku 4.5",
+      modelId: "anthropic/claude-haiku-4-5",
+      requestedModel: "google/gemini-3-pro",
+      thinking: "low",
+      requestedThinking: "max",
+    })).toBe("↳ anthropic/claude-haiku-4-5 (asked google/gemini-3-pro) · thinking: low (asked max)");
+  });
+
+  it("renders no row at all for a record with no invocation", () => {
+    expect(invocationLine(undefined)).toBe("");
+  });
 });
 
 describe("ConversationViewer cost display", () => {
@@ -408,7 +453,6 @@ describe("ConversationViewer", () => {
       viewer.dispose();
       expect(session.subscribe.mock.results[0].value).toHaveBeenCalledOnce();
     });
-
     it("renders assistant Markdown by default instead of raw source markers", () => {
       const out = strip(viewerFor(assistant("# Heading\n\n- first\n- second\n\n**bold**")).render(80).join("\n"));
 
@@ -531,7 +575,6 @@ describe("ConversationViewer", () => {
       const out = viewerFor([message] as any).render(80).join("\n");
       expect(out).toContain("truncated, 1 more character");
     });
-
     it("puts the truncation notice outside the code fence it cut into", () => {
       const text = `\`\`\`js\n${"const a = 1;\n".repeat(2000)}\`\`\``;
       const viewer = viewerFor(result(text), "all", undefined, 4000);
@@ -842,6 +885,64 @@ describe("ConversationViewer", () => {
       );
       expect(viewer.render(W).join("\n")).not.toContain("x stop");
       expect(() => { viewer.handleInput("x"); viewer.handleInput("x"); }).not.toThrow();
+    });
+  });
+
+  describe("background key", () => {
+    const W = 80;
+
+    const backgroundViewer = (record: AgentRecord, action?: ViewerBackgroundAction, width = W) =>
+      new ConversationViewer(
+        mockTui(30, width), mockSession([]), record, undefined, ansiTheme(),
+        vi.fn(), vi.fn(), undefined, vi.fn(), false, undefined, undefined, "auto", action,
+      );
+
+    /** An action available until it is sent, as the extension's is. */
+    const oneShotAction = () => {
+      let available = true;
+      const send = vi.fn(() => { available = false; });
+      return { available: () => available, send };
+    };
+
+    it("offers b while the owner says the run can be handed off, and sends once", () => {
+      const action = oneShotAction();
+      const viewer = backgroundViewer(mockRecord({ status: "running" }), action);
+
+      expect(viewer.render(W).join("\n")).toContain("b bg");
+      viewer.handleInput("b");
+      expect(action.send).toHaveBeenCalledTimes(1);
+
+      expect(viewer.render(W).join("\n")).not.toContain("b bg");
+      viewer.handleInput("b");
+      expect(action.send).toHaveBeenCalledTimes(1);
+    });
+
+    it("hides and ignores b when the owner says it is unavailable", () => {
+      // The record alone cannot say: a blocking, running agent-generator spawn
+      // has no tool call to release. Only the owner's answer counts.
+      const send = vi.fn();
+      const viewer = backgroundViewer(
+        mockRecord({ status: "running", blocking: true }), { available: () => false, send },
+      );
+      expect(viewer.render(W).join("\n")).not.toContain("b bg");
+      viewer.handleInput("b");
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it("omits b entirely when no action is supplied", () => {
+      const viewer = backgroundViewer(mockRecord({ status: "running", blocking: true }), undefined);
+      expect(viewer.render(W).join("\n")).not.toContain("b bg");
+      expect(() => viewer.handleInput("b")).not.toThrow();
+    });
+
+    it("keeps the footer within width at 80 columns with every action showing", () => {
+      const viewer = backgroundViewer(mockRecord({ status: "running" }), oneShotAction(), 80);
+      const lines = viewer.render(80);
+      const footer = lines.find(l => l.includes("b bg"));
+      expect(footer).toBeDefined();
+      expect(footer).toContain("Enter steer");
+      expect(footer).toContain("x stop");
+      assertAllLinesFit(lines, 80);
     });
   });
 

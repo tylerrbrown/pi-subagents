@@ -17,6 +17,8 @@ import subagentsExtension from "../src/index.js";
 function makePi() {
   return {
     registerMessageRenderer: vi.fn(),
+    registerEntryRenderer: vi.fn(),
+    registerFlag: vi.fn(),
     registerTool: vi.fn(),
     registerCommand: vi.fn(),
     on: vi.fn(),

@@ -1,5 +1,5 @@
 import { defineTool, } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import { buildAgentRegistry, getAgentConfigIn, getAvailableTypesIn, resolveEnabledTypeIn, resolveTypeIn, } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";

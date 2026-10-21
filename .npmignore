@@ -18,12 +18,14 @@ CLAUDE.md
 *.log
 npm-debug.log*
 .DS_Store
+.scratch
 
 # Tests (if any)
 test/
 tests/
 *.test.ts
 *.spec.ts
+vitest.config.ts
 
 .pi
 .claude

@@ -1,0 +1,17 @@
+{
+  "terminalProof": {
+    "schemaVersion": 2,
+    "reservationId": "00000000-0000-4000-8000-000000000001",
+    "launchKey": "attempt-launch-002",
+    "childSessionId": "01a0e600-0000-7000-8000-000000000002",
+    "bound": true,
+    "promptDelivered": false,
+    "modelTurnCount": 0,
+    "toolUseCount": 0,
+    "resultProduced": false,
+    "terminalStatus": "error",
+    "startupEffectsAbsent": true
+  },
+  "canonicalProofJson": "{\"bound\":true,\"childSessionId\":\"01a0e600-0000-7000-8000-000000000002\",\"launchKey\":\"attempt-launch-002\",\"modelTurnCount\":0,\"promptDelivered\":false,\"reservationId\":\"00000000-0000-4000-8000-000000000001\",\"resultProduced\":false,\"schemaVersion\":2,\"startupEffectsAbsent\":true,\"terminalStatus\":\"error\",\"toolUseCount\":0}",
+  "terminalProofDigest": "f2c0abed87d025e08cd2f6765041dcdc6737050a7f1e5874647e6dbb3be68a83"
+}

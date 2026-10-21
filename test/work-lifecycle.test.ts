@@ -260,7 +260,7 @@ describe("Work wire protocol", () => {
     expect(JSON.stringify(snapshot)).not.toContain("SYNTHETIC_PRIVATE");
   });
   it("matches the frozen v2 canonical proof bytes and SHA-256", () => {
-    const fixture = JSON.parse(readFileSync("C:/Users/tyler.TYWARE/SynologyDrive/Claude/shared/lib/tests/fixtures/work_assignment_lifecycle_v2.json", "utf8"));
+    const fixture = JSON.parse(readFileSync(new URL("./fixtures/work-terminal-proof-v2.json", import.meta.url), "utf8"));
     expect(validateWorkTerminalProof(fixture.terminalProof)).toEqual(fixture.terminalProof);
     expect(canonicalWorkTerminalProofBytes(fixture.terminalProof).toString("utf8")).toBe(fixture.canonicalProofJson);
     expect(workTerminalProofDigest(fixture.terminalProof)).toBe(fixture.terminalProofDigest);

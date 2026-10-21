@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
+import { registerAgents } from "../src/agent-types.js";
 import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -20,7 +21,7 @@ vi.mock("../src/worktree.js", () => ({
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { addUsage } from "../src/usage.js";
-import { isWorktreeIsolationEnabled } from "../src/worktree.js";
+import { createWorktree, isWorktreeIsolationEnabled, pruneWorktrees } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -451,6 +452,47 @@ describe("AgentManager — nested runtime propagation", () => {
 
     expect(manager.getRecord(childId)?.status).toBe("running");
     expect(manager.getRecord(siblingId)?.status).toBe("queued");
+  });
+
+  it("starts a workflow's children regardless of the concurrency pool", async () => {
+    // A workflow bounds its own fan-out. Routing its agents through the session
+    // pool as well would let one run fill it and starve everything else — and
+    // the run itself is not in the pool to be drained behind them.
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager = new AgentManager(undefined, 1);
+
+    const holder = manager.spawn(mockPi, mockCtx, "general-purpose", "holder", {
+      description: "holder",
+      isBackground: true,
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "scout", "child", {
+      description: "child",
+      isBackground: true,
+      workflowId: "wf_run1",
+    });
+    // A second top-level background agent still queues — the pool is untouched.
+    const siblingId = manager.spawn(mockPi, mockCtx, "general-purpose", "sibling", {
+      description: "sibling",
+      isBackground: true,
+    });
+
+    expect(manager.getRecord(holder)?.status).toBe("running");
+    expect(manager.getRecord(childId)?.status).toBe("running");
+    expect(manager.getRecord(siblingId)?.status).toBe("queued");
+  });
+
+  it("gives a workflow's child no handle, so nothing can address it", () => {
+    // Same reasoning as a nested child: it is filtered out of every top-level
+    // surface, so a handle would name something unreachable and consume a name
+    // a visible agent could have taken.
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
+      description: "child",
+      workflowId: "wf_run1",
+    });
+    expect(manager.getRecord(id)?.handle).toBeUndefined();
+
+    const visible = manager.spawn(mockPi, mockCtx, "general-purpose", "mine", { description: "mine" });
+    expect(manager.getRecord(visible)?.handle).toBe("general-purpose");
   });
 
   it("aborts owned children when the parent settles", async () => {
@@ -939,9 +981,12 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     manager?.dispose();
   });
 
-  it("awaitStartup() rejects when createWorktree returns undefined; no orphan record left behind", async () => {
+  it("awaitStartup rejects when createWorktree returns undefined; no orphan record left behind", async () => {
+    // The failure is async now — the repo copy is an awaited git call — so it
+    // arrives through awaitStartup instead of a throw out of spawn(). Everything
+    // observable about it is unchanged: same message, nothing runs, no record.
     const { createWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce(undefined);
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
     vi.mocked(runAgent).mockClear();
 
     manager = new AgentManager();
@@ -955,6 +1000,265 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(manager.listAgents()).toEqual([]);
     // runAgent never invoked — strict, no silent fallback
     expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("a foreground spawn surfaces the same failure by rejecting spawnAndWait", async () => {
+    // The other half of the strict contract: the top-level Agent tool awaits
+    // this call and reports failure by letting the throw out of execute.
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
+    vi.mocked(runAgent).mockClear();
+
+    manager = new AgentManager();
+    await expect(manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    })).rejects.toThrow(/isolation: "worktree"/);
+
+    expect(manager.listAgents()).toEqual([]);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("a QUEUED foreground spawn rejects spawnAndWait too, not just the immediate one (#179)", async () => {
+    // A queued start fails at drain time, when nobody awaits `startups`, so the
+    // failure lands on the record. spawnAndWait must still throw it — otherwise
+    // queue pressure decides whether the Agent tool call is marked failed.
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
+    let resolveRun!: (v: unknown) => void;
+    vi.mocked(runAgent).mockClear();
+    vi.mocked(runAgent).mockImplementationOnce(() => new Promise((res) => { resolveRun = res as (v: unknown) => void; }));
+
+    manager = new AgentManager();
+    manager.setMaxConcurrentForeground(1);
+    const blocker = manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "blocker", { description: "blocker" });
+    const queued = manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+    expect(manager.listAgents().find(r => r.description === "test")?.status).toBe("queued");
+
+    resolveRun({ responseText: "done", session: mockSession(), aborted: false, steered: false });
+    await blocker;
+    await expect(queued).rejects.toThrow(/isolation: "worktree"/);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the concurrency slot accounting straight while the worktree is being created", async () => {
+    // The slot is claimed before the awaited copy, so drainQueue can't read a
+    // stale runningBackground and start every queued agent at once — and it is
+    // given back if the copy fails, or the queue would be stuck forever.
+    const { createWorktree } = await import("../src/worktree.js");
+    let releaseCopy!: () => void;
+    vi.mocked(createWorktree).mockImplementationOnce(
+      () => new Promise(resolve => { releaseCopy = () => resolve(undefined); }),
+    );
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager(undefined, 1);
+    const slowId = manager.spawn(mockPi, mockCtx, "X", "slow", {
+      description: "slow", isBackground: true, isolation: "worktree",
+    });
+    const queuedId = manager.spawn(mockPi, mockCtx, "X", "queued", {
+      description: "queued", isBackground: true,
+    });
+
+    // The slot is taken while the copy is still in flight.
+    expect(manager.getRecord(queuedId)!.status).toBe("queued");
+    expect(runAgent).not.toHaveBeenCalled();
+
+    releaseCopy();
+    await expect(manager.awaitStartup(slowId)).rejects.toThrow(/isolation: "worktree"/);
+    await manager.getRecord(queuedId)!.promise;
+
+    // Slot released on failure — the queued agent got to run.
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(queuedId)!.status).toBe("completed");
+  });
+
+  it("keeps a structured payload parseable when the worktree note is appended", async () => {
+    // `record.result` is prose for a reader and picks up a branch note on the
+    // way out. A schema'd payload living in the same field would stop parsing
+    // for every `agent({ schema, isolation: "worktree" })` call.
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    const wt = { path: "/wt/a", branch: "pi-agent-a", baseSha: "abc", workPath: "/wt/a" };
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockResolvedValueOnce({ hasChanges: true, branch: "pi-agent-a" } as never);
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "I edited two files",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+      structuredJson: '{"answer":"42"}',
+    } as never);
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "go", {
+      description: "go", isBackground: true, isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+    await vi.waitFor(() => expect(manager.getRecord(id)!.status).toBe("completed"));
+
+    const record = manager.getRecord(id)!;
+    expect(JSON.parse(record.structuredJson!)).toEqual({ answer: "42" });
+    // The note still reaches the prose, which is where a human reads it.
+    expect(record.result).toContain("Changes saved to branch");
+  });
+
+  it("a stop that lands during the copy discards the worktree instead of running", async () => {
+    // Window that did not exist when creation was synchronous: abort() can mark
+    // the record stopped while the repo is still being copied.
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    let releaseCopy!: () => void;
+    const wt = { path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy" };
+    vi.mocked(createWorktree).mockImplementationOnce(
+      () => new Promise(resolve => { releaseCopy = () => resolve(wt); }),
+    );
+    vi.mocked(cleanupWorktree).mockClear();
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "stopped", {
+      description: "stopped", isBackground: true, isolation: "worktree",
+    });
+    expect(manager.abort(id)).toBe(true);
+
+    releaseCopy();
+    await expect(manager.awaitStartup(id)).rejects.toThrow(/startup cancelled/);
+
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, "/tmp", wt, "stopped");
+    expect(manager.getRecord(id)!.status).toBe("stopped");
+  });
+});
+
+// The worktree is committed to a branch and deleted inside the settle path, so
+// a caller holding the finished record can no longer see what the child wrote.
+// `onBeforeWorktreeCleanup` is the one window where it still exists — a workflow
+// `gate` runs there, and a gate pointed at the wrong tree is worse than none.
+describe("AgentManager — onBeforeWorktreeCleanup", () => {
+  let manager: AgentManager;
+  const wt = { path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy" };
+
+  /** Records call order across the hook and the (mocked) cleanup. */
+  async function trace() {
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    const order: string[] = [];
+    vi.mocked(createWorktree).mockResolvedValue(wt);
+    vi.mocked(cleanupWorktree).mockReset();
+    vi.mocked(cleanupWorktree).mockImplementation(async () => {
+      order.push("cleanup");
+      return { hasChanges: false };
+    });
+    return { order, cleanupWorktree: vi.mocked(cleanupWorktree) };
+  }
+
+  afterEach(async () => {
+    manager?.dispose();
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockReset();
+    vi.mocked(cleanupWorktree).mockReset();
+    vi.mocked(cleanupWorktree).mockImplementation(async () => ({ hasChanges: false }));
+  });
+
+  it("fires with the worktree path, before the worktree is cleaned up", async () => {
+    const { order } = await trace();
+    resolvedRun();
+    const seen: string[] = [];
+
+    manager = new AgentManager();
+    await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
+      description: "test",
+      isolation: "worktree",
+      onBeforeWorktreeCleanup: async (path) => {
+        order.push("hook");
+        seen.push(path);
+      },
+    });
+
+    expect(seen).toEqual(["/wt/copy"]);
+    // Order is the whole point: after cleanup the path is a branch, not a tree.
+    expect(order).toEqual(["hook", "cleanup"]);
+  });
+
+  it("cleans up anyway when the hook throws", async () => {
+    const { order } = await trace();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
+      description: "test",
+      isolation: "worktree",
+      onBeforeWorktreeCleanup: async () => {
+        order.push("hook");
+        throw new Error("gate blew up");
+      },
+    });
+
+    // A hook that fails must not leak a worktree, and must not fail the agent.
+    expect(order).toEqual(["hook", "cleanup"]);
+    expect(record.status).toBe("completed");
+  });
+
+  it("does not fire on the error path, which still cleans up", async () => {
+    const { order } = await trace();
+    vi.mocked(runAgent).mockRejectedValue(new Error("boom"));
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
+      description: "test",
+      isolation: "worktree",
+      onBeforeWorktreeCleanup: async () => {
+        order.push("hook");
+      },
+    });
+
+    expect(order).toEqual(["cleanup"]);
+    expect(record.status).toBe("error");
+  });
+
+  it("does not fire for a stop that lands while the repo is still being copied", async () => {
+    // That path discards a worktree the child never wrote in, so there is
+    // nothing to inspect and nothing may delay the discard.
+    const { createWorktree } = await import("../src/worktree.js");
+    const { order } = await trace();
+    let releaseCopy!: () => void;
+    vi.mocked(createWorktree).mockImplementationOnce(
+      () => new Promise(resolve => { releaseCopy = () => resolve(wt); }),
+    );
+    resolvedRun();
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "stopped", {
+      description: "stopped",
+      isBackground: true,
+      isolation: "worktree",
+      onBeforeWorktreeCleanup: async () => {
+        order.push("hook");
+      },
+    });
+    expect(manager.abort(id)).toBe(true);
+    releaseCopy();
+    await expect(manager.awaitStartup(id)).rejects.toThrow(/startup cancelled/);
+
+    expect(order).toEqual(["cleanup"]);
+  });
+
+  it("does not fire for an agent that has no worktree", async () => {
+    const { order } = await trace();
+    resolvedRun();
+
+    manager = new AgentManager();
+    await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
+      description: "test",
+      onBeforeWorktreeCleanup: async () => {
+        order.push("hook");
+      },
+    });
+
+    expect(order).toEqual([]);
   });
 });
 
@@ -987,10 +1291,13 @@ describe("AgentManager — worktreeIsolation: false refuses worktrees", () => {
 
   it("does not mask a genuine worktree failure while enabled", async () => {
     const { createWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce(undefined);
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined);
     vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
 
     manager = new AgentManager();
+    // The refusal above is silent, but a real failure still surfaces — through
+    // awaitStartup rather than a throw out of spawn(), since the repo copy is
+    // an awaited git call.
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
       isolation: "worktree",
@@ -1051,7 +1358,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
 
   it("cwd + isolation: worktree — worktree created FROM cwd, session runs at the copy's workPath, cleanup targets cwd's repo", async () => {
     const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce({
+    vi.mocked(createWorktree).mockResolvedValueOnce({
       path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/packages/api",
     });
     resolvedRun();
@@ -1062,6 +1369,8 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
       cwd: "/",
       isolation: "worktree",
     });
+    // The run only exists once the copy does — the agent is not running when
+    // spawn() returns under worktree isolation.
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
 
@@ -1080,7 +1389,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     // the copied subdir. Without SpawnOptions.cwd the agent must stay at the
     // copy's root — moving it would also move .pi config discovery.
     const { createWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce({
+    vi.mocked(createWorktree).mockResolvedValueOnce({
       path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/sub/dir",
     });
     vi.mocked(runAgent).mockClear();
@@ -1111,6 +1420,23 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     await manager.getRecord(id)!.promise;
 
     expect(vi.mocked(runAgent).mock.lastCall![3].worktreeBase).toBeUndefined();
+  });
+
+  it("passes `workflow` to the runner exactly when the spawn carries a workflowId", async () => {
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const owned = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      workflowId: "wf_abc123",
+    });
+    await manager.getRecord(owned)!.promise;
+    expect(vi.mocked(runAgent).mock.lastCall![3].workflow).toBe(true);
+
+    const plain = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test" });
+    await manager.getRecord(plain)!.promise;
+    expect(vi.mocked(runAgent).mock.lastCall![3].workflow).toBe(false);
   });
 
   it("relative cwd throws immediately; no orphan record", () => {
@@ -1651,7 +1977,7 @@ describe("AgentManager — drainQueue failure handling", () => {
         });
       }),
     );
-    vi.mocked(createWorktree).mockReturnValueOnce(undefined); // "not a git repo"
+    vi.mocked(createWorktree).mockResolvedValueOnce(undefined); // "not a git repo"
 
     const firstId = manager.spawn(mockPi, mockCtx, "X", "first", { description: "first", isBackground: true });
     const boomId = manager.spawn(mockPi, mockCtx, "X", "boom", {
@@ -1884,6 +2210,36 @@ describe("AgentManager — waitForAll", () => {
     await expect(manager.waitForAll()).resolves.toBeUndefined();
   });
 
+  it("waits for an agent whose worktree is still being created", async () => {
+    // The startup gap: the record is "running" but has no `.promise` yet,
+    // because the repo copy is an awaited git call. Waiting only on `.promise`
+    // would let a `/wait` return before the agent had run at all.
+    const { createWorktree } = await import("../src/worktree.js");
+    let releaseCopy!: () => void;
+    vi.mocked(createWorktree).mockImplementationOnce(
+      () => new Promise(resolve => {
+        releaseCopy = () => resolve({ path: "/wt/copy", branch: "b", baseSha: "abc", workPath: "/wt/copy" });
+      }),
+    );
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    manager.spawn(mockPi, mockCtx, "X", "copying", {
+      description: "copying", isBackground: true, isolation: "worktree",
+    });
+
+    let settled = false;
+    const all = manager.waitForAll().then(() => { settled = true; });
+    await new Promise(r => setImmediate(r));
+    expect(settled, "waitForAll resolved while the worktree was still being created").toBe(false);
+    expect(runAgent).not.toHaveBeenCalled();
+
+    releaseCopy();
+    await all;
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
   it("does not reject when an agent fails", async () => {
     // allSettled, not all — one failing agent must not leave the caller hanging
     // on a rejection it never asked for.
@@ -2014,6 +2370,38 @@ describe("AgentManager — monotonic resume run boundaries", () => {
     expect(record!.lastProgressAt).toBe(record!.startedAt);
     expect(record!.completedAt).toBeGreaterThanOrEqual(record!.startedAt);
     expect(record!.failureKind).toBeUndefined();
+  });
+});
+
+describe("AgentManager — dispose prunes worktree repos", () => {
+  it("uses an explicit runtime even when no agent was spawned", async () => {
+    vi.mocked(pruneWorktrees).mockClear();
+    const manager = new AgentManager();
+    await manager.dispose(mockPi);
+    expect(pruneWorktrees).toHaveBeenCalledWith(mockPi, process.cwd());
+  });
+
+  it("prunes the process cwd and every repo a worktree was created from", async () => {
+    // Pruning needs pi (the git call is async now), so it is handed in at
+    // dispose. A manager disposed without one just skips it.
+    const { createWorktree, pruneWorktrees } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce({
+      path: "/wt/copy", branch: "b", baseSha: "abc", workPath: "/wt/copy",
+    });
+    vi.mocked(pruneWorktrees).mockClear().mockResolvedValue(undefined);
+    resolvedRun();
+
+    const manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
+      description: "p", cwd: "/", isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)!.promise;
+
+    await manager.dispose();
+    expect(pruneWorktrees).toHaveBeenCalledWith(mockPi, process.cwd());
+    // The caller-supplied cwd's repo too — that is where its worktree lived.
+    expect(pruneWorktrees).toHaveBeenCalledWith(mockPi, "/");
   });
 });
 
@@ -2383,5 +2771,202 @@ describe("AgentManager — names as additive aliases", () => {
     await manager.getRecord(id)!.promise;
 
     expect(manager.getRecord(id)!.sessionFile).toBeUndefined();
+  });
+});
+
+describe("AgentManager — effective model and thinking write-back", () => {
+  let manager: AgentManager;
+
+  afterEach(() => {
+    manager?.dispose?.();
+    vi.restoreAllMocks();
+  });
+
+  /** Run a spawn whose session reports the given runtime model/level. */
+  async function spawnWithSession(
+    invocation: AgentRecord["invocation"],
+    runtime: { model?: { provider: string; id: string; name?: string }; thinkingLevel?: string },
+  ): Promise<AgentRecord> {
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onSessionCreated?.({ dispose: vi.fn(), ...runtime });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false } as any;
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "Explore", "go", {
+      description: "go",
+      isBackground: true,
+      invocation,
+    });
+    await manager.getRecord(id)!.promise;
+    return manager.getRecord(id)!;
+  }
+
+  it("relabels the record with the model the session actually runs", async () => {
+    const record = await spawnWithSession(
+      { modelName: "pre-session", modelId: "pre/session", thinking: "high" },
+      { model: { provider: "anthropic", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" }, thinkingLevel: "high" },
+    );
+
+    expect(record.invocation).toMatchObject({
+      modelName: "sonnet 4.6",
+      modelId: "anthropic/claude-sonnet-4-6",
+      thinking: "high",
+    });
+  });
+
+  it("keeps the requested level when pi clamps it to what the model supports", async () => {
+    const record = await spawnWithSession(
+      { thinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" },
+    );
+
+    expect(record.invocation!.thinking).toBe("high");
+    expect(record.invocation!.requestedThinking).toBe("max");
+  });
+
+  it("retains the requested level even when honored", async () => {
+    const record = await spawnWithSession(
+      { thinking: "high" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" },
+    );
+
+    expect(record.invocation!.requestedThinking).toBe("high");
+  });
+
+  it("does not overwrite a request the agent file already overrode", async () => {
+    // Frontmatter pinned `low` over a caller's `max`, then the model clamped it
+    // again. The caller asked for `max` — that is what the surfaces must say,
+    // not the intermediate value frontmatter chose.
+    const record = await spawnWithSession(
+      { thinking: "low", requestedThinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "minimal" },
+    );
+
+    expect(record.invocation!.thinking).toBe("minimal");
+    expect(record.invocation!.requestedThinking).toBe("max");
+  });
+
+  it("gives a spawn that carried no invocation one to display", async () => {
+    // Cross-extension RPC and `@handle` spawns pass none, and used to render no
+    // metadata at all.
+    const record = await spawnWithSession(
+      undefined,
+      { model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "xhigh" },
+    );
+
+    expect(record.invocation).toMatchObject({
+      modelName: "gpt-5.6-sol",
+      modelId: "openai-codex/gpt-5.6-sol",
+      thinking: "xhigh",
+    });
+  });
+
+  it("keeps the requested level when the session reports no level of its own", async () => {
+    // An older pi or a stubbed session degrades to "nothing to say about the
+    // level", which must not read as "no level" on every surface.
+    const record = await spawnWithSession(
+      { thinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" } },
+    );
+
+    expect(record.invocation!.thinking).toBe("max");
+    expect(record.invocation!.requestedThinking).toBe("max");
+    expect(record.invocation!.modelName).toBe("claude-haiku-4-5");
+  });
+
+  it("leaves the invocation alone when the session reports no model", async () => {
+    const record = await spawnWithSession({ thinking: "max" }, {});
+
+    expect(record.invocation).toMatchObject({ thinking: "max", requestedThinking: "max" });
+  });
+});
+
+// Frontmatter is authoritative (README "Frontmatter is authoritative"): the
+// agent file's `isolation:` must hold on every spawn path. Only the Agent tool
+// and nested tools resolve it before calling the manager; `@handle` mentions
+// pass none, and RPC spawns forward only their caller's value. Workflow
+// children follow Claude Code instead: only the script's option decides.
+describe("AgentManager — the agent file's `isolation` wins over the spawn option", () => {
+  let manager: AgentManager;
+  const wt = { path: "/wt/a", branch: "pi-agent-a", baseSha: "abc", workPath: "/wt/a" };
+
+  function spawnAs(
+    fileIsolation: "worktree" | "off" | undefined,
+    optionIsolation: "worktree" | undefined,
+    { type = "walled", workflowId }: { type?: string; workflowId?: string } = {},
+  ) {
+    registerAgents(new Map([["walled", { name: "walled", isolation: fileIsolation } as any]]));
+    vi.mocked(createWorktree).mockReset();
+    vi.mocked(createWorktree).mockResolvedValue(wt as never);
+    resolvedRun();
+    manager = new AgentManager();
+    return manager.spawn(mockPi, mockCtx, type, "go", {
+      description: "go",
+      isBackground: true,
+      ...(optionIsolation !== undefined ? { isolation: optionIsolation } : {}),
+      ...(workflowId !== undefined ? { workflowId } : {}),
+    });
+  }
+
+  afterEach(() => {
+    manager?.dispose();
+    registerAgents(new Map());
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
+  });
+
+  it("isolation: worktree in the file applies when the spawn omits it, and tags the record", async () => {
+    const id = spawnAs("worktree", undefined);
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)!.worktree).toEqual(wt);
+    // The widget's "worktree" tag reads the invocation snapshot, which only
+    // the Agent tool used to seed.
+    expect(manager.getRecord(id)!.invocation?.isolation).toBe("worktree");
+  });
+
+  it("isolation: off in the file refuses a spawn's isolation: worktree", async () => {
+    const id = spawnAs("off", "worktree");
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)!.worktree).toBeUndefined();
+  });
+
+  it("the spawn option decides when the file leaves isolation unset", async () => {
+    const id = spawnAs(undefined, "worktree");
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  it("the project switch still refuses a file's isolation: worktree", async () => {
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(false);
+    const id = spawnAs("worktree", undefined);
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("an unregistered type keeps the spawn option", async () => {
+    const id = spawnAs("off", "worktree", { type: "not-registered" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  // Claude Code's workflow agent() reads only the script's `isolation`.
+  it("a workflow child ignores the file's isolation: worktree when the script omits it", async () => {
+    const id = spawnAs("worktree", undefined, { workflowId: "wf-1" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("a workflow child gets the script's isolation: worktree despite the file's isolation: off", async () => {
+    const id = spawnAs("off", "worktree", { workflowId: "wf-1" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
   });
 });

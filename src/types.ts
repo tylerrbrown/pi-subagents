@@ -121,8 +121,12 @@ export interface AgentConfig {
   isDefault?: boolean;
   /** false = agent is hidden from the registry */
   enabled?: boolean;
-  /** Where this agent was loaded from */
-  source?: "default" | "project" | "global";
+  /**
+   * Where this agent was loaded from. `"package"` means an installed pi package
+   * declared it (see package-resources.ts) — those files live under pi's install
+   * root, so `/agents` treats them as read-only and offers Eject instead of Edit.
+   */
+  source?: "default" | "project" | "global" | "package";
   /** Path of the .md it was loaded from. Unset for embedded defaults. */
   sourcePath?: string;
 }
@@ -138,7 +142,19 @@ export type JoinMode = 'async' | 'group' | 'smart';
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
-/** Transcript Markdown scope. Assistant-only is the default; tool results are opt-in. */
+/**
+ * How much of the conversation viewer's transcript is rendered as Markdown.
+ * - `off`: every line wraps as literal text, as it did before the mode existed.
+ * - `assistant`: assistant text renders as Markdown; tool results stay verbatim
+ *   and dim. The default, because assistant text *is* Markdown by contract
+ *   while a tool result is arbitrary bytes — a Markdown pass over a log or a
+ *   diff eats `#` from shell comments, swallows a `---` line into a setext
+ *   heading, re-fences indented output and redraws `| a | b |` as a table.
+ *   (Ordered-list renumbering is the one such rewrite actively suppressed —
+ *   see `MARKDOWN_OPTIONS` — because it silently changes data, not layout.)
+ * - `all`: tool results render as Markdown too, for tools that genuinely emit
+ *   it (#210's `ctx_execute`), accepting the rewrites above on ones that don't.
+ */
 export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
 
 /**
@@ -197,6 +213,9 @@ export type MentionResolution =
   | { kind: "live"; record: AgentRecord }
   | { kind: "tombstone"; entry: AgentTombstone };
 
+/** Which concurrency pool a run is charged to. */
+export type Pool = "background" | "foreground";
+
 export interface AgentRecord {
   id: string;
   work?: WorkBinding;
@@ -243,6 +262,36 @@ export interface AgentRecord {
   session?: AgentSession;
   abortController?: AbortController;
   promise?: Promise<string>;
+  /**
+   * A caller is awaiting this agent inline (`spawnAndWait`) — what
+   * `maxConcurrentForeground` bounds. Distinct from `isBackground === false`,
+   * which says only that the agent has an inline result surface: a detached
+   * cross-extension RPC spawn is foreground by that measure and yet blocks
+   * nobody, so it takes no slot.
+   *
+   * Cleared when the inline caller stops waiting: by `sendToBackground`, or
+   * when the run settles.
+   */
+  blocking?: boolean;
+  /**
+   * The concurrency pool this run's slot is charged to, set once when it
+   * starts. `settleRun` releases exactly this; `sendToBackground` is the only
+   * thing that moves it, together with the counters.
+   */
+  chargedPool?: Pool;
+  /**
+   * Removes the listener that stops this run when its caller's signal aborts.
+   * At most one is armed at a time — queueing arms one, starting replaces it.
+   */
+  detachParentAbort?: () => void;
+  /**
+   * Present only while the record is "queued": resolves when it leaves the
+   * queue, started or aborted. `spawnAndWait` waits on this because a queued
+   * record has no `promise` yet. Always resolves, never rejects — a rejection
+   * would escape into the caller's tool `execute` and take down pi's whole
+   * Promise.all tool batch.
+   */
+  startGate?: Promise<void>;
   groupId?: string;
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
@@ -275,8 +324,9 @@ export interface AgentRecord {
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
   /**
-   * Whether this agent was spawned to run in the background. Tri-state, set at
-   * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =
+   * Whether this agent runs in the background. Tri-state, initialized at spawn
+   * from `SpawnOptions.isBackground` and flipped `false` → `true` (once, never
+   * back) by `sendToBackground`: `true` = background, `false` =
    * foreground (has an inline Agent tool-result surface), `undefined` = the
    * caller never declared it (e.g. a cross-extension RPC spawn, which is detached
    * and has no inline surface). The widget's background-only filter keys off this
@@ -289,8 +339,27 @@ export interface AgentRecord {
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
+  /**
+   * The validated `StructuredOutput` payload, as canonical JSON.
+   *
+   * Set only when the spawn asked for a schema. Separate from `result` because
+   * `result` is prose for a reader — previewed in the widget, written to the
+   * transcript, and appended to with the worktree branch note — and JSON that
+   * has been appended to no longer parses.
+   */
+  structuredJson?: string;
+  /** Whether the child needed the extra structured-output prompt. */
+  structuredRetried?: boolean;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
+  /**
+   * The workflow run that owns this child, when a workflow spawned it.
+   *
+   * Owned the same way a nested child is owned by its parent: filtered out of
+   * every top-level surface, and outside the `maxConcurrent` pool. See
+   * `isTopLevelAgent`.
+   */
+  workflowId?: string;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
   /**
@@ -300,6 +369,13 @@ export interface AgentRecord {
    */
   rootSessionId?: string;
 }
+
+/**
+ * What a session reports as its level: pi's `ThinkingLevel` plus the `"off"` a
+ * model with thinking disabled reports. Display-only — spawning still takes a
+ * `ThinkingLevel`, so this widening cannot leak into an invocation.
+ */
+export type EffectiveThinkingLevel = ThinkingLevel | "off";
 
 export interface AgentInvocation {
   /** Short display name, updated from the actual child session. */
