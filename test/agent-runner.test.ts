@@ -455,6 +455,24 @@ describe("agent-runner final output capture", () => {
 
     expect(session.setSessionName).toHaveBeenCalledWith("Explore#a1b2c3d4");
   });
+
+  it("composes <Parent subject> - <Role> <intent>#id8 from the parent session name, before binding", async () => {
+    const { session } = createSession("NAMED");
+    createAgentSession.mockResolvedValue({ session });
+    const parentCtx = {
+      ...ctx,
+      sessionManager: { ...ctx.sessionManager, getSessionName: () => "Inbox - Quarantine Release Work" },
+    };
+
+    await runAgent(parentCtx, "Explore", "Quarantine release regression check\nmore detail", {
+      pi, agentId: "61f471ad9e3c",
+    });
+
+    expect(session.setSessionName).toHaveBeenCalledWith("Inbox - Explore Quarantine Release Regression Check#61f471ad");
+    const setOrder = session.setSessionName.mock.invocationCallOrder[0];
+    const bindOrder = session.bindExtensions.mock.invocationCallOrder[0];
+    expect(setOrder).toBeLessThan(bindOrder);
+  });
 });
 
 // #144 — a failed FINAL assistant turn (stopReason "error") must surface as
