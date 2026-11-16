@@ -25,15 +25,16 @@
 
 ## Commands
 
-- After code changes (not docs), run the full check suite and fix all errors and warnings:
+- After code changes (not docs), run typecheck, lint, and only the Vitest files covering changed code and its direct users; fix all errors and warnings:
   ```bash
-  npm run lint        # biome
   npm run typecheck   # tsc --noEmit
-  npm run test        # vitest run
+  npm run lint        # biome
+  npx vitest run test/<file>.test.ts   # specify the relevant files explicitly
   ```
 - `npm run lint:fix` auto-fixes most style issues.
-- `npm run test` runs the whole suite, including `*-e2e.test.ts` files. To iterate on a single file, run it directly: `npx vitest run test/<file>.test.ts`.
-- If you create or modify a test file, run it and iterate on the test or implementation until it passes.
+- This targeted-test policy supersedes broader ordinary PR/change-triggered test guidance in `CONTRIBUTING.md`; preserve all other PR checks and the release workflow below.
+- `npm run test` runs the whole suite, including `*-e2e.test.ts` files. Run the full suite or e2e tests only immediately before `npm publish` or when Tyler explicitly requests them; do not include e2e files in the default targeted selection.
+- If you create or modify a non-e2e test file, run it and iterate on the test or implementation until it passes. E2e files follow the gate above.
 - `npm run build` compiles with `tsc`; run it only when verifying the build output or when requested.
 - For ad-hoc scripts, write them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 
@@ -82,14 +83,15 @@ Before a release:
 
 - Update `CHANGELOG.md` — move the `## [Unreleased]` entries under a new `## [X.Y.Z]` version section, and add a fresh empty `## [Unreleased]` for the next cycle.
 - Update `README.md` if user-facing behavior changed (features list, settings, usage).
-- Run the full check suite plus the e2e tests, and fix anything that fails:
+- Before `npm publish` (or when Tyler explicitly requests it), run the full check suite plus the e2e tests, and fix anything that fails. Do not run these broader tests during ordinary iteration:
   ```bash
   npm run lint
   npm run typecheck
+  npm run test
   npm run test:e2e                 # faux/scripted e2e — no network, no keys
   npm run build
   ```
-- For a real pre-publish smoke test, run the **live** e2e against an actual model:
+- Only before `npm publish` or when Tyler explicitly requests it, run the **live** e2e against an actual model as a smoke test:
   ```bash
   PI_E2E_LIVE=1 npm run test:e2e   # uses your local `pi` login; optional PI_PROVIDER / PI_MODEL
   ```
