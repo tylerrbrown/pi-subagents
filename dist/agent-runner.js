@@ -4,7 +4,7 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager, } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, createCodemodeExtension, createMcpExtension, createToolSearchExtension, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager, } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
@@ -17,6 +17,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth } from "./nested-tools.j
 import { projectReadScopes } from "./project-scope.js";
 import { buildAgentPrompt } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
+import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 /**
  * Tool names registered by THIS extension. Single source of truth so the
  * registration sites (index.ts) and the subagent exclusion list below can't
@@ -25,6 +26,7 @@ import { preloadSkills } from "./skill-loader.js";
  */
 export const SUBAGENT_TOOL_NAMES = {
     AGENT: "Agent",
+    WORKFLOW: "SubagentWorkflow",
     GET_RESULT: "get_subagent_result",
     STEER: "steer_subagent",
 };
@@ -64,6 +66,9 @@ export function extensionCanonicalName(extPath) {
  * co-located file to `pi-subagents`.
  */
 function extensionPackageName(extPath) {
+    // `builtin:<name>` names no file; climbing from it would read the process cwd's manifest.
+    if (extPath.startsWith("builtin:"))
+        return undefined;
     const entry = resolve(extPath);
     let dir = dirname(extPath);
     for (;;) {
@@ -253,7 +258,7 @@ export function parseExtSelectors(entries) {
  * static `allowedToolNames` allowlist already gates the registry itself.
  */
 export function installExtensionToolScope(session, ctx) {
-    const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames } = ctx;
+    const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, nestedCallGate } = ctx;
     // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
     // selector is present, extension tools become an explicit allowlist — a loaded
     // extension not named by a selector contributes nothing (its handlers still ran),
@@ -278,19 +283,39 @@ export function installExtensionToolScope(session, ctx) {
         }
         for (const name of EXCLUDED_TOOL_NAMES)
             keep.delete(name);
-        // Opt-in nested delegation tools share EXCLUDED_TOOL_NAMES' names but are
-        // legitimately active for this agent — re-admit them so the renarrow keeps
-        // them in the active set and beforeToolCall doesn't block them.
-        for (const name of nestedToolNames) {
-            if (!disallowedSet?.has(name))
-                keep.add(name);
-        }
+        // Injected tools are legitimately active for this agent — re-admit them so
+        // the renarrow keeps them in the active set and beforeToolCall doesn't
+        // block them. Already vetted against `disallowed_tools` by the caller,
+        // which is the only place that knows which kind may be taken back.
+        for (const name of readmitToolNames)
+            keep.add(name);
         return keep;
     };
+    // Names this agent selects explicitly: its built-ins, injected tools, and
+    // `ext:foo/bar` narrowings. pi activates a named tool even when it is
+    // `defaultActive: false`, as `--tools` does.
+    const named = new Set([...toolNames, ...readmitToolNames, ...[...narrowing.values()].flatMap((s) => [...s])]);
+    // Activate what pi itself would: only tools declared to the model (`direct`/
+    // `model-only` exposure), and of those only named ones or ones not opted out
+    // with `defaultActive: false`. `codemode`/`deferred` tools (pi's MCP tools by
+    // default) stay undeclared until their extension or `tool_search` activates
+    // them — so an already-active tool is kept, or turn_end would undo that.
     const renarrow = () => {
         const allowed = inScope();
-        const next = session.getAllTools().map((t) => t.name).filter((n) => allowed.has(n));
         const current = session.getActiveToolNames();
+        const active = new Set(current);
+        const next = session
+            .getAllTools()
+            .filter(({ name, exposure = "direct" }) => {
+            if (!allowed.has(name))
+                return false;
+            if (active.has(name))
+                return true;
+            if (exposure !== "direct" && exposure !== "model-only")
+                return false;
+            return named.has(name) || session.getToolDefinition(name)?.defaultActive !== false;
+        })
+            .map((t) => t.name);
         // setActiveToolsByName unconditionally rebuilds the system prompt, so skip
         // the no-op that steady-state turns would otherwise pay for every turn.
         if (next.length !== current.length || next.some((n, i) => n !== current[i])) {
@@ -304,6 +329,7 @@ export function installExtensionToolScope(session, ctx) {
         if (event.type === "turn_end")
             renarrow();
     });
+    nestedCallGate.allows = (name) => inScope().has(name);
     const priorBeforeToolCall = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, signal) => {
         if (!inScope().has(context.toolCall.name)) {
@@ -313,6 +339,25 @@ export function installExtensionToolScope(session, ctx) {
             };
         }
         return priorBeforeToolCall?.(context, signal);
+    };
+}
+/**
+ * Inline extension that applies the subagent's tool scope to calls a tool makes
+ * through `ctx.executeTool()` — codemode scripts calling MCP tools. pi runs those
+ * past extensions' `tool_call` handlers only, never `agent.beforeToolCall`, and
+ * every registered `codemode`/`deferred` tool is callable there whether or not
+ * it is in scope.
+ */
+const SCOPE_GATE_NAME = "pi-subagents-scope";
+function scopeGateExtension(gate) {
+    return {
+        name: SCOPE_GATE_NAME,
+        hidden: true,
+        factory: (ext) => {
+            ext.on("tool_call", (event) => gate.allows?.(event.toolName) === false
+                ? { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` }
+                : undefined);
+        },
     };
 }
 /** Default max turns. undefined = unlimited (no turn limit). */
@@ -555,6 +600,9 @@ export async function runAgent(ctx, type, prompt, options) {
     const extras = {};
     if (options.worktreeBase)
         extras.worktreeBase = options.worktreeBase;
+    if (options.workflow && !options.structuredOutput)
+        extras.workflowChild = true;
+    const isolated = agentConfig?.isolated ?? options.isolated;
     // Per-run additions are derived locally; the registered agent definition is
     // never mutated, so concurrent and later runs retain their original scope.
     const addedTools = options.tools ?? [];
@@ -562,15 +610,15 @@ export async function runAgent(ctx, type, prompt, options) {
     const addedExtSelectors = addedTools.filter((name) => name.startsWith("ext:"));
     const unique = (values) => [...new Set(values)];
     // Resolve extensions/skills: isolated overrides all per-run additions.
-    const extensions = options.isolated
+    const extensions = isolated
         ? false
         : options.extensions?.length
             ? unique([...(config.extensions === true ? ["*"] : Array.isArray(config.extensions) ? config.extensions : []), ...options.extensions])
             : config.extensions;
     // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
     // isolation is an intentional override, not a misconfiguration.
-    const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
-    const skills = options.isolated
+    const excludeExtensions = isolated ? undefined : config.excludeExtensions;
+    const skills = isolated
         ? false
         : options.skills?.length
             ? unique([...(Array.isArray(config.skills) ? config.skills : []), ...options.skills])
@@ -620,7 +668,7 @@ export async function runAgent(ctx, type, prompt, options) {
     }
     // When skills is string[], we've already preloaded them into the prompt.
     // Still pass noSkills: true since we don't need the skill loader to load them again.
-    const noSkills = options.isolated || config.skills !== true;
+    const noSkills = isolated || config.skills !== true;
     const agentDir = getAgentDir();
     // Extension loading:
     // Local extensions are trusted executable code; these filters scope what the
@@ -641,7 +689,7 @@ export async function runAgent(ctx, type, prompt, options) {
     // the LLM. They do NOT control loading — `extensions:` is the sole authority for
     // which extensions load. `ext:foo` against an extension that `extensions:` excluded
     // is an orphan and warns after reload. `isolated` means no extension tools at all.
-    const { extNames, narrowing } = parseExtSelectors(options.isolated ? [] : [...(agentConfig?.extSelectors ?? []), ...addedExtSelectors]);
+    const { extNames, narrowing } = parseExtSelectors(isolated ? [] : [...(agentConfig?.extSelectors ?? []), ...addedExtSelectors]);
     const noExtensions = extensions === false;
     const requiredWorkGuard = options.bindBeforeExtensions ? boundWorkGuardPath(configCwd) : undefined;
     const extensionsSpec = Array.isArray(extensions)
@@ -674,6 +722,8 @@ export async function runAgent(ctx, type, prompt, options) {
                 extensions: base.extensions.filter((e) => {
                     if (requiredWorkGuard && resolve(e.path) === requiredWorkGuard)
                         return true;
+                    if (e.path === `<inline:${SCOPE_GATE_NAME}>`)
+                        return true; // ours, not the agent's
                     const canons = extensionCanonicalNames(e.path);
                     if (requiredWorkGuard && (noExtensions || canons.includes("work-agent-binding")))
                         return false;
@@ -683,7 +733,44 @@ export async function runAgent(ctx, type, prompt, options) {
                 }),
             };
         };
+    // The child inherits the parent's project-trust decision. pi's SettingsManager
+    // defaults to trusted, so without this a subagent in a project the user declined
+    // to trust would load its `.pi` extensions and settings, and pi's built-in MCP
+    // would start the stdio servers in its `.pi/mcp.json`.
+    const projectTrusted = ctx.isProjectTrusted();
+    const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
+    // That trust covers the parent's project (`configCwd`), not a directory a spawn
+    // was sent into. The session answers `ctx.isProjectTrusted()` for its own cwd,
+    // which pi's MCP uses to read `<cwd>/.pi/mcp.json` — so a cross-directory session
+    // keeps the parent project's settings but reports its cwd as untrusted. The
+    // loader keeps the trusted manager: it loads the parent project's extensions.
+    const sessionSettingsManager = resolve(effectiveCwd) === resolve(configCwd)
+        ? settingsManager
+        : Object.assign(SettingsManager.create(configCwd, agentDir, { projectTrusted }), {
+            isProjectTrusted: () => false,
+        });
+    const nestedCallGate = {};
     const loader = new DefaultResourceLoader({
+        settingsManager,
+        // pi's CLI hands its built-in extensions to the loader it builds; this one starts
+        // with none. Forwarded as `builtin:` resources they load as in the main session —
+        // default-on, disabled by `-builtin:<name>` in settings — and the per-agent
+        // allowlist filters them like any other extension. pi's `llama.cpp` built-in is
+        // CLI-only (not exported). Fresh factories per spawn: MCP state lives in the closure.
+        extensionFactories: [
+            { name: "codemode", factory: createCodemodeExtension(), builtin: true, replaceable: true },
+            { name: "tool-search", factory: createToolSearchExtension(), builtin: true, replaceable: true },
+            { name: "mcp", factory: createMcpExtension(), builtin: true, replaceable: true },
+            // Under `noExtensions` the static allowlist gates the registry itself.
+            ...(noExtensions ? [] : [scopeGateExtension(nestedCallGate)]),
+        ],
+        // Mirrors pi's CLI: `--no-mcp` keeps MCP out of subagents too, and `--no-extensions`
+        // keeps all the built-ins out. Discovered extensions still follow `extensions:`.
+        disabledBuiltinExtensions: process.argv.some((a) => a === "--no-extensions" || a === "-ne")
+            ? ["codemode", "tool-search", "mcp"]
+            : process.argv.includes("--no-mcp")
+                ? ["mcp"]
+                : undefined,
         cwd: configCwd,
         agentDir,
         noExtensions,
@@ -787,7 +874,7 @@ export async function runAgent(ctx, type, prompt, options) {
     const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
         ? options.nestedRuntime
         : undefined;
-    const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+    const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !isolated
         ? createNestedSubagentTools({
             manager: nestedRuntime.manager,
             pi: options.pi,
@@ -799,6 +886,27 @@ export async function runAgent(ctx, type, prompt, options) {
         })
         : [];
     const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
+    // The `agent({ schema })` contract: this child reports its answer by calling
+    // StructuredOutput, and `structuredJson` below is what the caller reads. The
+    // schema was already compiled by whoever asked for it, so a bad one failed
+    // before any of this ran.
+    const structuredCapture = options.structuredOutput ? createStructuredCapture() : undefined;
+    const structuredTools = options.structuredOutput && structuredCapture
+        ? [createStructuredOutputTool(options.structuredOutput, structuredCapture)]
+        : [];
+    const structuredToolNames = new Set(structuredTools.map(tool => tool.name));
+    // Re-admitted together at every gate below. Kept as one set so a new injected
+    // tool cannot be added to some of the three gates and forgotten at the rest.
+    //
+    // `disallowed_tools` is applied HERE rather than at the gates, because the two
+    // kinds answer to it differently: a nested delegation tool is an opt-in the
+    // agent's own frontmatter can take back, while StructuredOutput exists only
+    // because this call asked for a schema — removing it would make the request
+    // unsatisfiable by construction rather than merely restricted.
+    const readmitToolNames = new Set([
+        ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
+        ...structuredToolNames,
+    ]);
     // ─── Tool scoping ───────────────────────────────────────────────────────
     //
     // Some extensions register their tools ASYNCHRONOUSLY, long after the
@@ -835,6 +943,11 @@ export async function runAgent(ctx, type, prompt, options) {
         sessionTools = [
             ...toolNames.filter((t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t)),
             ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
+            // Not filtered through `disallowedSet`, unlike the nested tools above:
+            // the caller asked for a schema, and removing the only tool that can
+            // satisfy it would make the request unsatisfiable by construction rather
+            // than merely restricted.
+            ...structuredToolNames,
         ];
     }
     else {
@@ -848,12 +961,14 @@ export async function runAgent(ctx, type, prompt, options) {
         }
         if (disallowedSet) {
             // disallowed_tools wins even over an opt-in nested tool of the same name.
-            for (const name of disallowedSet)
-                denyTools.add(name);
+            // Not over StructuredOutput, though — see the allowlist branch above.
+            for (const name of disallowedSet) {
+                if (!structuredToolNames.has(name))
+                    denyTools.add(name);
+            }
         }
         sessionExcludeTools = [...denyTools];
     }
-    const settingsManager = SettingsManager.create(configCwd, agentDir);
     const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
     const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
     // Frontmatter wins when it says anything; otherwise the project default,
@@ -883,7 +998,7 @@ export async function runAgent(ctx, type, prompt, options) {
         cwd: effectiveCwd,
         agentDir,
         sessionManager,
-        settingsManager,
+        settingsManager: sessionSettingsManager,
         modelRegistry: ctx.modelRegistry,
         // `as never` is what keeps this assignable across the supported Pi range:
         // pre-0.80.8 the field exists only via the `modelRuntime?: unknown` shim
@@ -892,7 +1007,7 @@ export async function runAgent(ctx, type, prompt, options) {
         ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime }),
         model,
         tools: sessionTools,
-        customTools: nestedTools,
+        customTools: [...nestedTools, ...structuredTools],
         resourceLoader: loader,
     };
     if (sessionExcludeTools) {
@@ -949,7 +1064,8 @@ export async function runAgent(ctx, type, prompt, options) {
             disallowedSet,
             extNames,
             narrowing,
-            nestedToolNames,
+            readmitToolNames,
+            nestedCallGate,
         });
     }
     if (!options.bindBeforeExtensions)
@@ -1066,12 +1182,19 @@ export async function runAgent(ctx, type, prompt, options) {
     // on counts as this run's output (a fresh session, so usually 0).
     const startLen = session.messages.length;
     let timedOut = false;
+    let structuredRetried = false;
     try {
-        // Refuse before the first model call when a resumed record already crossed
-        // the ceiling, or when the newly-created session reports an initial value.
-        if (!checkContext()) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (options.signal?.aborted === true || aborted || deadline.timedOut() || checkContext())
+                break;
+            if (attempt === 1) {
+                if (structuredCapture === undefined || structuredCapture.json !== undefined)
+                    break;
+                structuredRetried = true;
+            }
             options.onPromptDelivered?.();
-            const promptRun = session.prompt(effectivePrompt).then(() => false);
+            const nextPrompt = attempt === 0 ? effectivePrompt : structuredRetryPrompt(structuredCapture);
+            const promptRun = session.prompt(nextPrompt).then(() => false);
             try {
                 timedOut = await Promise.race([promptRun, deadline.expired.then(() => true)]);
             }
@@ -1080,8 +1203,10 @@ export async function runAgent(ctx, type, prompt, options) {
                     throw error;
                 timedOut = true;
             }
-            if (timedOut)
+            if (timedOut) {
                 void promptRun.catch(() => { });
+                break;
+            }
         }
     }
     finally {
@@ -1091,6 +1216,14 @@ export async function runAgent(ctx, type, prompt, options) {
         deadline.cancel();
     }
     const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+    // A child asked for structured output that never gave any has failed, however
+    // articulate its prose was. Reported through `failure` so it travels the same
+    // path as a provider error rather than arriving as a successful empty answer.
+    const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
+        ? structuredCapture.lastError !== undefined
+            ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
+            : "The agent did not report its answer through StructuredOutput."
+        : undefined;
     return {
         responseText,
         session,
@@ -1100,7 +1233,9 @@ export async function runAgent(ctx, type, prompt, options) {
         contextSteered,
         contextGuardState: contextGuard.state,
         steered: softLimitReached || contextSteered,
-        failure: finalTurnError(session, startLen),
+        failure: finalTurnError(session, startLen) ?? structuredFailure,
+        ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
+        ...(structuredRetried ? { structuredRetried } : {}),
     };
 }
 /**
@@ -1183,7 +1318,7 @@ export async function resumeAgent(session, prompt, options = {}) {
     });
     let timedOut = false;
     try {
-        if (!checkContext()) {
+        if (options.signal?.aborted !== true && !checkContext()) {
             options.onPromptDelivered?.();
             const promptRun = session.prompt(prompt).then(() => false);
             try {

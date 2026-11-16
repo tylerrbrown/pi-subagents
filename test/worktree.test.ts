@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupWorktree,
   createWorktree,
@@ -11,6 +12,44 @@ import {
   setWorktreeIsolationEnabled,
 } from "../src/worktree.js";
 import { worktreePi as pi } from "./helpers/worktree-pi.js";
+
+/**
+ * Minimal stand-in for pi.exec(): runs the command for real, and — like the
+ * host's implementation — REPORTS failure in the result instead of rejecting.
+ * The source has to read `code`/`killed` rather than rely on a throw, so a stub
+ * that threw would hide the branch that matters.
+ */
+function mockPi(): ExtensionAPI {
+  return {
+    exec: async (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => {
+      try {
+        const stdout = execFileSync(command, args, {
+          cwd: options?.cwd,
+          encoding: "utf-8",
+          stdio: ["pipe", "pipe", "pipe"],
+          timeout: options?.timeout,
+        });
+        return { stdout, stderr: "", code: 0, killed: false };
+      } catch (err: any) {
+        return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", code: err.status ?? 1, killed: false };
+      }
+    },
+  } as unknown as ExtensionAPI;
+}
+
+/**
+ * A pi whose exec answers one git subcommand with a canned failure result and
+ * runs everything else for real. `match` sees the argv git is called with.
+ */
+function failingPi(match: (args: string[]) => boolean, failure: { code: number; killed: boolean }): ExtensionAPI {
+  const real = mockPi();
+  return {
+    exec: vi.fn(async (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => {
+      if (match(args)) return { stdout: "", stderr: "boom", ...failure };
+      return real.exec(command, args, options);
+    }),
+  } as unknown as ExtensionAPI;
+}
 
 /**
  * Helper: create a temporary git repo with an initial commit.
@@ -28,9 +67,11 @@ function initGitRepo(): string {
 
 describe("worktree", () => {
   let repoDir: string;
+  let pi: ExtensionAPI;
 
   beforeEach(() => {
     repoDir = initGitRepo();
+    pi = mockPi();
   });
 
   afterEach(async () => {
@@ -77,6 +118,27 @@ describe("worktree", () => {
       }
     });
 
+    it("returns undefined when `git worktree add` reports a non-zero exit", async () => {
+      // pi.exec resolves with a failure code instead of throwing, so a port that
+      // only caught exceptions would hand back a worktree path that isn't there.
+      const wt = await createWorktree(
+        failingPi(args => args[0] === "worktree" && args[1] === "add", { code: 128, killed: false }),
+        repoDir,
+        "add-fails",
+      );
+      expect(wt).toBeUndefined();
+    });
+
+    it("returns undefined when a git call is killed by its timeout", async () => {
+      // A killed process reports code 0 with killed: true — the one failure
+      // shape that looks like success if only the exit code is checked.
+      const wt = await createWorktree(
+        failingPi(args => args[0] === "rev-parse" && args[1] === "HEAD", { code: 0, killed: true }),
+        repoDir,
+        "timed-out",
+      );
+      expect(wt).toBeUndefined();
+    });
     it("workPath equals path when created from the repo root", async () => {
       const wt = (await createWorktree(pi, repoDir, "root-wp"))!;
       expect(wt.workPath).toBe(wt.path);
@@ -107,6 +169,36 @@ describe("worktree", () => {
       try { execFileSync("git", ["worktree", "remove", "--force", wt1!.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
       try { execFileSync("git", ["worktree", "remove", "--force", wt2!.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
+
+    it("creates worktrees concurrently — the git calls do not serialize on one another", async () => {
+      // The reason for the port: several isolated agents can start at once, so
+      // no call may block the caller until the previous one has finished.
+      const order: string[] = [];
+      const tracking = {
+        exec: async (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => {
+          order.push(`start:${args[0]}`);
+          const result = await pi.exec(command, args, options);
+          order.push(`end:${args[0]}`);
+          return result;
+        },
+      } as unknown as ExtensionAPI;
+
+      const [a, b] = await Promise.all([
+        createWorktree(tracking, repoDir, "par-1"),
+        createWorktree(tracking, repoDir, "par-2"),
+      ]);
+      expect(a).toBeDefined();
+      expect(b).toBeDefined();
+
+      // Interleaving proves the two chains ran together: with blocking calls the
+      // log would be strictly start/end paired.
+      const interleaved = order.some((entry, i) => entry.startsWith("start:") && order[i + 1]?.startsWith("start:"));
+      expect(interleaved).toBe(true);
+
+      for (const wt of [a!, b!]) {
+        try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
+      }
+    });
   });
 
   describe("cleanupWorktree", () => {
@@ -117,6 +209,7 @@ describe("worktree", () => {
       const result = await cleanupWorktree(pi, repoDir, wt, "test cleanup");
       expect(result.hasChanges).toBe(false);
       expect(result.branch).toBeUndefined();
+      expect(existsSync(wt.path)).toBe(false);
     });
 
     it("commits changes and creates branch when changes exist", async () => {
@@ -246,14 +339,30 @@ describe("worktree", () => {
       // Cleanup
       try { execFileSync("git", ["branch", "-D", result.branch!], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
+
+    it("falls back to pruning when `git worktree remove` fails", async () => {
+      // Removal failing is not fatal — the registration is pruned instead, and
+      // the caller still hears that there were no changes.
+      const wt = (await createWorktree(pi, repoDir, "remove-fails"))!;
+      const failing = failingPi(
+        args => args[0] === "worktree" && args[1] === "remove",
+        { code: 1, killed: false },
+      );
+
+      const result = await cleanupWorktree(failing, repoDir, wt, "removal fails");
+
+      expect(result.hasChanges).toBe(false);
+      expect(vi.mocked(failing.exec).mock.calls.some(([, args]) => args[0] === "worktree" && args[1] === "prune")).toBe(true);
+      try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
+    });
   });
 
   describe("pruneWorktrees", () => {
-    it("does not throw on a clean repo", async () => {
+    it("does not reject on a clean repo", async () => {
       await expect(pruneWorktrees(pi, repoDir)).resolves.toBeUndefined();
     });
 
-    it("does not throw on non-git directory", async () => {
+    it("does not reject on non-git directory", async () => {
       const nonGit = mkdtempSync(join(tmpdir(), "pi-wt-nongit-"));
       try {
         await expect(pruneWorktrees(pi, nonGit)).resolves.toBeUndefined();
@@ -271,8 +380,9 @@ describe("worktree", () => {
 // commits go with the worktree and nobody is told.
 describe("cleanupWorktree — failure path", () => {
   let repoDir: string;
+  let pi: ExtensionAPI;
 
-  beforeEach(() => { repoDir = initGitRepo(); });
+  beforeEach(() => { repoDir = initGitRepo(); pi = mockPi(); });
   afterEach(async () => {
     try { await pruneWorktrees(pi, repoDir); } catch { /* ignore */ }
     rmSync(repoDir, { recursive: true, force: true });
@@ -312,6 +422,26 @@ describe("cleanupWorktree — failure path", () => {
     rmSync(wt.path, { recursive: true, force: true });
   });
 
+  it("retains recoverable output when the preservation commit fails", async () => {
+    // `git commit` failing resolves with a non-zero code rather than throwing,
+    // so the outer catch is only reached if the result is inspected.
+    const wt = (await createWorktree(pi, repoDir, "commit-fails"))!;
+    writeFileSync(join(wt.path, "work.txt"), "agent output");
+
+    const result = await cleanupWorktree(
+      failingPi(args => args[0] === "commit", { code: 1, killed: false }),
+      repoDir,
+      wt,
+      "commit fails",
+    );
+
+    expect(result.hasChanges).toBe(true);
+    expect(result.branch).toBeUndefined();
+    expect(result.path).toBe(wt.path);
+    expect(result.error).toBe("boom");
+    expect(existsSync(join(wt.path, "work.txt"))).toBe(true);
+    rmSync(wt.path, { recursive: true, force: true });
+  });
   it("creates the branch BEFORE removing the worktree, so a removal failure cannot lose commits", async () => {
     // Ordering is the actual safety property. If a refactor moved
     // removeWorktree above the `git branch` call, the commits would be

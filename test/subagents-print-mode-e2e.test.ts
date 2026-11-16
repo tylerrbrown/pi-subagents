@@ -17,7 +17,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { Context } from "@earendil-works/pi-ai";
+import { type Context, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentCall,
@@ -46,6 +46,43 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     for (const d of tmpDirs.splice(0)) {
       try { rmSync(d, { recursive: true, force: true }); } catch { /* Windows may retain a just-removed worktree briefly. */ }
     }
+  });
+
+  // The one assumption the model/thinking display rests on, checked against a
+  // REAL AgentSession rather than a stub: that a child session exposes the model
+  // it resolved and the level it settled on, and that the manager writes both
+  // onto the record. Every unit test in that area stubs the session, so nothing
+  // else would notice pi moving or renaming either getter — the display would
+  // just quietly go blank, which is the bug this whole area exists to fix.
+  it("records the model and thinking level the child session actually resolved", async () => {
+    run = await runPrintMode({
+      prompt: "Delegate the greeting to a subagent.",
+      respond: routeBySession({
+        parentInitial: agentCall({
+          subagent_type: "general-purpose",
+          description: "greet",
+          prompt: "Say hello.",
+          run_in_background: true,
+        }),
+        parentFinal: "done",
+        subagent: "CHILD_GREETING_OK",
+      }),
+    });
+    await run.manager?.waitForAll();
+
+    // The background result names the id; the record behind it is the real one
+    // the extension built from the real child session.
+    const id = /Agent ID: (\S+)/.exec(agentToolResults(run.parentSession).join("\n"))?.[1];
+    expect(id).toBeTruthy();
+    const record = run.manager?.getRecord(id as string) as { invocation?: Record<string, unknown> };
+    const invocation = record?.invocation;
+
+    // faux/faux-1 is what the harness registers and the child inherits, so this
+    // is the resolved identity travelling through the real code path.
+    expect(invocation?.modelId).toBe("faux/faux-1");
+    expect(invocation?.modelName).toBe("faux-1");
+    expect(typeof invocation?.thinking).toBe("string");
+    expect(invocation?.thinking).not.toBe("");
   });
 
   it("spawns a FOREGROUND subagent and routes its real output back to the parent", async () => {
@@ -96,7 +133,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     //     finishes → the child's own model turn actually runs (≥3 calls).
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const respond = async (ctx: Context) => {
-      const isParent = (ctx.tools ?? []).some((t) => t.name === "Agent");
+      const isParent = getCurrentTools(ctx.messages).some((t) => t.name === "Agent");
       if (!isParent) {
         await sleep(80); // child takes long enough that a non-held parent exits first
         return "CHILD_BG_RAN";
@@ -155,7 +192,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
         parentFinal: "Reported.",
         // The child reflects whether the frontmatter body reached its own prompt.
         subagent: (ctx: Context) =>
-          `child saw: ${ctx.systemPrompt?.includes(MARKER) ? MARKER : "MISSING"}`,
+          `child saw: ${getCurrentSystemPrompt(ctx.messages).includes(MARKER) ? MARKER : "MISSING"}`,
       }),
     });
 
@@ -189,7 +226,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
         }),
         parentFinal: "Reported.",
         subagent: (ctx: Context) =>
-          `child saw: ${ctx.systemPrompt?.includes(MARKER) ? MARKER : "MISSING"}`,
+          `child saw: ${getCurrentSystemPrompt(ctx.messages).includes(MARKER) ? MARKER : "MISSING"}`,
       }),
     });
 

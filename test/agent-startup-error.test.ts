@@ -2,10 +2,10 @@
  * agent-startup-error.test.ts — a spawn that never starts must fail the tool
  * call, not return a message (#179).
  *
- * The assertion is `rejects`, and that is the whole point: pi marks a tool
- * result failed only when `execute` throws (`isError` on a returned result is
- * discarded), so a returned diagnostic reaches the parent model as a subagent
- * that ran and reported this — and the model retries the same doomed call.
+ * The assertion is `rejects`, and that is the whole point: the tool reports
+ * failure by throwing, which pi turns into `isError: true`. A returned
+ * diagnostic reaches the parent model as a subagent that ran and reported
+ * this — and the model retries the same doomed call.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +25,9 @@ function boot() {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
+    registerEntryRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     on: vi.fn(),
     events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
     appendEntry: vi.fn(),

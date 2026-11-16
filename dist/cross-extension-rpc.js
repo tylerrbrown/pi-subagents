@@ -1,14 +1,20 @@
 /**
  * Cross-extension RPC handlers for the subagents extension.
  *
- * Exposes ping, spawn, and stop RPCs over the pi.events event bus,
+ * Exposes ping, spawn, stop, and consume RPCs over the pi.events event bus,
  * using per-request scoped reply channels.
  *
  * Reply envelope follows pi-mono convention:
  *   success → { success: true, data?: T }
  *   error   → { success: false, error: string }
+ *
+ * @see docs/rpc.md — the caller-facing integration reference: spawn options
+ * (including the fields spawnTopLevel strips), every error string, the
+ * completion-notification race, and what protocol version 2 does not promise.
  */
+import { isTopLevelAgent } from "./agent-manager.js";
 import { resolveModel } from "./model-resolver.js";
+import { checkModelScope } from "./model-scope.js";
 import { validateWorkSkipped } from "./work-lifecycle.js";
 /** RPC protocol version — bumped when the envelope or method contracts change. */
 export const PROTOCOL_VERSION = 2;
@@ -34,7 +40,7 @@ function handleRpc(events, channel, fn) {
     });
 }
 /**
- * Register ping, spawn, and stop RPC handlers on the event bus.
+ * Register ping, spawn, stop, and consume RPC handlers on the event bus.
  * Returns unsub functions for cleanup.
  */
 export function registerRpcHandlers(deps) {
@@ -55,31 +61,85 @@ export function registerRpcHandlers(deps) {
         let normalizedOptions = options?.work !== undefined
             ? { ...options, invocationId: options.invocationId ?? requestId }
             : options ?? {};
-        if (typeof normalizedOptions.model === "string") {
-            const registry = ctx.modelRegistry;
-            if (!registry) {
-                throw new Error(`Model override "${normalizedOptions.model}" provided but ctx.modelRegistry is unavailable`);
+        // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
+        // field as null, and the runner reads `options.model ?? default`, so null
+        // means "inherit" — not an override to resolve or scope-check.
+        const override = normalizedOptions.model;
+        if (override != null) {
+            const { modelRegistry, cwd } = ctx;
+            // Names the override the same way in both messages below; an object
+            // override would otherwise interpolate as "[object Object]".
+            const label = typeof override === "string" ? override : `${override.provider}/${override.id}`;
+            if (!modelRegistry) {
+                throw new Error(`Model override "${label}" provided but ctx.modelRegistry is unavailable`);
             }
-            const resolved = resolveModel(normalizedOptions.model, registry);
-            if (typeof resolved === "string") {
-                // resolveModel returns a human-readable error string when the
-                // input doesn't match any available model. Surface it instead of
-                // silently falling back so the caller sees the auth/typo issue.
-                throw new Error(resolved);
+            let model = typeof override === "string" ? undefined : override;
+            if (typeof override === "string") {
+                const resolved = resolveModel(override, modelRegistry);
+                if (typeof resolved === "string") {
+                    // resolveModel returns a human-readable error string when the
+                    // input doesn't match any available model. Surface it instead of
+                    // silently falling back so the caller sees the auth/typo issue.
+                    throw new Error(resolved);
+                }
+                model = resolved;
+                normalizedOptions = { ...normalizedOptions, model: resolved, requestedModel: override };
             }
-            normalizedOptions = { ...normalizedOptions, model: resolved, requestedModel: normalizedOptions.model };
+            // A model on the RPC payload is an orchestrator-level choice, exactly
+            // like Agent({ model }) — so it gets the Agent tool's hard error, never
+            // the frontmatter warn (#240). The check reads the RESOLVED model:
+            // resolveModel is fuzzy, so a bare "sonnet" can land on a provider the
+            // caller never named. Frontmatter-pinned and parent-inherited models are
+            // resolved later, in agent-runner, and keep warn-and-proceed.
+            const verdict = checkModelScope({
+                model,
+                cwd: cwd ?? process.cwd(),
+                modelRegistry,
+                callerSupplied: true,
+                agentLabel: type,
+                modelInput: label,
+            });
+            if (verdict.kind === "error")
+                throw new Error(verdict.message);
         }
         const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
+        // With isolation: "worktree" the agent starts asynchronously — wait for
+        // it, so a strict-isolation failure is still an error envelope rather
+        // than an id for an agent that never ran.
         await manager.awaitStartup(id);
-        const record = manager.getRecord?.(id);
+        const record = manager.getRecord(id);
         if (record?.status === "skipped" && record.workLaunch) {
             return validateWorkSkipped(JSON.parse(record.result ?? "null"), record.workLaunch);
         }
         return { id };
     });
     const unsubStop = handleRpc(events, "subagents:rpc:stop", ({ agentId }) => {
-        if (!manager.abort(agentId))
+        const record = manager.getRecord(agentId);
+        if (!record)
             throw new Error("Agent not found");
+        // Only the session's own agents are this RPC's to stop. A nested child or
+        // a workflow's agent is owned by something that is *waiting on it*, and
+        // aborting it out from under that owner turns another extension's stop
+        // into a failed step here. Defence in depth rather than a live hole: no
+        // RPC hands out agent ids, so a caller has no ordinary way to name one it
+        // does not own — but the guard is cheap and the id may leak some other
+        // way. Same refuse-what-we-should-not-touch stance as `consume` below.
+        if (!isTopLevelAgent(record))
+            throw new Error("Agent is owned by another agent or workflow");
+        // Not "not found" — the lookup above already proved it exists. `abort`
+        // returns false only for a record that is neither running nor queued,
+        // which is an agent that has already finished.
+        if (!manager.abort(agentId))
+            throw new Error("Agent is not running");
     });
-    return { unsubPing, unsubSpawn, unsubStop };
+    // A caller that has already shown the model an agent's result — pi-tasks'
+    // TaskOutput is the one in practice — says so here, so the completion
+    // notification for that same result is not delivered on top of it and does
+    // not cost the parent a turn. Deliberately outside the ping version
+    // handshake: an extension built against protocol v2 simply never calls it.
+    const unsubConsume = handleRpc(events, "subagents:rpc:consume", ({ agentId }) => {
+        if (!manager.consumeResult(agentId))
+            throw new Error("Agent not found or still running");
+    });
+    return { unsubPing, unsubSpawn, unsubStop, unsubConsume };
 }

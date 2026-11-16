@@ -192,6 +192,53 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
+  it("round-trips packageAgents and packageWorkflows in all three forms", () => {
+    saveSettings({ packageAgents: false, packageWorkflows: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: false, packageWorkflows: false });
+
+    saveSettings({ packageAgents: true, packageWorkflows: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: true, packageWorkflows: true });
+
+    saveSettings({ packageAgents: ["my-subagents", "@acme/tools"] }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["my-subagents", "@acme/tools"] });
+  });
+
+  it("trims allowlist entries and drops the ones that are not strings", () => {
+    writeProject({ packageAgents: ["  spaced  ", 7, "", null, "kept"] } as any);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["spaced", "kept"] });
+  });
+
+  it("keeps an allowlist that trims to empty rather than dropping the key", () => {
+    // Dropping it would restore the `true` default and load every package's
+    // agents — the opposite of what someone who wrote a list meant. `[]` matches
+    // nothing, like `false`.
+    writeProject({ packageAgents: ["   ", ""] } as any);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: [] });
+  });
+
+  it("reads a bare string as a one-entry allowlist, not as garbage to drop", () => {
+    // This setting defaults to `true`, so dropping a malformed value silently
+    // admits every package — the opposite of what someone narrowing the gate
+    // meant. `"my-pkg"` is the obvious typo for `["my-pkg"]`, so read it as one.
+    writeProject({ packageAgents: "my-pkg" } as any);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["my-pkg"] });
+    writeProject({ packageAgents: "   " } as any);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: [] });
+  });
+
+  it("drops a packageAgents value that is neither a boolean, a string, nor an array", () => {
+    writeProject({ packageWorkflows: { allow: [] } } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ packageAgents: 7 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("lets a project gate override a global one", () => {
+    writeGlobal({ packageAgents: true });
+    writeProject({ packageAgents: ["only-this"] });
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["only-this"] });
+  });
+
   it("round-trips worktreeIsolation; drops non-boolean", () => {
     saveSettings({ worktreeIsolation: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: false });
@@ -209,6 +256,25 @@ describe("settings persistence", () => {
     // The sanitizer is an allowlist: a key it does not name is dropped, and the
     // setting silently never applies.
     writeProject({ reportUsage: "on", showCost: 1 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("round-trips showModel; drops non-boolean", () => {
+    saveSettings({ showModel: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ showModel: true });
+    saveSettings({ showModel: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ showModel: false });
+    writeProject({ showModel: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("round-trips workflowsEnabled; drops non-boolean", () => {
+    saveSettings({ workflowsEnabled: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: true });
+    saveSettings({ workflowsEnabled: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: false });
+    writeProject({ workflowsEnabled: "on" } as any);
+    // Dropped, not coerced — a truthy string must not switch the feature on.
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -272,6 +338,20 @@ describe("settings persistence", () => {
       expect(loadSettings(projectDir).maxConcurrent).toBeUndefined();
       writeProject({ maxConcurrent: null });
       expect(loadSettings(projectDir).maxConcurrent).toBeUndefined();
+    });
+
+    // Unlike maxConcurrent above, 0 is the DEFAULT here and means unlimited —
+    // dropping it would make the default unrepresentable in the file.
+    it("keeps maxConcurrentForeground: 0 (explicit unlimited)", () => {
+      writeProject({ maxConcurrentForeground: 0 });
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrentForeground: 0 });
+    });
+
+    it("drops out-of-range or non-integer maxConcurrentForeground", () => {
+      for (const bad of [-1, 1025, 1.5, "four", null]) {
+        writeProject({ maxConcurrentForeground: bad });
+        expect(loadSettings(projectDir).maxConcurrentForeground).toBeUndefined();
+      }
     });
 
     it("accepts defaultMaxTurns: 0 (explicit unlimited)", () => {
@@ -500,6 +580,7 @@ describe("settings persistence", () => {
     beforeEach(() => {
       appliers = {
         setMaxConcurrent: vi.fn(),
+        setMaxConcurrentForeground: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
@@ -520,7 +601,39 @@ describe("settings persistence", () => {
         setFallbackSubagent: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
+        setShowModel: vi.fn(),
+        setPackageAgents: vi.fn(),
+        setPackageWorkflows: vi.fn(),
       };
+    });
+
+    // 0 is a real value here, so `if (s.x)` truthiness would silently skip it.
+    it("applies maxConcurrentForeground, including an explicit 0", () => {
+      applySettings({ maxConcurrentForeground: 3 }, appliers);
+      expect(appliers.setMaxConcurrentForeground).toHaveBeenCalledWith(3);
+
+      applySettings({ maxConcurrentForeground: 0 }, appliers);
+      expect(appliers.setMaxConcurrentForeground).toHaveBeenCalledWith(0);
+
+      vi.mocked(appliers.setMaxConcurrentForeground).mockClear();
+      applySettings({}, appliers);
+      expect(appliers.setMaxConcurrentForeground).not.toHaveBeenCalled();
+    });
+
+    it("applies packageAgents and packageWorkflows, including false and an empty list", () => {
+      applySettings({ packageAgents: ["a"], packageWorkflows: false }, appliers);
+      expect(appliers.setPackageAgents).toHaveBeenCalledWith(["a"]);
+      expect(appliers.setPackageWorkflows).toHaveBeenCalledWith(false);
+
+      // `false` and `[]` are real values, so a truthiness check would skip them.
+      applySettings({ packageAgents: false }, appliers);
+      expect(appliers.setPackageAgents).toHaveBeenCalledWith(false);
+      applySettings({ packageAgents: [] }, appliers);
+      expect(appliers.setPackageAgents).toHaveBeenCalledWith([]);
+
+      vi.mocked(appliers.setPackageAgents).mockClear();
+      applySettings({}, appliers);
+      expect(appliers.setPackageAgents).not.toHaveBeenCalled();
     });
 
     it("applies reportUsage and showCost", () => {
@@ -531,6 +644,14 @@ describe("settings persistence", () => {
       applySettings({ reportUsage: false, showCost: false }, appliers);
       expect(appliers.setReportUsage).toHaveBeenCalledWith(false);
       expect(appliers.setShowCost).toHaveBeenCalledWith(false);
+    });
+
+    it("applies showModel", () => {
+      applySettings({ showModel: true }, appliers);
+      expect(appliers.setShowModel).toHaveBeenCalledWith(true);
+
+      applySettings({ showModel: false }, appliers);
+      expect(appliers.setShowModel).toHaveBeenCalledWith(false);
     });
 
     it("is a no-op on an empty settings object", () => {
@@ -728,6 +849,7 @@ describe("settings persistence", () => {
     beforeEach(() => {
       appliers = {
         setMaxConcurrent: vi.fn(),
+        setMaxConcurrentForeground: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
@@ -748,6 +870,9 @@ describe("settings persistence", () => {
         setFallbackSubagent: vi.fn(),
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
+        setShowModel: vi.fn(),
+        setPackageAgents: vi.fn(),
+        setPackageWorkflows: vi.fn(),
       };
     });
 

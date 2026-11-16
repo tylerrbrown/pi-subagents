@@ -1,5 +1,4 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -31,20 +30,22 @@ import { runAgent, workBoundAgentConfig } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { type Hermetic, hermeticDir } from "./helpers/boot-extension.js";
+import { requireExternalWorkFixture } from "./helpers/external-work-fixture.js";
 import { workContext } from "./helpers/work-adapter.js";
 
 let fixture: Hermetic | undefined;
 afterEach(() => { state.session?.dispose(); fixture?.restore(); fixture = undefined; registerAgents([]); vi.clearAllMocks(); });
 
 describe("bound Work guard through the actual resource loader", () => {
-  it("refreshes only root shared definitions for a positive Work dispatch at actual Naming cwd", () => {
-    const cwd = "C:/Worktrees/tylerrbrown/Claude/hyynh8qv-session-naming-targeted-model-comparison";
+  it("refreshes only root shared definitions for a positive Work dispatch at configured cwd", () => {
+    const cwd = requireExternalWorkFixture("PI_SUBAGENTS_TEST_WORK_CWD", "directory");
+    const rootAgent = requireExternalWorkFixture("PI_SUBAGENTS_TEST_ROOT_AGENT");
     const original = loadCustomAgents(cwd).get("builder")!;
     const refreshed = workBoundAgentConfig(cwd, original, true)!;
-    expect(refreshed.sourcePath).toBe(resolve(homedir(), "SynologyDrive/Claude/.claude/agents/builder.md"));
+    expect(refreshed.sourcePath).toBe(resolve(rootAgent));
     expect(refreshed.systemPrompt).toContain("file list is a prediction, not an edit lock");
     expect(workBoundAgentConfig(cwd, original, false)).toBe(original);
-    const local = { ...original, sourcePath: join(cwd, "apps/helm/.claude/agents/builder.md"), systemPrompt: "local authority" };
+    const local = { ...original, sourcePath: join(cwd, "nested/.claude/agents/builder.md"), systemPrompt: "local authority" };
     expect(workBoundAgentConfig(cwd, local, true)).toBe(local);
     const custom = { ...original, name: "only-local", sourcePath: join(cwd, ".claude/agents/only-local.md") };
     expect(workBoundAgentConfig(cwd, custom, true)).toBe(custom);
@@ -57,7 +58,9 @@ describe("bound Work guard through the actual resource loader", () => {
     mkdirSync(extensions, { recursive: true }); mkdirSync(compiled);
     writeFileSync(join(extensions, "recall-inject.js"), "export default function(pi) {}\n");
     const guard = join(compiled, "work-agent-binding.js");
-    const actualSource = resolve(homedir(), "SynologyDrive/Claude/.pi/extensions-dist/work-agent-binding.js");
+    const actualSource = bound
+      ? requireExternalWorkFixture("PI_SUBAGENTS_TEST_WORK_GUARD")
+      : join(compiled, "unavailable-work-guard.js");
     // Load the real adapter; only its external Work process is replaced.
     writeFileSync(guard, `import guard from ${JSON.stringify(pathToFileURL(actualSource).href)};
       export default function(pi) { guard({...pi, exec: async (_command,args) => ({code:0,stdout:JSON.stringify({
@@ -68,7 +71,7 @@ describe("bound Work guard through the actual resource loader", () => {
     registerAgents(new Map([["guard-builder", { name: "guard-builder", description: "builder", systemPrompt: "synthetic",
       tools: ["write"], builtinToolNames: ["write"], extensions: ["recall-inject"], excludeExtensions: ["work-agent-binding"], skills: false,
     } as any]]));
-    const ctx = workContext(); ctx.cwd = fixture.dir;
+    const ctx = { ...workContext(), cwd: fixture.dir, isProjectTrusted: () => false };
     const running = runAgent(ctx, "guard-builder", "Never call a real model", {
       pi: { exec: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })) } as any,
       isolated, bindBeforeExtensions: bound,

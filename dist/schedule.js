@@ -12,11 +12,12 @@
  *     of dispatching a user message — schedule fires bypass maxConcurrent so
  *     a 5-minute interval can't be deferred behind 4 long-running agents.
  *   - Result delivery is implicit: spawn → background completion → existing
- *     `subagent-notification` followUp path. No new delivery code.
+ *     `subagent-notification` path. No new delivery code.
  */
 import { Cron } from "croner";
 import { nanoid } from "nanoid";
 import { assertValidSpawnCwd } from "./agent-manager.js";
+import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { resolveContextThresholds } from "./context-guard.js";
 import { resolveModel } from "./model-resolver.js";
@@ -262,6 +263,20 @@ export class SubagentScheduler {
                 isolated: job.isolated,
                 thinkingLevel: job.thinking,
                 isolation: job.isolation,
+                // A scheduled run has no tool call to build this, so without it the
+                // conversation viewer shows nothing about how the job was configured.
+                // The model is left out on purpose: agent-manager fills in the effective
+                // one when the session reports it, and naming the pre-session pick here
+                // would only be right until then.
+                invocation: {
+                    thinking: job.thinking,
+                    // Normalized like the Agent tool's own snapshot: `0` means unlimited,
+                    // and rendering it as "max turns: 0" would read as a limit of none.
+                    maxTurns: normalizeMaxTurns(job.max_turns),
+                    isolated: job.isolated,
+                    runInBackground: true,
+                    isolation: job.isolation,
+                },
             });
         }
         catch (err) {

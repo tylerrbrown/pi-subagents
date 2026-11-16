@@ -18,7 +18,8 @@ afterEach(() => vi.restoreAllMocks());
 it.each(["fleet", "menu"])("persists m through the real %s entry point and reopens with the same mode", async entry => {
   const sandbox = hermeticDir({ settings: { viewerMarkdown: "off", schedulingEnabled: false, outputTranscript: false } });
   const { pi, tools, lifecycle } = makePi();
-  let input: ((data: string) => unknown) | undefined;
+  const inputs: Array<(data: string) => unknown> = [];
+  const input = (data: string) => inputs.forEach(handler => { handler(data); });
   const modes: string[] = [];
   const custom: FleetUICtx["custom"] = async factory => {
     const viewer = factory({ terminal: { rows: 30, columns: 100 }, requestRender: vi.fn() },
@@ -34,7 +35,7 @@ it.each(["fleet", "menu"])("persists m through the real %s entry point and reope
   const ui = {
     setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(), custom,
     getEditorText: () => "",
-    onTerminalInput: (handler: (data: string) => unknown) => { input = handler; return vi.fn(); },
+    onTerminalInput: (handler: (data: string) => unknown) => { inputs.push(handler); return vi.fn(); },
     select: vi.fn(),
   };
   const context = ctx({ hasUI: true, ui });

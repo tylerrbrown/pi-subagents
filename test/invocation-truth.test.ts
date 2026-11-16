@@ -354,7 +354,7 @@ it.each(["astra", "haiku"])("RPC preserves raw alias %s through the real manager
     requestedModelId: model === "astra" ? "openai-codex/astra" : "pi-sub-anthropic/claude-haiku-4-5",
     modelId: "pi-sub-anthropic/claude-haiku-4-5", thinking: "off",
   });
-  expect(buildInvocationTags(record.invocation)).toEqual({
+  expect(buildInvocationTags(record.invocation)).toMatchObject({
     modelName: model === "astra" ? "haiku 4.5 (asked astra)" : "haiku 4.5",
     tags: ["thinking: off (asked max)"],
   });

@@ -5,7 +5,7 @@
  * Subscribes to session events for real-time streaming updates.
  */
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Input, Markdown, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Input, Markdown, matchesKey, ScrollView, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
@@ -16,6 +16,13 @@ const CHROME_LINES_BASE = 6;
 const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
+const SCROLLBAR_WIDTH = 1;
+/** Follow the active renderer, not a setting that may require a restart. */
+export function getConversationOverlayOptions(tui) {
+    return tui.mode === "fullscreen"
+        ? { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 }
+        : { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` };
+}
 /**
  * Cap on a single tool result or bash output before the viewer elides the rest.
  *
@@ -220,8 +227,17 @@ export class ConversationViewer {
     showCost;
     viewerMarkdown;
     onMarkdownMode;
+    onBackground;
     scrollOffset = 0;
     autoScroll = true;
+    focused = false;
+    fullscreen;
+    viewport;
+    scrollbarGrabOffset;
+    footerTargets = [];
+    latestTarget;
+    newMessages = 0;
+    scrollView;
     unsubscribe;
     lastInnerW = 0;
     closed = false;
@@ -266,7 +282,15 @@ export class ConversationViewer {
      * Persist a mode chosen with `m`, so the key and `/agents → Settings` mean
      * the same thing. Omitted → `m` still cycles, viewer-locally.
      */
-    onMarkdownMode) {
+    onMarkdownMode, 
+    /** Pi's fullscreen scrollbar preference, captured when the observer opens. */
+    scrollbarMode = "auto", 
+    /**
+     * Hand this run to the background. `available` is read live — it turns
+     * false the instant the handoff lands or the run ends. Omitted → no `b`
+     * affordance (history views).
+     */
+    onBackground) {
         this.tui = tui;
         this.session = session;
         this.record = record;
@@ -278,19 +302,34 @@ export class ConversationViewer {
         this.showCost = showCost;
         this.viewerMarkdown = viewerMarkdown;
         this.onMarkdownMode = onMarkdownMode;
+        this.onBackground = onBackground;
+        this.fullscreen = tui.mode === "fullscreen";
         this.markdownTheme = resolveMarkdownTheme(theme);
         this.keys = createViewerKeys(keybindings);
         this.markdownCycleKeyAvailable = !keybindings || !(keybindings.matches("m", "tui.select.up")
             || keybindings.matches("m", "tui.select.down")
             || keybindings.matches("m", "tui.select.pageUp")
             || keybindings.matches("m", "tui.select.pageDown"));
-        this.unsubscribe = session.subscribe(() => {
+        this.scrollView = new ScrollView({
+            render: width => this.buildContentLines(width),
+            invalidate: () => { },
+        }, { follow: "end", scrollbar: this.fullscreen ? scrollbarMode : "hidden" });
+        this.unsubscribe = session.subscribe(event => {
             if (this.closed)
                 return;
+            if (this.fullscreen && !this.scrollView.isFollowingEnd && event.type === "message_start" && ["user", "assistant", "toolResult", "bashExecution"].includes(event.message.role)) {
+                this.newMessages++;
+            }
             this.tui.requestRender();
         });
     }
     handleInput(data) {
+        if (this.closed)
+            return;
+        if (this.fullscreen && (matchesKey(data, "ctrl+end") || (!this.composer && matchesKey(data, "end")))) {
+            this.jumpToLatest();
+            return;
+        }
         // While composing a steer message, the input owns all keys (Enter sends,
         // Esc cancels — both wired in openComposer()). Editing keys flow through.
         if (this.composer) {
@@ -309,6 +348,15 @@ export class ConversationViewer {
         if (matchesKey(data, "enter") && this.canSteer()) {
             this.stopArmed = false;
             this.openComposer();
+            return;
+        }
+        // Hand a live foreground run to the background. Single press, unlike stop:
+        // the transition is one-way but keeps the agent working, so a stray key
+        // costs a notification rather than the run.
+        if (matchesKey(data, "b") && this.canSendToBackground()) {
+            this.stopArmed = false;
+            this.onBackground?.send();
+            this.tui.requestRender();
             return;
         }
         // Stop/abort the agent (only while it can still be stopped). Two-press:
@@ -340,6 +388,23 @@ export class ConversationViewer {
         }
         const totalLines = this.buildContentLines(this.lastInnerW).length;
         const viewportHeight = this.viewportHeight();
+        if (this.fullscreen) {
+            this.scrollView.updateLayout(totalLines, viewportHeight, () => {
+                if (!this.closed)
+                    this.tui.requestRender();
+            });
+            if (this.keys.scrollUp(data))
+                this.scrollView.scrollBy(-1);
+            else if (this.keys.scrollDown(data))
+                this.scrollView.scrollBy(1);
+            else if (this.keys.pageUp(data))
+                this.scrollView.scrollBy(-viewportHeight);
+            else if (this.keys.pageDown(data))
+                this.scrollView.scrollBy(viewportHeight);
+            else if (matchesKey(data, "home"))
+                this.scrollView.scrollToStart();
+            return;
+        }
         const maxScroll = Math.max(0, totalLines - viewportHeight);
         if (this.keys.scrollUp(data)) {
             this.scrollOffset = Math.max(0, this.scrollOffset - 1);
@@ -366,23 +431,107 @@ export class ConversationViewer {
             this.autoScroll = true;
         }
     }
+    jumpToLatest() {
+        this.scrollView.scrollToEnd();
+        this.newMessages = 0;
+        this.stopArmed = false;
+        this.tui.requestRender();
+    }
+    handleMouse(event) {
+        if (!this.fullscreen)
+            return { handled: false };
+        // Every cell belongs to this observer. Even unused clicks/drags must not
+        // fall through to Pi's transcript selection, scrolling, or editor.
+        if (this.closed || !this.viewport)
+            return { handled: true, render: false };
+        const view = this.viewport;
+        const onScrollbar = this.scrollView.scrollbar !== "hidden" && event.x >= view.width - SCROLLBAR_WIDTH && event.x < view.width && event.y >= view.top && event.y < view.top + view.height;
+        if (event.type === "move") {
+            this.scrollView.setScrollbarActive(onScrollbar);
+            return { handled: true, render: false };
+        }
+        if (event.type === "wheel") {
+            this.stopArmed = false;
+            this.scrollView.scrollBy(event.wheelDelta ?? 0);
+            return { handled: true, render: true };
+        }
+        if (event.type === "release") {
+            const wasDragging = this.scrollbarGrabOffset !== undefined;
+            this.scrollbarGrabOffset = undefined;
+            this.scrollView.setScrollbarActive(onScrollbar);
+            return { handled: true, render: wasDragging };
+        }
+        if (event.type === "drag" && this.scrollbarGrabOffset !== undefined) {
+            const travel = view.height - view.thumbHeight;
+            const position = Math.max(0, Math.min(travel, event.y - view.top - this.scrollbarGrabOffset));
+            this.scrollView.scrollTo(travel > 0 ? Math.round(position / travel * view.maxScroll) : 0);
+            return { handled: true, render: true };
+        }
+        if (event.type === "press" && event.button === "left") {
+            this.scrollbarGrabOffset = undefined;
+            this.scrollView.setScrollbarActive(onScrollbar);
+            if (this.latestTarget && event.y === this.latestTarget.row && event.x >= this.latestTarget.start && event.x < this.latestTarget.end) {
+                this.jumpToLatest();
+                return { handled: true, render: true };
+            }
+            if (event.y === this.tui.terminal.rows - 1) {
+                const target = this.footerTargets.find(t => event.x >= t.start && event.x < t.end);
+                if (target) {
+                    this.handleInput(target.key);
+                    return { handled: true, render: true };
+                }
+            }
+            this.stopArmed = false;
+            if (this.composer && event.y === this.tui.terminal.rows - 2) {
+                this.composer.handleMouse({ ...event, x: event.x - 1, y: 0, width: this.lastInnerW, height: 1 });
+                return { handled: true, render: true };
+            }
+            if (onScrollbar && view.maxScroll > 0) {
+                const y = event.y - view.top;
+                if (y >= view.thumbTop && y < view.thumbTop + view.thumbHeight) {
+                    this.scrollbarGrabOffset = y - view.thumbTop;
+                    return { handled: true, capture: true, render: true };
+                }
+                this.scrollView.scrollBy(y < view.thumbTop ? -view.height : view.height);
+                // A track click still pages, but holding it can grab the thumb too.
+                this.scrollbarGrabOffset = Math.floor(view.thumbHeight / 2);
+                return { handled: true, capture: true, render: true };
+            }
+            return { handled: true, render: true };
+        }
+        return { handled: true, render: false };
+    }
     render(width) {
-        if (width < 6)
+        this.footerTargets = [];
+        this.latestTarget = undefined;
+        this.viewport = undefined;
+        const rows = Math.max(0, this.tui.terminal.rows);
+        if (!this.fullscreen && width < 6)
             return []; // too narrow for any meaningful rendering
+        if (width <= SCROLLBAR_WIDTH + 1)
+            return Array.from({ length: rows }, () => " ".repeat(Math.max(0, width)));
         const th = this.theme;
-        const innerW = width - 4; // border + padding
+        const innerW = this.fullscreen ? this.scrollView.getContentWidth(width - 1) : width - 4;
         this.lastInnerW = innerW;
         const lines = [];
+        const footerActions = [];
         const pad = (s, len) => {
             const vis = visibleWidth(s);
             return s + " ".repeat(Math.max(0, len - vis));
         };
-        const row = (content) => th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
+        const row = (content, scrollbar) => {
+            if (this.fullscreen) {
+                const contentWidth = width - 1 - (scrollbar ? SCROLLBAR_WIDTH : 0);
+                return " " + truncateToWidth(content, contentWidth, scrollbar ? "" : "...", true) + (scrollbar ?? "");
+            }
+            return th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
+        };
         const hrTop = th.fg("border", `╭${"─".repeat(width - 2)}╮`);
         const hrBot = th.fg("border", `╰${"─".repeat(width - 2)}╯`);
         const hrMid = row(th.fg("dim", "─".repeat(innerW)));
         // Header
-        lines.push(hrTop);
+        if (!this.fullscreen)
+            lines.push(hrTop);
         const modeLabel = getPromptModeLabel(this.record.type);
         const modeTag = modeLabel ? ` ${th.fg("dim", `(${modeLabel})`)}` : "";
         const statusIcon = this.record.status === "running"
@@ -414,22 +563,59 @@ export class ConversationViewer {
             lines.push(row(invocationLine));
         lines.push(hrMid);
         // Content area — rebuild every render (live data, no cache needed)
-        const contentLines = this.buildContentLines(innerW);
+        const contentLines = this.fullscreen ? this.scrollView.render(width - 1) : this.buildContentLines(innerW);
         const viewportHeight = this.viewportHeight();
         const maxScroll = Math.max(0, contentLines.length - viewportHeight);
-        if (this.autoScroll) {
+        if (this.fullscreen) {
+            this.scrollView.updateLayout(contentLines.length, viewportHeight, () => {
+                if (!this.closed)
+                    this.tui.requestRender();
+            });
+            if (this.scrollView.isFollowingEnd)
+                this.newMessages = 0;
+        }
+        else if (this.autoScroll) {
             this.scrollOffset = maxScroll;
         }
-        const visibleStart = Math.min(this.scrollOffset, maxScroll);
+        const visibleStart = this.fullscreen ? this.scrollView.scrollTop : Math.min(this.scrollOffset, maxScroll);
         const visible = contentLines.slice(visibleStart, visibleStart + viewportHeight);
+        // Match Pi's scrollbar geometry: rounded size, at least two rows when available.
+        const thumbHeight = Math.min(viewportHeight, Math.max(2, Math.round(viewportHeight * viewportHeight / Math.max(1, contentLines.length))));
+        const thumbTop = maxScroll > 0 ? Math.round(visibleStart / maxScroll * (viewportHeight - thumbHeight)) : 0;
+        this.viewport = { width, top: lines.length, height: viewportHeight, maxScroll, thumbTop, thumbHeight };
         for (let i = 0; i < viewportHeight; i++) {
-            lines.push(row(visible[i] ?? ""));
+            let scrollbar;
+            if (this.scrollView.isScrollbarVisible) {
+                const onThumb = i >= thumbTop && i < thumbTop + thumbHeight;
+                if (onThumb) {
+                    scrollbar = th.fg("scrollbarThumb", this.scrollView.isScrollbarActive ? "█" : "┃");
+                }
+                else {
+                    scrollbar = th.fg("scrollbarTrack", "│");
+                }
+            }
+            lines.push(row(visible[i] ?? "", scrollbar));
         }
-        // Footer
-        lines.push(hrMid);
+        // Keep the divider pinned above the footer, with the jump control centered
+        // inside it. Neither scrolling nor new messages change its position.
+        if (this.fullscreen && !this.scrollView.isFollowingEnd && maxScroll > 0 && rows >= this.chromeLines()) {
+            const text = this.newMessages > 0
+                ? `${this.newMessages} new message${this.newMessages === 1 ? "" : "s"}`
+                : "Jump to latest message";
+            const label = truncateToWidth(`[ ↓ ${text} · Ctrl+End ]`, innerW, "…");
+            const labelWidth = visibleWidth(label);
+            const padding = Math.floor((innerW - labelWidth) / 2);
+            this.latestTarget = { row: lines.length, start: padding + 1, end: padding + 1 + labelWidth };
+            lines.push(row(th.fg("dim", "─".repeat(padding)) + th.fg("accent", label) + th.fg("dim", "─".repeat(innerW - padding - labelWidth))));
+        }
+        else {
+            lines.push(hrMid);
+        }
         if (this.composer) {
             // Composer row: the Input renders its own `> ` prompt and cursor.
+            this.composer.focused = this.focused;
             lines.push(row(this.composer.render(innerW)[0] ?? ""));
+            footerActions.push({ label: "Enter send", key: "\r" }, { label: "Esc cancel", key: "\x1b" });
             const composeHint = th.fg("dim", "Enter send · Esc cancel");
             const composeLeft = th.fg("accent", "✎ steer");
             const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
@@ -440,17 +626,21 @@ export class ConversationViewer {
             // full key list so the less-obvious bindings stay discoverable; it leads
             // the right group so "Esc close" is the only part that truncates first.
             const sep = th.fg("dim", " · ");
-            const actions = [];
             if (this.canSteer())
-                actions.push(th.fg("dim", "Enter steer"));
+                footerActions.push({ label: "Enter steer", key: "\r" });
+            // Abbreviated for the same reason as the Markdown group below.
+            if (this.canSendToBackground())
+                footerActions.push({ label: "b bg", key: "b" });
             if (this.isStoppable()) {
-                actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
+                footerActions.push({ label: this.stopArmed ? "x again to STOP" : "x stop", key: "x" });
             }
             // Abbreviated (`raw`/`md`/`md+`) because the idle footer is already full
             // at 80 columns with steer + stop present, and this group has no
             // degradation step below "drop the line-count readout".
             if (this.markdownCycleKeyAvailable)
-                actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
+                footerActions.push({ label: `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`, key: "m" });
+            const actions = footerActions.map(a => th.fg(a.key === "x" && this.stopArmed ? "error" : "dim", a.label));
+            footerActions.push({ label: "Esc close", key: "\x1b" });
             const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
             // Prepend the line-count/scroll-% readout only when there's spare width —
             // it's the first thing dropped so it never crowds out the hints.
@@ -465,8 +655,22 @@ export class ConversationViewer {
             const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
             lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
         }
-        lines.push(hrBot);
-        return lines;
+        if (!this.fullscreen) {
+            lines.push(hrBot);
+            return lines;
+        }
+        // Keep the footer on screen even in a terminal shorter than the chrome.
+        const footer = lines.pop() ?? row("");
+        const output = rows > 0 ? [...lines.slice(0, rows - 1), footer] : [];
+        const footerText = stripTerminalSequences(footer);
+        for (const action of footerActions) {
+            const index = footerText.indexOf(action.label);
+            if (index < 0)
+                continue; // a clipped label is not a clickable control
+            const start = visibleWidth(footerText.slice(0, index));
+            this.footerTargets.push({ start, end: start + visibleWidth(action.label), key: action.key });
+        }
+        return output;
     }
     /** Stoppable only when a stop handler exists and the agent is still active. */
     isStoppable() {
@@ -528,6 +732,14 @@ export class ConversationViewer {
     canSteer() {
         return !!this.onSteer && (this.record.status === "running" || this.record.status === "queued");
     }
+    /**
+     * Asked of the owner rather than derived from the record: only the caller
+     * blocked on this run knows it can let go of it, and `blocking` alone also
+     * matches spawns nobody can hand off (the agent generator).
+     */
+    canSendToBackground() {
+        return this.onBackground?.available() === true;
+    }
     /** Open the inline steering composer and route subsequent input to it. */
     openComposer() {
         const input = new Input();
@@ -549,6 +761,7 @@ export class ConversationViewer {
     invalidate() { }
     dispose() {
         this.closed = true;
+        this.scrollView.setScrollbar("hidden"); // clears Pi's auto-hide timer
         if (this.unsubscribe) {
             this.unsubscribe();
             this.unsubscribe = undefined;
@@ -556,6 +769,8 @@ export class ConversationViewer {
     }
     // ---- Private ----
     viewportHeight() {
+        if (this.fullscreen)
+            return Math.max(0, this.tui.terminal.rows - this.chromeLines());
         // Cap mirrors the overlay's maxHeight — otherwise the viewer would render
         // more lines than the overlay shows and clip the footer.
         const maxRows = Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100);
@@ -563,15 +778,15 @@ export class ConversationViewer {
     }
     chromeLines() {
         // The composer adds one row above the footer hint while it's open.
-        return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
+        return CHROME_LINES_BASE - (this.fullscreen ? 2 : 0) + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
     }
     invocationLine() {
-        const invocation = this.record.invocation;
-        const { modelName, tags } = buildInvocationTags(invocation && {
-            ...invocation,
-            modelName: invocation.modelId ?? invocation.modelName,
-        });
-        const parts = modelName ? [modelName, ...tags] : tags;
+        // Canonical id here, short label everywhere else: this overlay is opened to
+        // inspect one agent and has the width for it, and two providers can serve
+        // models whose short names read alike.
+        const { modelName, modelId, tags } = buildInvocationTags(this.record.invocation);
+        const model = modelId ?? modelName;
+        const parts = model ? [model, ...tags] : tags;
         if (parts.length === 0)
             return undefined;
         return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);

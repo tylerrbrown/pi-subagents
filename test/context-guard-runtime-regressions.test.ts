@@ -6,6 +6,9 @@ const { createAgentSession } = vi.hoisted(() => ({
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
+  createCodemodeExtension: vi.fn(() => () => {}),
+  createToolSearchExtension: vi.fn(() => () => {}),
+  createMcpExtension: vi.fn(() => () => {}),
   DefaultResourceLoader: class {
     async reload() {}
     getExtensions() { return { extensions: [], errors: [], runtime: {} }; }
@@ -41,6 +44,7 @@ import { resumeAgent, runAgent, setDefaultContextThresholds, setDefaultMaxTurns 
 import { SubagentScheduler } from "../src/schedule.js";
 
 const ctx = {
+  isProjectTrusted: () => false,
   cwd: "/tmp",
   model: undefined,
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },

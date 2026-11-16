@@ -64,23 +64,6 @@ export interface WorktreeCleanupResult {
   error?: string;
 }
 
-/**
- * Run git and return its trimmed stdout, throwing on failure so callers keep
- * the try/catch control flow `execFileSync` gave them.
- *
- * `pi.exec` never rejects — it reports failure in the result — and a command
- * killed by its timeout comes back as `killed` with an exit code of 0, so both
- * have to be checked to reproduce `execFileSync`'s "throws on anything but a
- * clean exit".
- */
-async function git(pi: ExtensionAPI, cwd: string, args: string[], timeout: number): Promise<string> {
-  const result = await pi.exec("git", args, { cwd, timeout });
-  if (result.killed || result.code !== 0) {
-    throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
-  }
-  return result.stdout.trim();
-}
-
 /** Convert Git's slash-separated repo prefix to a contained host path. */
 function safeRepoSubdir(prefix: string): string | undefined {
   if (!prefix) return "";
@@ -101,6 +84,23 @@ function safeRepoSubdir(prefix: string): string | undefined {
 export function isPathContained(root: string, candidate: string): boolean {
   const rel = relative(resolve(root), resolve(candidate));
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+/**
+ * Run git and return its trimmed stdout, throwing on failure so callers keep
+ * the try/catch control flow `execFileSync` gave them.
+ *
+ * `pi.exec` never rejects — it reports failure in the result — and a command
+ * killed by its timeout comes back as `killed` with an exit code of 0, so both
+ * have to be checked to reproduce `execFileSync`'s "throws on anything but a
+ * clean exit".
+ */
+async function git(pi: ExtensionAPI, cwd: string, args: string[], timeout: number): Promise<string> {
+  const result = await pi.exec("git", args, { cwd, timeout });
+  if (result.killed || result.code !== 0) {
+    throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
+  }
+  return result.stdout.trim();
 }
 
 /**
