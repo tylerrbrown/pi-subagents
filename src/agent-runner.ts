@@ -28,7 +28,6 @@ import { ContextGuard, type ContextGuardState, type ContextThresholds, getContex
 import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
-import { composeHelperSessionName } from "./helper-session-name.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { projectReadScopes } from "./project-scope.js";
@@ -573,8 +572,6 @@ export interface RunOptions extends AgentCapabilityAdditions {
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
-  /** The child label already shown in the parent's agent list. */
-  displayDescription?: string;
   model?: Model<any>;
   maxTurns?: number;
   /** Per-dispatch context guard overrides; omitted values use project defaults. */
@@ -819,15 +816,6 @@ export async function bindExtensionsWithStartupObservation(
   observe?.(false);
   await session.bindExtensions({ onError });
   if (noExtensions) observe?.(true);
-}
-
-/** The parent session's display name, or undefined when it is unnamed or unreadable. */
-function parentSessionName(ctx: ExtensionContext): string | undefined {
-  try {
-    return ctx.sessionManager?.getSessionName?.() ?? undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 export async function runAgent(
@@ -1299,12 +1287,8 @@ export async function runAgent(
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
 
   // Named before extensions bind so the parent auto-namer keeps this name.
-  session.setSessionName(composeHelperSessionName({
-    parentName: parentSessionName(ctx),
-    role: agentConfig?.name ?? type,
-    prompt: options.displayDescription ?? "",
-    agentId: options.agentId,
-  }));
+  const role = agentConfig?.name ?? type;
+  session.setSessionName(options.agentId ? `${role}#${options.agentId.slice(0, 8)}` : role);
 
   if (options.bindBeforeExtensions) {
     try {

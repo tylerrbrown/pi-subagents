@@ -166,27 +166,27 @@ ${envBlock}`;
  * Pi renders a prompt as the preamble followed by tagged sections in a fixed order:
  * `tools`, `rules`, `docs` (default preamble only), `addendum`, `project_context`,
  * `skills`, `cwd`, then the sections extensions add during a turn. The child session renders its own `skills` (from its `skills:`
- * setting), its own `cwd` and its own extension sections after the inherited text.
+ * setting) and its own `cwd` after the inherited text.
  * Inheriting the parent's copies too listed them twice, showed the parent's skills to
- * children configured with `skills: false` or a preload list, and left copies that
- * section-editing extensions in the child cannot reach. It also made the result depend
- * on timing: `getSystemPrompt()` includes the extension sections only while the
- * parent's turn runs.
+ * children configured with `skills: false` or a preload list. Keep appended extension
+ * instructions because the child may exclude the extension that supplied them.
  *
- * Returns the text before the `skills` section, or before the `cwd` section when there
- * are no skills. A prompt without the `cwd` section (for example, a forced prompt) is
+ * Removes the matching cwd and preceding skills section. A prompt without the
+ * `cwd` section (for example, a forced prompt) is
  * returned unchanged.
  *
  * @param rendered  The parent's `ctx.getSystemPrompt()`.
  * @param cwd  The cwd the parent's prompt was rendered with.
  */
 export function inheritableParentPrompt(rendered: string, cwd: string): string {
-  const cwdAt = rendered.lastIndexOf(cwdSection(cwd));
+  const section = cwdSection(cwd);
+  const cwdAt = rendered.lastIndexOf(section);
   if (cwdAt < 0) return rendered;
   const head = rendered.slice(0, cwdAt);
-  if (!head.endsWith("\n</skills>")) return head;
+  const suffix = rendered.slice(cwdAt + section.length);
+  if (!head.endsWith("\n</skills>")) return head + suffix;
   const skillsAt = head.lastIndexOf("\n\n<skills>\n");
-  return skillsAt < 0 ? head : head.slice(0, skillsAt);
+  return (skillsAt < 0 ? head : head.slice(0, skillsAt)) + suffix;
 }
 
 /**

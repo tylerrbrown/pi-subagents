@@ -12,7 +12,6 @@ import { ContextGuard, getContextGuardDefaults, resolveContextThresholds, setCon
 import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
-import { composeHelperSessionName } from "./helper-session-name.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth } from "./nested-tools.js";
 import { projectReadScopes } from "./project-scope.js";
@@ -585,15 +584,6 @@ export async function bindExtensionsWithStartupObservation(session, noExtensions
     if (noExtensions)
         observe?.(true);
 }
-/** The parent session's display name, or undefined when it is unnamed or unreadable. */
-function parentSessionName(ctx) {
-    try {
-        return ctx.sessionManager?.getSessionName?.() ?? undefined;
-    }
-    catch {
-        return undefined;
-    }
-}
 export async function runAgent(ctx, type, prompt, options) {
     // Resolve working directory: worktree override > parent cwd
     const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -1028,12 +1018,8 @@ export async function runAgent(ctx, type, prompt, options) {
     }
     const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
     // Named before extensions bind so the parent auto-namer keeps this name.
-    session.setSessionName(composeHelperSessionName({
-        parentName: parentSessionName(ctx),
-        role: agentConfig?.name ?? type,
-        prompt: options.displayDescription ?? "",
-        agentId: options.agentId,
-    }));
+    const role = agentConfig?.name ?? type;
+    session.setSessionName(options.agentId ? `${role}#${options.agentId.slice(0, 8)}` : role);
     if (options.bindBeforeExtensions) {
         try {
             await options.onSessionCreated?.(session);

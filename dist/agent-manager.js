@@ -1028,7 +1028,6 @@ export class AgentManager {
                 bindBeforeExtensions: !!record.workLaunch,
                 pi,
                 agentId: id,
-                displayDescription: options.description,
                 model: options.model,
                 maxTurns: options.maxTurns,
                 contextWarnPercent: options.contextWarnPercent ?? record.contextGuard?.warnPercent,

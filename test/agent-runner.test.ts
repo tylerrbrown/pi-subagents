@@ -550,7 +550,7 @@ describe("agent-runner final output capture", () => {
     expect(session.setSessionName).toHaveBeenCalledWith("Explore#a1b2c3d4");
   });
 
-  it("composes <Parent subject> - <Role> <intent>#id8 from the parent session name, before binding", async () => {
+  it("keeps prompt-derived labels out of the child session title before binding", async () => {
     const { session } = createSession("NAMED");
     createAgentSession.mockResolvedValue({ session });
     const parentCtx = {
@@ -558,11 +558,10 @@ describe("agent-runner final output capture", () => {
       sessionManager: { ...ctx.sessionManager, getSessionName: () => "Inbox - Quarantine Release Work" },
     };
 
-    await runAgent(parentCtx, "Explore", "Private task information should stay in this conversation", {
-      pi, agentId: "61f471ad9e3c", displayDescription: "Quarantine release regression check",
-    });
+    const options = { pi, agentId: "61f471ad9e3c", displayDescription: "Private task information from mention" };
+    await runAgent(parentCtx, "Explore", "Private task information should stay in this conversation", options);
 
-    expect(session.setSessionName).toHaveBeenCalledWith("Inbox - Explore Quarantine Release Regression Check#61f471ad");
+    expect(session.setSessionName).toHaveBeenCalledWith("Explore#61f471ad");
     const setOrder = session.setSessionName.mock.invocationCallOrder[0];
     const bindOrder = session.bindExtensions.mock.invocationCallOrder[0];
     expect(setOrder).toBeLessThan(bindOrder);

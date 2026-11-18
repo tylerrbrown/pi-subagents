@@ -513,9 +513,9 @@ describe("inheritableParentPrompt", () => {
   const preamble = "You are pi.\n\n<project_context>\nRules.\n</project_context>";
   const skills = "<skills>\n<available_skills>\n  <skill><name>a</name></skill>\n</available_skills>\n</skills>";
 
-  it("drops the skills, cwd and extension sections", () => {
+  it("keeps appended extension policy when removing rendered skills and cwd", () => {
     const rendered = `${preamble}\n\n${skills}\n\n<cwd>\n/work\n</cwd>\n\n<extension_instructions>\nX\n</extension_instructions>`;
-    expect(inheritableParentPrompt(rendered, "/work")).toBe(preamble);
+    expect(inheritableParentPrompt(rendered, "/work")).toBe(`${preamble}\n\n<extension_instructions>\nX\n</extension_instructions>`);
   });
 
   it("drops the cwd section when there are no skills", () => {
