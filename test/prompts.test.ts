@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt } from "../src/prompts.js";
+import { buildAgentPrompt, inheritableParentPrompt } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -62,8 +62,18 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("<sub_agent_context>");
     expect(prompt).not.toContain("<inherited_system_prompt>");
     expect(prompt).not.toContain("READ-ONLY");
-    // Empty systemPrompt means no <agent_instructions> section
+    // Empty systemPrompt means no <agent_instructions> section, and no
+    // re-delegation line unless the runner says this agent can spawn.
     expect(prompt).not.toContain("<agent_instructions>");
+    expect(prompt).not.toContain("re-delegate");
+  });
+
+  it("adds Claude Code's re-delegation line when the agent can delegate", () => {
+    const config = getDefaultConfig("general-purpose");
+    const prompt = buildAgentPrompt(config, "/workspace", env, "Parent.", { delegationGuideline: true });
+    expect(prompt).toContain(
+      "You are already the dedicated agent for this task. Do the work directly — do not re-delegate your entire assignment to another single subagent.",
+    );
   });
 
   it("general-purpose without parent prompt falls back to generic base", () => {
@@ -496,5 +506,29 @@ describe("buildAgentPrompt", () => {
       expect(prompt).toContain("<worktree_isolation>");
       expect(prompt.indexOf("<workflow_child>")).toBeGreaterThan(prompt.indexOf("<worktree_isolation>"));
     });
+  });
+});
+
+describe("inheritableParentPrompt", () => {
+  const preamble = "You are pi.\n\n<project_context>\nRules.\n</project_context>";
+  const skills = "<skills>\n<available_skills>\n  <skill><name>a</name></skill>\n</available_skills>\n</skills>";
+
+  it("drops the skills, cwd and extension sections", () => {
+    const rendered = `${preamble}\n\n${skills}\n\n<cwd>\n/work\n</cwd>\n\n<extension_instructions>\nX\n</extension_instructions>`;
+    expect(inheritableParentPrompt(rendered, "/work")).toBe(preamble);
+  });
+
+  it("drops the cwd section when there are no skills", () => {
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\n/work\n</cwd>`, "/work")).toBe(preamble);
+  });
+
+  it("matches the cwd as pi renders it on Windows", () => {
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\nC:/work\n</cwd>`, "C:\\work")).toBe(preamble);
+  });
+
+  it("returns a prompt without the cwd section unchanged", () => {
+    const forced = `${preamble}\n\n${skills}`;
+    expect(inheritableParentPrompt(forced, "/work")).toBe(forced);
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\n/other\n</cwd>`, "/work")).toContain("/other");
   });
 });

@@ -43,6 +43,10 @@ Your final message IS the return value of this task. A workflow script captures 
 Return only the answer, in exactly the shape the prompt asks for — no preamble, no summary of what you did, no offer to continue.
 </workflow_child>`
         : "";
+    // Append mode only: the one agent that gets this, general-purpose, is append.
+    const delegationBlock = extras?.delegationGuideline
+        ? "\n\nYou are already the dedicated agent for this task. Do the work directly — do not re-delegate your entire assignment to another single subagent."
+        : "";
     // Build optional extras suffix
     const extraSections = [];
     if (extras?.memoryBlock) {
@@ -76,7 +80,7 @@ You are operating as a sub-agent invoked to handle a specific task.
         // placed verbatim (no wrapper tag) so it forms an identical byte prefix
         // with the parent session, maximising KV cache hits. The <active_agent>
         // tag and env block vary per call and are placed after the cached prefix.
-        return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
+        return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + delegationBlock + customSection + extrasSuffix;
     }
     // "replace" mode — minimum specialist floor + env header + config prompt
     const replaceHeader = `You are a pi coding agent sub-agent.
@@ -94,6 +98,56 @@ You have been invoked to handle a specific task autonomously.
 
 ${envBlock}`;
     return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
+}
+/**
+ * The part of the parent's rendered system prompt that an append-mode child inherits.
+ *
+ * Pi renders a prompt as the preamble followed by tagged sections in a fixed order:
+ * `tools`, `rules`, `docs` (default preamble only), `addendum`, `project_context`,
+ * `skills`, `cwd`, then the sections extensions add during a turn. The child session renders its own `skills` (from its `skills:`
+ * setting), its own `cwd` and its own extension sections after the inherited text.
+ * Inheriting the parent's copies too listed them twice, showed the parent's skills to
+ * children configured with `skills: false` or a preload list, and left copies that
+ * section-editing extensions in the child cannot reach. It also made the result depend
+ * on timing: `getSystemPrompt()` includes the extension sections only while the
+ * parent's turn runs.
+ *
+ * Returns the text before the `skills` section, or before the `cwd` section when there
+ * are no skills. A prompt without the `cwd` section (for example, a forced prompt) is
+ * returned unchanged.
+ *
+ * @param rendered  The parent's `ctx.getSystemPrompt()`.
+ * @param cwd  The cwd the parent's prompt was rendered with.
+ */
+export function inheritableParentPrompt(rendered, cwd) {
+    const cwdAt = rendered.lastIndexOf(cwdSection(cwd));
+    if (cwdAt < 0)
+        return rendered;
+    const head = rendered.slice(0, cwdAt);
+    if (!head.endsWith("\n</skills>"))
+        return head;
+    const skillsAt = head.lastIndexOf("\n\n<skills>\n");
+    return skillsAt < 0 ? head : head.slice(0, skillsAt);
+}
+/**
+ * The parent's rendered system prompt without its `cwd` section, for a session that
+ * renders its own `cwd` after the prompt it is given and adds nothing else.
+ *
+ * Everything else is kept, including sections after `cwd` (extension sections present
+ * while the parent's turn runs). A prompt without the section (for example, a forced
+ * prompt) is returned unchanged.
+ *
+ * @param rendered  The parent's `ctx.getSystemPrompt()`.
+ * @param cwd  The cwd the parent's prompt was rendered with.
+ */
+export function withoutCwdSection(rendered, cwd) {
+    const section = cwdSection(cwd);
+    const at = rendered.lastIndexOf(section);
+    return at < 0 ? rendered : rendered.slice(0, at) + rendered.slice(at + section.length);
+}
+/** The `cwd` section as pi renders it after the preceding section. */
+function cwdSection(cwd) {
+    return `\n\n<cwd>\n${cwd.replace(/\\/g, "/")}\n</cwd>`;
 }
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */
 const genericBase = `# Role

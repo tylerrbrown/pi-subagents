@@ -5,7 +5,8 @@
  * load/save, parse-error self-heal, stale-lock recovery.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -42,7 +43,7 @@ describe("ScheduleStore", () => {
 
   it("resolveStorePath produces session-scoped path under .pi/subagent-schedules/", () => {
     const p = resolveStorePath("/repo", "abc123");
-    expect(p).toBe("/repo/.pi/subagent-schedules/abc123.json");
+    expect(p).toBe(join("/repo", ".pi", "subagent-schedules", "abc123.json"));
   });
 
   it("starts empty and round-trips a job through add/list", () => {
@@ -137,6 +138,50 @@ describe("ScheduleStore", () => {
     store.add(a);
     store.add(b);  // would hang if the lock from the first add wasn't released
     expect(store.list().map(j => j.id).sort()).toEqual(["a", "b"]);
+  });
+
+  it("preserves a lock held by its own process", () => {
+    const file = join(tmp, "s.json");
+    const lockFile = file + ".lock";
+    // A worker thread can hold a live lock under this PID.
+    writeFileSync(lockFile, String(process.pid));
+
+    const store = new ScheduleStore(file);
+    expect(() => store.add(makeJob())).toThrow(/locked by live process/);
+    expect(readFileSync(lockFile, "utf8")).toBe(String(process.pid));
+  });
+
+  it("fails fast on a lock held by a live foreign process", () => {
+    const file = join(tmp, "s.json");
+    const lockFile = file + ".lock";
+    // A live child stands in for a foreign holder (PID 1 is EPERM-invisible).
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true });
+    writeFileSync(lockFile, String(holder.pid));
+    try {
+      const store = new ScheduleStore(file);
+      expect(() => store.add(makeJob())).toThrow(/locked by live process/);
+    } finally {
+      holder.kill();
+    }
+  });
+
+  it("fails fast on a lock whose content has no valid PID", () => {
+    const file = join(tmp, "s.json");
+    writeFileSync(file + ".lock", "");
+    const store = new ScheduleStore(file);
+    expect(() => store.add(makeJob())).toThrow(/no valid PID/);
+
+    writeFileSync(file + ".lock", "garbage");
+    expect(() => store.add(makeJob())).toThrow(/no valid PID/);
+  });
+
+  it("fails fast on an unreadable lock without unlinking it", () => {
+    const file = join(tmp, "s.json");
+    const lockFile = file + ".lock";
+    mkdirSync(lockFile);
+    const store = new ScheduleStore(file);
+    expect(() => store.add(makeJob())).toThrow(/unreadable/);
+    expect(existsSync(lockFile)).toBe(true);
   });
 
   it("does not create the backing directory until a mutation persists", () => {

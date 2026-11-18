@@ -326,7 +326,7 @@ export class ConversationViewer {
     handleInput(data) {
         if (this.closed)
             return;
-        if (this.fullscreen && (matchesKey(data, "ctrl+end") || (!this.composer && matchesKey(data, "end")))) {
+        if (this.fullscreen && (this.keys.bottom(data) || (!this.composer && matchesKey(data, "end")))) {
             this.jumpToLatest();
             return;
         }
@@ -401,7 +401,7 @@ export class ConversationViewer {
                 this.scrollView.scrollBy(-viewportHeight);
             else if (this.keys.pageDown(data))
                 this.scrollView.scrollBy(viewportHeight);
-            else if (matchesKey(data, "home"))
+            else if (this.keys.top(data) || matchesKey(data, "home"))
                 this.scrollView.scrollToStart();
             return;
         }
@@ -422,11 +422,11 @@ export class ConversationViewer {
             this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
             this.autoScroll = this.scrollOffset >= maxScroll;
         }
-        else if (matchesKey(data, "home")) {
+        else if (this.keys.top(data) || matchesKey(data, "home")) {
             this.scrollOffset = 0;
             this.autoScroll = false;
         }
-        else if (matchesKey(data, "end")) {
+        else if (this.keys.bottom(data) || matchesKey(data, "end")) {
             this.scrollOffset = maxScroll;
             this.autoScroll = true;
         }
@@ -602,7 +602,7 @@ export class ConversationViewer {
             const text = this.newMessages > 0
                 ? `${this.newMessages} new message${this.newMessages === 1 ? "" : "s"}`
                 : "Jump to latest message";
-            const label = truncateToWidth(`[ ↓ ${text} · Ctrl+End ]`, innerW, "…");
+            const label = truncateToWidth(`[ ↓ ${text} · ${this.keys.jumpToLatestLabel()} ]`, innerW, "…");
             const labelWidth = visibleWidth(label);
             const padding = Math.floor((innerW - labelWidth) / 2);
             this.latestTarget = { row: lines.length, start: padding + 1, end: padding + 1 + labelWidth };

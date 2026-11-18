@@ -32,7 +32,7 @@ import { composeHelperSessionName } from "./helper-session-name.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { projectReadScopes } from "./project-scope.js";
-import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, inheritableParentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { AgentCapabilityAdditions, AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
@@ -573,6 +573,8 @@ export interface RunOptions extends AgentCapabilityAdditions {
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
+  /** The child label already shown in the parent's agent list. */
+  displayDescription?: string;
   model?: Model<any>;
   maxTurns?: number;
   /** Per-dispatch context guard overrides; omitted values use project defaults. */
@@ -846,7 +848,7 @@ export async function runAgent(
   const env = await detectEnv(options.pi, effectiveCwd);
 
   // Get parent system prompt for append-mode agents
-  const parentSystemPrompt = ctx.getSystemPrompt();
+  const parentSystemPrompt = inheritableParentPrompt(ctx.getSystemPrompt(), ctx.cwd);
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
@@ -1300,7 +1302,7 @@ export async function runAgent(
   session.setSessionName(composeHelperSessionName({
     parentName: parentSessionName(ctx),
     role: agentConfig?.name ?? type,
-    prompt,
+    prompt: options.displayDescription ?? "",
     agentId: options.agentId,
   }));
 

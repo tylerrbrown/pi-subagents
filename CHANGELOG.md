@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The maintained fork incorporates selected changes through upstream v0.26.1. These include nested agent descriptions, prompt inheritance, structured output guidance, scheduler failure reporting and conversation viewer controls. The fork keeps its existing resume behavior, project settings scope, agent permissions and workflow controls. Helper session titles use the public task description. Imported session records cannot use the new upstream evicted-file resume path.
+
 ### Added
 - **Automatic child context guard.** Fresh and resumed children receive one wrap-up steer at 30% context and abort at 50%, with validated per-dispatch and persisted-default overrides. Context state survives compaction and reopen; available partial output is retained and context outcomes are distinguished from turn limits.
 - **Aligned agent status columns.** The widget and FleetView render unique handle → description → model/effort/thinking → metrics, with shared column starts across running agents. The unique handle replaces the redundant display-name/prompt-mode label in these compact rows; prompt mode remains visible in the conversation viewer and Agent tool result.

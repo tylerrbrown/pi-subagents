@@ -109,6 +109,7 @@ vi.mock("../src/env.js", () => ({
 }));
 
 vi.mock("../src/prompts.js", () => ({
+  inheritableParentPrompt: (prompt: string) => prompt,
   buildAgentPrompt: vi.fn(() => "system prompt"),
 }));
 
@@ -557,8 +558,8 @@ describe("agent-runner final output capture", () => {
       sessionManager: { ...ctx.sessionManager, getSessionName: () => "Inbox - Quarantine Release Work" },
     };
 
-    await runAgent(parentCtx, "Explore", "Quarantine release regression check\nmore detail", {
-      pi, agentId: "61f471ad9e3c",
+    await runAgent(parentCtx, "Explore", "Private task information should stay in this conversation", {
+      pi, agentId: "61f471ad9e3c", displayDescription: "Quarantine release regression check",
     });
 
     expect(session.setSessionName).toHaveBeenCalledWith("Inbox - Explore Quarantine Release Regression Check#61f471ad");

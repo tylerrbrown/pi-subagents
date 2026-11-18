@@ -35,7 +35,7 @@ vi.mock("../src/agent-types.js", () => ({
   resolveSpawnType: vi.fn(),
 }));
 vi.mock("../src/env.js", () => ({ detectEnv: vi.fn(async () => ({ isGitRepo: false, branch: "", platform: "linux" })) }));
-vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: vi.fn(() => "system") }));
+vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: vi.fn(() => "system"), inheritableParentPrompt: (prompt: string) => prompt }));
 vi.mock("../src/memory.js", () => ({ buildMemoryBlock: vi.fn(() => ""), buildReadOnlyMemoryBlock: vi.fn(() => "") }));
 vi.mock("../src/skill-loader.js", () => ({ preloadSkills: vi.fn(() => []) }));
 vi.mock("../src/nested-tools.js", () => ({ getMaxSubagentDepth: vi.fn(() => 2), createNestedSubagentTools: vi.fn(() => []) }));

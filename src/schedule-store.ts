@@ -14,11 +14,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, join } from "node:path";
 import type { ScheduledSubagent, ScheduleStoreData } from "./types.js";
 
-const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
 
 function isProcessRunning(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); return true; } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 function acquireLock(lockPath: string): void {
@@ -27,19 +28,25 @@ function acquireLock(lockPath: string): void {
       writeFileSync(lockPath, `${process.pid}`, { flag: "wx" });
       return;
     } catch (e: any) {
-      if (e.code === "EEXIST") {
-        try {
-          const pid = parseInt(readFileSync(lockPath, "utf-8"), 10);
-          if (pid && !isProcessRunning(pid)) {
-            unlinkSync(lockPath);
-            continue;
-          }
-        } catch { /* ignore — try again */ }
-        const start = Date.now();
-        while (Date.now() - start < LOCK_RETRY_MS) { /* busy wait */ }
+      if (e.code !== "EEXIST") throw e;
+      let pid: number;
+      try {
+        pid = Number(readFileSync(lockPath, "utf-8"));
+      } catch {
+        // unreadable lock: never unlink what we cant prove stale
+        throw new Error(`Schedule store lock is unreadable: ${lockPath}`);
+      }
+      // empty/garbage content is the create-write race window, not staleness
+      if (!Number.isSafeInteger(pid) || pid <= 0) {
+        throw new Error(`Schedule store lock has no valid PID: ${lockPath}`);
+      }
+      if (!isProcessRunning(pid)) {
+        try { unlinkSync(lockPath); } catch {
+          // raced, retry writeFile
+        }
         continue;
       }
-      throw e;
+      throw new Error(`Schedule store is locked by live process ${pid}: ${lockPath}`);
     }
   }
   throw new Error(`Failed to acquire schedule lock: ${lockPath}`);

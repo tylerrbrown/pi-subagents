@@ -156,7 +156,7 @@ export function getFailureNote(kind: RunFailureKind | undefined): string {
  * surfaces (or "" if the run produced nothing). `record.result` is bounded to
  * the run's own turns, so this is never a stale earlier answer (#144).
  */
-export function partialOutputSuffix(record: AgentRecord): string {
+export function partialOutputSuffix(record: Pick<AgentRecord, "result">): string {
   const partial = record.result?.trim();
   return partial ? `\n\nPartial output before the failure:\n${partial}` : "";
 }

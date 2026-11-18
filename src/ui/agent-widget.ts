@@ -343,7 +343,7 @@ export function getPromptModeLabel(type: SubagentType): string | undefined {
  */
 export function buildInvocationTags(
   invocation: AgentInvocation | undefined,
-): { modelName?: string; modelId?: string; tags: string[] } {
+): { modelName?: string; modelId?: string; thinking?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
   if (invocation.thinking) {

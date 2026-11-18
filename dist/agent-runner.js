@@ -12,10 +12,11 @@ import { ContextGuard, getContextGuardDefaults, resolveContextThresholds, setCon
 import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { composeHelperSessionName } from "./helper-session-name.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth } from "./nested-tools.js";
 import { projectReadScopes } from "./project-scope.js";
-import { buildAgentPrompt } from "./prompts.js";
+import { buildAgentPrompt, inheritableParentPrompt } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 /**
@@ -584,6 +585,15 @@ export async function bindExtensionsWithStartupObservation(session, noExtensions
     if (noExtensions)
         observe?.(true);
 }
+/** The parent session's display name, or undefined when it is unnamed or unreadable. */
+function parentSessionName(ctx) {
+    try {
+        return ctx.sessionManager?.getSessionName?.() ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 export async function runAgent(ctx, type, prompt, options) {
     // Resolve working directory: worktree override > parent cwd
     const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -595,7 +605,7 @@ export async function runAgent(ctx, type, prompt, options) {
     const config = agentConfig ?? getConfig(type);
     const env = await detectEnv(options.pi, effectiveCwd);
     // Get parent system prompt for append-mode agents
-    const parentSystemPrompt = ctx.getSystemPrompt();
+    const parentSystemPrompt = inheritableParentPrompt(ctx.getSystemPrompt(), ctx.cwd);
     // Build prompt extras (memory, skill preloading)
     const extras = {};
     if (options.worktreeBase)
@@ -1017,8 +1027,13 @@ export async function runAgent(ctx, type, prompt, options) {
         sessionOpts.thinkingLevel = thinkingLevel;
     }
     const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
-    const baseSessionName = agentConfig?.name ?? type;
-    session.setSessionName(options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName);
+    // Named before extensions bind so the parent auto-namer keeps this name.
+    session.setSessionName(composeHelperSessionName({
+        parentName: parentSessionName(ctx),
+        role: agentConfig?.name ?? type,
+        prompt: options.displayDescription ?? "",
+        agentId: options.agentId,
+    }));
     if (options.bindBeforeExtensions) {
         try {
             await options.onSessionCreated?.(session);
